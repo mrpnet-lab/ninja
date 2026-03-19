@@ -315,12 +315,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             // --- STEP 3: SECONDARY ENTRY — VWAP RECLAIM WITH EMA CONFIRMATION ---
             // Additional entry when price crosses back above VWAP with trend alignment.
             // This catches moves that didn't have a clean stop hunt signature.
-            bool vwapReclaimLong  = CrossAbove(Close, _vwap, 1)
+            bool vwapReclaimLong  = (Close[1] <= vwapVal && Close[0] > vwapVal)
                                  && fastEMA > slowEMA
                                  && Close[0] > Close[1]
                                  && Close[0] > Close[2];
 
-            bool vwapReclaimShort = CrossBelow(Close, _vwap, 1)
+            bool vwapReclaimShort = (Close[1] >= vwapVal && Close[0] < vwapVal)
                                  && fastEMA < slowEMA
                                  && Close[0] < Close[1]
                                  && Close[0] < Close[2];
