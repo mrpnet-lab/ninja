@@ -5,7 +5,9 @@ using System.ComponentModel.DataAnnotations;
 using System.Windows.Media;
 using NinjaTrader.Cbi;
 using NinjaTrader.Data;
+using NinjaTrader.Gui;
 using NinjaTrader.NinjaScript;
+using NinjaTrader.NinjaScript.DrawingTools;
 using NinjaTrader.NinjaScript.Indicators;
 using NinjaTrader.NinjaScript.Strategies;
 #endregion
@@ -41,7 +43,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         // ---- INTERNAL STATE ----
         private EMA     _emaFast, _emaSlow;
         private ATR     _atr;
-        private VWAP    _vwap;        // NinjaTrader built-in VWAP
+        private double  _cumVolPrice;  // Cumulative (Volume × Typical Price) for VWAP
+        private double  _cumVol;       // Cumulative Volume for VWAP
+        private double  _vwapValue;    // Current session VWAP
+        private DateTime _lastSessionDate;
         private double  _entryPrice;
         private double  _currentSL, _currentTP1, _currentTP2;
         private bool    _tp1Hit;
@@ -161,7 +166,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 _emaFast = EMA(_fastEMA);
                 _emaSlow = EMA(_slowEMA);
                 _atr     = ATR(_atrPeriod);
-                _vwap    = VWAP();
             }
         }
 
@@ -193,9 +197,21 @@ namespace NinjaTrader.NinjaScript.Strategies
             // Max daily trades gate
             if (_tradeCount >= _maxTradesPerDay) return;
 
+            // --- Compute session VWAP ---
+            double typicalPrice = (High[0] + Low[0] + Close[0]) / 3.0;
+            if (_lastSessionDate != Time[0].Date)
+            {
+                _cumVolPrice = 0;
+                _cumVol      = 0;
+                _lastSessionDate = Time[0].Date;
+            }
+            _cumVolPrice += typicalPrice * Volume[0];
+            _cumVol      += Volume[0];
+            _vwapValue    = _cumVol > 0 ? _cumVolPrice / _cumVol : typicalPrice;
+
             // --- Indicators ---
             double atrVal   = _atr[0];
-            double vwapVal  = _vwap[0];
+            double vwapVal  = _vwapValue;
             double fastEMA  = _emaFast[0];
             double slowEMA  = _emaSlow[0];
             double close    = Close[0];
