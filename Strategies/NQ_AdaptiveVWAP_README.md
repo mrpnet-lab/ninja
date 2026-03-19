@@ -259,8 +259,83 @@ Best for: Full NQ contracts, larger accounts > $25K, set-and-forget
 
 | File | Description |
 |------|-------------|
-| `NQ_AdaptiveVWAP_Strategy.cs` | Strategy source code |
+| `NQ_AdaptiveVWAP_Strategy.cs` | V1 strategy source code (original) |
+| `NQ_AdaptiveVWAP_V2_Strategy.cs` | **V2 strategy source code (recommended)** |
 | `NQ_AdaptiveVWAP_README.md` | This documentation |
+
+---
+
+## V2 Changelog — What Changed and Why
+
+V1 was profitable in January 2026 but had large losses in February 2026 due to uncontrolled risk during volatile market conditions. V2 addresses every identified weakness.
+
+### Root Causes of V1 Losses
+
+| Problem | Impact | V2 Fix |
+|---------|--------|--------|
+| No hard stop cap — ATR-based stops exploded during high volatility | 30-40+ pt stops ($600-800/contract) | Hard max stop cap at 25 pts regardless of ATR |
+| No daily loss limit — kept trading after compounding losses | 3 losses × 35 pts = $2,100+/contract | Daily P&L circuit breaker at -50 pts, stops all trading |
+| No volatility filter — entered when ATR was abnormally high | Bad R:R, huge risk per trade | ATR > 35 filter — skips entries in extreme conditions |
+| VWAP reclaim secondary entry too loose | Whipsaw entries in choppy markets | Removed entirely — stop-hunt only |
+| Entry filter: EMA aligned OR above VWAP (only 1 needed) | Low-quality entries passed through | Require BOTH: EMA aligned AND price on right side of VWAP |
+| No protection between entry and TP1 | Full SL hit if TP1 never reached | Early breakeven at 50% of TP1 distance |
+| Trailing stop only after TP1 | No intermediate SL tightening | Breakeven + 2 ticks activated early |
+| No cooldown after losses | Re-entered same bad conditions | 2 consecutive losses → pause for rest of day |
+| No gap between trades | Immediate re-entry after stop hit | Min 30 min (6 bars) between trades |
+| Weak momentum threshold (5% of ATR) | Doji bars triggered entries | Doubled to 10% of ATR |
+| Recovery threshold too loose (10% of ATR above swing) | Weak reversals counted as hunts | Tightened to 15% of ATR |
+| Session started at 9:30 (first 15 min noise) | False signals during open chaos | Starts at 9:45 — skips opening noise |
+| Session ended at 3:45 with flatten at 3:55 | Late entries with poor R:R | Ends at 3:30 with flatten at 3:50 |
+
+### V2 Default Parameters vs V1
+
+| Parameter | V1 | V2 | Change Reason |
+|-----------|----|----|---------------|
+| SL ATR multiplier | 1.2 | **1.0** | Tighter stop, better R:R |
+| TP1 ATR multiplier | 1.8 | **1.5** | Hit more often, lock profits faster |
+| TP2 ATR multiplier | 3.0 | **2.5** | More realistic runner target |
+| Max stop (points) | None | **25** | Hard cap prevents catastrophic single trades |
+| Daily loss limit (pts) | None | **50** | Circuit breaker stops bleeding |
+| Max ATR filter | None | **35** | Skips extreme volatility |
+| Min bars between trades | None | **6** (30 min) | Prevents emotional re-entry |
+| Max consecutive losses | None | **2** | Cools off after bad streak |
+| Session start | 9:30 | **9:45** | Skips opening 15 min noise |
+| Session end | 3:45 | **3:30** | Earlier cutoff, no late gambles |
+| Flatten time | 3:55 | **3:50** | Slightly earlier exit |
+| Hunt recovery threshold | 10% ATR | **15% ATR** | Stronger reversal required |
+| Momentum threshold | 5% ATR | **10% ATR** | Filters weak/doji bars |
+| Trend filter | EMA OR VWAP | **EMA AND VWAP** | Both must align |
+| VWAP reclaim entry | Enabled | **Removed** | Main source of whipsaws |
+| Early breakeven | None | **At 50% of TP1** | Protects before TP1 |
+| Trail multiplier (after TP1) | 1.0× ATR | **0.8× ATR** | Tighter trail, locks more profit |
+
+### V2 Position Management Flow
+
+```
+Entry → SL at min(1.0×ATR, 25 pts) | TP2 at 2.5×ATR
+  │
+  ├─ Price reaches 50% of TP1 → Move SL to breakeven + 2 ticks
+  │
+  ├─ Price reaches TP1 (1.5×ATR) → Exit 60%, move SL to BE + 5 ticks
+  │
+  ├─ After TP1 → Trail SL at 0.8×ATR from price (tighter trail)
+  │
+  ├─ Price reaches TP2 (2.5×ATR) → Exit remaining 40%
+  │
+  └─ EOD (3:50 PM) → Flatten all
+```
+
+### V2 Circuit Breaker Flow
+
+```
+Before each entry, check ALL of:
+  ✓ Daily P&L > -50 pts?          (else stop trading)
+  ✓ Trades today < 3?             (else stop trading)
+  ✓ Consecutive losses < 2?       (else stop trading)
+  ✓ ATR < 35 pts?                 (else skip this bar)
+  ✓ Last trade was 6+ bars ago?   (else wait)
+  ✓ Inside 9:45 AM - 3:30 PM?    (else wait)
+```
 
 ---
 
