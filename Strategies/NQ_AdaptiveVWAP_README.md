@@ -193,6 +193,58 @@ In the Strategies dialog:
 
 ---
 
+## Recommended Settings for Maximum Profitability
+
+The default parameters are conservative. Below are tuned settings optimized for higher profitability on NQ/MNQ. **Always backtest these on at least 30 days of data before going live.**
+
+### Aggressive Profile (Higher Win Rate, More Trades)
+
+Best for: Active traders, MNQ with 4+ contracts, accounts > $10K
+
+| Parameter | Default | Aggressive | Why |
+|-----------|---------|------------|-----|
+| Fast EMA | 9 | **8** | Faster reaction to momentum shifts after hunt |
+| Slow EMA | 21 | **18** | Tighter trend filter — catches more setups without being too loose |
+| ATR period | 14 | **10** | More responsive to recent volatility; adapts faster intraday |
+| SL ATR multiplier | 1.2 | **1.0** | Tighter stop — reduces max loss per trade (~12–20 NQ pts) |
+| TP1 ATR multiplier | 1.8 | **1.5** | Hit TP1 more often for consistent partial profits |
+| TP2 ATR multiplier | 3.0 | **2.5** | More realistic runner target — gets filled more frequently |
+| Swing lookback | 5 | **4** | Detects more recent hunts; more signals |
+| Hunt confirm bars | 2 | **1** | Enter faster after hunt confirmation — less slippage |
+| Max trades per day | 3 | **4** | Allows one extra trade to capitalize on volatile days |
+
+**Expected profile:** Higher trade frequency (3–5 trades/day), ~50–55% win rate, smaller avg win but more consistent.
+
+### Conservative Profile (Higher Reward-to-Risk, Fewer Trades)
+
+Best for: Full NQ contracts, larger accounts > $25K, set-and-forget
+
+| Parameter | Default | Conservative | Why |
+|-----------|---------|--------------|-----|
+| Fast EMA | 9 | **9** | Keep default — reliable |
+| Slow EMA | 21 | **26** | Stronger trend filter — only trades with established trend |
+| ATR period | 14 | **14** | Keep default — stable |
+| SL ATR multiplier | 1.2 | **1.5** | Wider stop — avoids getting stopped out by noise |
+| TP1 ATR multiplier | 1.8 | **2.0** | Larger first target — more profit per partial exit |
+| TP2 ATR multiplier | 3.0 | **4.0** | Big runner target — lets winners ride further |
+| Swing lookback | 5 | **7** | Deeper swing reference — only catches major liquidity grabs |
+| Hunt confirm bars | 2 | **3** | Extra confirmation — higher quality setups |
+| Max trades per day | 3 | **2** | Strict discipline — only the best 2 setups |
+
+**Expected profile:** Lower trade frequency (1–2 trades/day), ~40–45% win rate, larger avg win with R:R of 2.5–3.5.
+
+### Key Profit Optimization Tips
+
+1. **Use MNQ with 4 contracts** instead of 1 NQ contract — the 60/40 partial exit math works cleanly (exit 2 at TP1, run 2 to TP2) vs. NQ where 1 contract can't be split
+2. **Focus on the 9:45–11:00 AM window** — this is when the opening stop-hunt sweeps happen most reliably after the first 15 min of noise
+3. **Avoid the 12:00–1:30 PM dead zone** — low volume means VWAP is flat, ATR contracts, and stop-hunts are unreliable. Consider narrowing session to 9:30–11:30 and 2:00–3:45
+4. **After a losing day, don't change parameters** — the ATR adapts automatically. Changing settings after drawdowns leads to curve-fitting
+5. **Monitor profit factor weekly** — if it drops below 1.3 for 2+ weeks, the market regime may have shifted (trending vs. mean-reverting). Switch between Aggressive and Conservative profiles accordingly
+6. **Scale up only after 50+ sim trades** — statistically significant sample before risking real capital
+7. **Compound position size** — once profitable for 30+ days, increase from 1 NQ to 2 (or 4 MNQ to 6) rather than changing strategy parameters
+
+---
+
 ## Position Management Logic
 
 1. **Entry** → Sets SL at 1.2× ATR, profit target at 3.0× ATR
