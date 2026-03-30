@@ -70,6 +70,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int    atrPeriod;
         private double minSignalConfidence;
         private int    slTpAdjustStep;
+        private int    jumpSlPercent;       // % jump toward current price (default 50)
         private bool   showEma;
         private bool   showRsi;
         private bool   showAtr;
@@ -98,6 +99,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double hiddenTargetPrice;
         private bool   stopsArmed;
         private int    openTradeDirection; // 1=long, -1=short, 0=flat
+        private int    defaultSlPoints;    // saved from SetDefaults for reset
+        private int    defaultTpPoints;    // saved from SetDefaults for reset
 
         // ─── DCA tracking ─────────────────────────────────────────
         private int    openDcaCount;
@@ -117,8 +120,12 @@ namespace NinjaTrader.NinjaScript.Strategies
         // ─── Thread-safe button flags & cooldown ──────────────────
         private bool     pendingLong;
         private bool     pendingShort;
+        private bool     pendingLongLimit;
+        private bool     pendingShortLimit;
         private bool     pendingFlatten;
         private bool     pendingCloseTrade;
+        private bool     pendingCloseOne;
+        private bool     pendingJumpSL;
         private bool     pendingRearm;      // re-arm stops after SL/TP change
         private bool     pendingExit;       // exit orders submitted, waiting for fill
         private int      pendingExitTicks;  // ticks since pendingExit became true (safety net)
@@ -145,10 +152,14 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         // ─── On-chart dashboard elements ──────────────────────────
         private Grid      dashboardPanel;
-        private Button    btnLong;
-        private Button    btnShort;
+        private Button    btnBuyMkt;
+        private Button    btnSellMkt;
+        private Button    btnBuyLmt;
+        private Button    btnSellLmt;
         private Button    btnCloseTrade;
+        private Button    btnCloseOne;       // partial close 1 contract
         private Button    btnExit;           // Emergency Kill
+        private Button    btnJumpSL;
         private Button    btnModeManual;
         private Button    btnModeAuto;
         private TextBlock lblStatus;
@@ -165,6 +176,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private TextBlock lblTpVal;
         private TextBlock lblVwapVal;
         private TextBlock lblTradeHours;
+        private TextBlock lblJumpPct;
         private StackPanel stratPanel;
 
         // ─── Dashboard placement & drag/resize ────────────────────
@@ -220,6 +232,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 atrPeriod             = 14;
                 minSignalConfidence   = 68.0;
                 slTpAdjustStep        = 5;
+                jumpSlPercent         = 50;
                 showEma               = true;
                 showRsi               = true;
                 showAtr               = true;
@@ -253,6 +266,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 dailyRealizedPnL = 0;
                 dailyLimitHit    = false;
                 dailyProfitHit   = false;
+                defaultSlPoints  = slPoints;
+                defaultTpPoints  = tpPoints;
             }
             else if (State == State.Terminated)
             {
@@ -335,11 +350,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                 pendingExitTicks = 0;
             }
 
-            // 4. Button entries (manual LONG/SHORT)
+            // 4. Button entries (manual BUY/SELL MKT/LMT + partial close + jump SL)
             if (State == State.Realtime && !pendingExit)
             {
-                if (pendingLong)  { pendingLong  = false; ExecuteLongEntry(true); }
-                if (pendingShort) { pendingShort = false; ExecuteShortEntry(true); }
+                if (pendingLong)       { pendingLong       = false; ExecuteLongEntry(true); }
+                if (pendingShort)      { pendingShort      = false; ExecuteShortEntry(true); }
+                if (pendingLongLimit)  { pendingLongLimit  = false; ExecuteLongLimitEntry(); }
+                if (pendingShortLimit) { pendingShortLimit = false; ExecuteShortLimitEntry(); }
+                if (pendingCloseOne)   { pendingCloseOne   = false; ExecuteCloseOne(); }
+                if (pendingJumpSL)     { pendingJumpSL     = false; ExecuteJumpSL(); }
                 if (pendingRearm) { pendingRearm = false; if (stopsArmed) ArmHiddenStops(); }
             }
 
@@ -654,6 +673,151 @@ namespace NinjaTrader.NinjaScript.Strategies
             UpdateDashboardStatus("● Closing trade...", Brushes.Yellow);
         }
 
+        // ─── Limit order entries ──────────────────────────────────
+        private void ExecuteLongLimitEntry()
+        {
+            if (pendingExit) { UpdateDashboardStatus("⚠ BUY LMT blocked: exit pending", Brushes.Orange); return; }
+            if (dailyLimitHit || dailyProfitHit) { UpdateDashboardStatus("⚠ BUY LMT blocked: daily limit", Brushes.OrangeRed); return; }
+            int ct = ToTime(Time[0]);
+            if (ct >= 165500 && ct < 180000) { UpdateDashboardStatus("⚠ BUY LMT blocked: CME maintenance", Brushes.OrangeRed); return; }
+            if (Position.MarketPosition == MarketPosition.Short) { UpdateDashboardStatus("⚠ BUY LMT blocked: close short first", Brushes.Orange); return; }
+            if (!dcaEnabled && Position.MarketPosition != MarketPosition.Flat) { UpdateDashboardStatus("⚠ BUY LMT blocked: DCA off", Brushes.Orange); return; }
+            if (Position.MarketPosition == MarketPosition.Long && openDcaCount >= dcaMaxPositions) { UpdateDashboardStatus("⚠ BUY LMT blocked: max DCA", Brushes.Orange); return; }
+            if (entryDelaySeconds > 0 && (DateTime.Now - lastEntryWallTime).TotalSeconds < entryDelaySeconds) { UpdateDashboardStatus("⚠ BUY LMT blocked: cooldown", Brushes.Orange); return; }
+
+            double limitPrice = GetCurrentBid();
+            if (limitPrice <= 0) limitPrice = Close[0] - TickSize;
+
+            if (Position.MarketPosition == MarketPosition.Flat)
+                tradeSequence++;
+            openDcaCount++;
+            string signalName = "LE_LMT_" + tradeSequence + "_" + openDcaCount;
+            EnterLongLimit(contracts, limitPrice, signalName);
+            activeEntrySignals.Add(signalName);
+            openTradeDirection = 1;
+            lastEntryWallTime = DateTime.Now;
+
+            double newQty = totalContracts + contracts;
+            averageEntryPrice = totalContracts > 0
+                ? (averageEntryPrice * totalContracts + limitPrice * contracts) / newQty
+                : limitPrice;
+            totalContracts = newQty;
+
+            ArmHiddenStops();
+            Print(Time[0] + " | BUY LMT #" + openDcaCount + " qty=" + contracts + " @ limit " + limitPrice.ToString("F2"));
+            UpdateDashboardStatus("● BUY LMT #" + openDcaCount + " @ " + limitPrice.ToString("F2"), Brushes.LimeGreen);
+        }
+
+        private void ExecuteShortLimitEntry()
+        {
+            if (pendingExit) { UpdateDashboardStatus("⚠ SELL LMT blocked: exit pending", Brushes.Orange); return; }
+            if (dailyLimitHit || dailyProfitHit) { UpdateDashboardStatus("⚠ SELL LMT blocked: daily limit", Brushes.OrangeRed); return; }
+            int ct = ToTime(Time[0]);
+            if (ct >= 165500 && ct < 180000) { UpdateDashboardStatus("⚠ SELL LMT blocked: CME maintenance", Brushes.OrangeRed); return; }
+            if (Position.MarketPosition == MarketPosition.Long) { UpdateDashboardStatus("⚠ SELL LMT blocked: close long first", Brushes.Orange); return; }
+            if (!dcaEnabled && Position.MarketPosition != MarketPosition.Flat) { UpdateDashboardStatus("⚠ SELL LMT blocked: DCA off", Brushes.Orange); return; }
+            if (Position.MarketPosition == MarketPosition.Short && openDcaCount >= dcaMaxPositions) { UpdateDashboardStatus("⚠ SELL LMT blocked: max DCA", Brushes.Orange); return; }
+            if (entryDelaySeconds > 0 && (DateTime.Now - lastEntryWallTime).TotalSeconds < entryDelaySeconds) { UpdateDashboardStatus("⚠ SELL LMT blocked: cooldown", Brushes.Orange); return; }
+
+            double limitPrice = GetCurrentAsk();
+            if (limitPrice <= 0) limitPrice = Close[0] + TickSize;
+
+            if (Position.MarketPosition == MarketPosition.Flat)
+                tradeSequence++;
+            openDcaCount++;
+            string signalName = "SE_LMT_" + tradeSequence + "_" + openDcaCount;
+            EnterShortLimit(contracts, limitPrice, signalName);
+            activeEntrySignals.Add(signalName);
+            openTradeDirection = -1;
+            lastEntryWallTime = DateTime.Now;
+
+            double newQty = totalContracts + contracts;
+            averageEntryPrice = totalContracts > 0
+                ? (averageEntryPrice * totalContracts + limitPrice * contracts) / newQty
+                : limitPrice;
+            totalContracts = newQty;
+
+            ArmHiddenStops();
+            Print(Time[0] + " | SELL LMT #" + openDcaCount + " qty=" + contracts + " @ limit " + limitPrice.ToString("F2"));
+            UpdateDashboardStatus("● SELL LMT #" + openDcaCount + " @ " + limitPrice.ToString("F2"), Brushes.OrangeRed);
+        }
+
+        // ─── Partial close: exit 1 contract ──────────────────────
+        private void ExecuteCloseOne()
+        {
+            if (Position.MarketPosition == MarketPosition.Flat)
+            {
+                UpdateDashboardStatus("● Already flat", Brushes.CornflowerBlue);
+                return;
+            }
+            if (Position.Quantity <= 1)
+            {
+                UpdateDashboardStatus("⚠ Only 1 qty — use CLOSE TRADE", Brushes.Orange);
+                return;
+            }
+
+            // Exit the LAST signal (most recent DCA add) for 1 contract
+            string sig = activeEntrySignals.Count > 0 ? activeEntrySignals[activeEntrySignals.Count - 1] : "";
+            string exitSig = "PX_" + (++tradeSequence);
+
+            if (Position.MarketPosition == MarketPosition.Long)
+                ExitLong(1, exitSig, sig);
+            else
+                ExitShort(1, exitSig, sig);
+
+            // Update tracking
+            if (activeEntrySignals.Count > 0)
+                activeEntrySignals.RemoveAt(activeEntrySignals.Count - 1);
+            openDcaCount = Math.Max(0, openDcaCount - 1);
+            totalContracts = Math.Max(0, totalContracts - 1);
+
+            Print(Time[0] + " | CLOSE 1 — remaining qty≈" + (Position.Quantity - 1) + " DCA=" + openDcaCount);
+            UpdateDashboardStatus("● Closed 1 contract", Brushes.Yellow);
+        }
+
+        // ─── Jump SL closer to current price ─────────────────────
+        private void ExecuteJumpSL()
+        {
+            if (!stopsArmed || Position.MarketPosition == MarketPosition.Flat)
+            {
+                UpdateDashboardStatus("⚠ No active SL to jump", Brushes.Orange);
+                return;
+            }
+
+            double price = Close[0];
+            double pct = jumpSlPercent / 100.0;
+
+            if (openTradeDirection == 1)
+            {
+                // Long: SL is below price. Jump it closer by pct of the gap.
+                double gap = price - hiddenStopPrice;
+                if (gap <= 1.0 * 4.0 * TickSize) { UpdateDashboardStatus("⚠ SL already at minimum", Brushes.Orange); return; }
+                double newSl = hiddenStopPrice + gap * pct;
+                // Enforce minimum 1 point from current price
+                double minSl = price - 1.0 * 4.0 * TickSize;
+                if (newSl > minSl) newSl = minSl;
+                hiddenStopPrice = Math.Round(newSl / TickSize) * TickSize;
+                slPoints = (int)Math.Round((price - hiddenStopPrice) / (4.0 * TickSize));
+            }
+            else if (openTradeDirection == -1)
+            {
+                // Short: SL is above price. Jump it closer by pct of the gap.
+                double gap = hiddenStopPrice - price;
+                if (gap <= 1.0 * 4.0 * TickSize) { UpdateDashboardStatus("⚠ SL already at minimum", Brushes.Orange); return; }
+                double newSl = hiddenStopPrice - gap * pct;
+                double maxSl = price + 1.0 * 4.0 * TickSize;
+                if (newSl < maxSl) newSl = maxSl;
+                hiddenStopPrice = Math.Round(newSl / TickSize) * TickSize;
+                slPoints = (int)Math.Round((hiddenStopPrice - price) / (4.0 * TickSize));
+            }
+
+            slPoints = Math.Max(1, slPoints);
+            Print(Time[0] + " | JUMP SL: new SL=" + hiddenStopPrice.ToString("F2") + " (" + slPoints + " pts)");
+            if (ChartControl != null)
+                ChartControl.Dispatcher.InvokeAsync(() => UpdateAdjustLabels());
+            UpdateDashboardStatus("● SL jumped to " + hiddenStopPrice.ToString("F2") + " (" + slPoints + "pt)", Brushes.Yellow);
+        }
+
         private void ResetPositionState()
         {
             stopsArmed         = false;
@@ -667,6 +831,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             hiddenStopPrice    = 0;
             hiddenTargetPrice  = 0;
             activeEntrySignals.Clear();
+
+            // Reset SL/TP to default values for next trade
+            if (defaultSlPoints > 0) slPoints = defaultSlPoints;
+            if (defaultTpPoints > 0) tpPoints = defaultTpPoints;
+            if (ChartControl != null)
+                ChartControl.Dispatcher.InvokeAsync(() => UpdateAdjustLabels());
 
             // Remove trade-related chart lines
             RemoveDrawObject("hiddenSL");
@@ -1203,7 +1373,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 // ─── SL row ───────────────────────────────────────
                 var slRow = MakeAdjustRow("SL:", slPoints + "pt | " + (slPoints * 4) + "tk | $" + (slPoints * 20), 
-                    (s, e) => { slPoints = Math.Max(5, slPoints - slTpAdjustStep); UpdateAdjustLabels(); pendingRearm = true; },
+                    (s, e) => { slPoints = Math.Max(1, slPoints - slTpAdjustStep); UpdateAdjustLabels(); pendingRearm = true; },
                     (s, e) => { slPoints = Math.Min(500, slPoints + slTpAdjustStep); UpdateAdjustLabels(); pendingRearm = true; },
                     "");
                 lblSlVal = (TextBlock)((StackPanel)slRow).Children[3];
@@ -1211,7 +1381,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 // ─── TP row ───────────────────────────────────────
                 var tpRow = MakeAdjustRow("TP:", tpPoints + "pt | " + (tpPoints * 4) + "tk | $" + (tpPoints * 20), 
-                    (s, e) => { tpPoints = Math.Max(5, tpPoints - slTpAdjustStep); UpdateAdjustLabels(); pendingRearm = true; },
+                    (s, e) => { tpPoints = Math.Max(1, tpPoints - slTpAdjustStep); UpdateAdjustLabels(); pendingRearm = true; },
                     (s, e) => { tpPoints = Math.Min(500, tpPoints + slTpAdjustStep); UpdateAdjustLabels(); pendingRearm = true; },
                     "");
                 lblTpVal = (TextBlock)((StackPanel)tpRow).Children[3];
@@ -1219,35 +1389,86 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 stack.Children.Add(MakeSeparator());
 
-                // ─── LONG / SHORT buttons ─────────────────────────
-                var btnRow = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 2, 0, 2) };
-                btnLong = new Button
+                // ─── Jump SL row ──────────────────────────────────
+                var jumpRow = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 2, 0, 2) };
+                btnJumpSL = new Button
                 {
-                    Content = "▲  LONG", Width = 120, Height = 38,
-                    Background = new SolidColorBrush(Color.FromRgb(22, 140, 100)),
-                    Foreground = Brushes.White, FontSize = 13, FontWeight = FontWeights.Bold,
+                    Content = "⇥ JUMP SL", Width = 90, Height = 26,
+                    Background = new SolidColorBrush(Color.FromRgb(120, 80, 20)),
+                    Foreground = Brushes.White, FontSize = 10, FontWeight = FontWeights.Bold,
                     BorderThickness = new Thickness(0), Margin = new Thickness(0, 0, 4, 0)
                 };
-                btnShort = new Button
+                jumpRow.Children.Add(btnJumpSL);
+                jumpRow.Children.Add(MakeSmallButton("−", (s, e) => { jumpSlPercent = Math.Max(10, jumpSlPercent - 10); UpdateJumpLabel(); }));
+                lblJumpPct = MakeLabel(jumpSlPercent + "%", Brushes.White, 10, FontWeights.Bold, HorizontalAlignment.Center);
+                lblJumpPct.Width = 36;
+                lblJumpPct.VerticalAlignment = VerticalAlignment.Center;
+                lblJumpPct.TextAlignment = TextAlignment.Center;
+                jumpRow.Children.Add(lblJumpPct);
+                jumpRow.Children.Add(MakeSmallButton("+", (s, e) => { jumpSlPercent = Math.Min(95, jumpSlPercent + 10); UpdateJumpLabel(); }));
+                stack.Children.Add(jumpRow);
+
+                stack.Children.Add(MakeSeparator());
+
+                // ─── BUY MKT / SELL MKT buttons ──────────────────
+                var btnRow = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 2, 0, 2) };
+                btnBuyMkt = new Button
                 {
-                    Content = "▼  SHORT", Width = 120, Height = 38,
+                    Content = "▲ BUY MKT", Width = 120, Height = 36,
+                    Background = new SolidColorBrush(Color.FromRgb(22, 140, 100)),
+                    Foreground = Brushes.White, FontSize = 12, FontWeight = FontWeights.Bold,
+                    BorderThickness = new Thickness(0), Margin = new Thickness(0, 0, 4, 0)
+                };
+                btnSellMkt = new Button
+                {
+                    Content = "▼ SELL MKT", Width = 120, Height = 36,
                     Background = new SolidColorBrush(Color.FromRgb(190, 45, 45)),
-                    Foreground = Brushes.White, FontSize = 13, FontWeight = FontWeights.Bold,
+                    Foreground = Brushes.White, FontSize = 12, FontWeight = FontWeights.Bold,
                     BorderThickness = new Thickness(0), Margin = new Thickness(4, 0, 0, 0)
                 };
-                btnRow.Children.Add(btnLong);
-                btnRow.Children.Add(btnShort);
+                btnRow.Children.Add(btnBuyMkt);
+                btnRow.Children.Add(btnSellMkt);
                 stack.Children.Add(btnRow);
 
-                // ─── Close Trade button ───────────────────────────
+                // ─── BUY LMT / SELL LMT buttons ──────────────────
+                var lmtRow = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 2, 0, 2) };
+                btnBuyLmt = new Button
+                {
+                    Content = "△ BUY LMT", Width = 120, Height = 30,
+                    Background = new SolidColorBrush(Color.FromRgb(18, 105, 78)),
+                    Foreground = Brushes.White, FontSize = 11, FontWeight = FontWeights.SemiBold,
+                    BorderThickness = new Thickness(0), Margin = new Thickness(0, 0, 4, 0)
+                };
+                btnSellLmt = new Button
+                {
+                    Content = "▽ SELL LMT", Width = 120, Height = 30,
+                    Background = new SolidColorBrush(Color.FromRgb(145, 35, 35)),
+                    Foreground = Brushes.White, FontSize = 11, FontWeight = FontWeights.SemiBold,
+                    BorderThickness = new Thickness(0), Margin = new Thickness(4, 0, 0, 0)
+                };
+                lmtRow.Children.Add(btnBuyLmt);
+                lmtRow.Children.Add(btnSellLmt);
+                stack.Children.Add(lmtRow);
+
+                // ─── Close 1 + Close All row ──────────────────────
+                var closeRow = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 4, 0, 0) };
+                btnCloseOne = new Button
+                {
+                    Content = "▣ CLOSE 1", Width = 90, Height = 28,
+                    Background = new SolidColorBrush(Color.FromRgb(130, 90, 0)),
+                    Foreground = Brushes.White, FontSize = 10, FontWeight = FontWeights.Bold,
+                    BorderThickness = new Thickness(0), Margin = new Thickness(0, 0, 4, 0)
+                };
                 btnCloseTrade = new Button
                 {
-                    Content = "⏹  CLOSE TRADE", Height = 30,
+                    Content = "⏹ CLOSE ALL", Width = 148, Height = 28,
                     Background = new SolidColorBrush(Color.FromRgb(160, 100, 0)),
-                    Foreground = Brushes.White, FontSize = 11, FontWeight = FontWeights.SemiBold,
-                    Margin = new Thickness(0, 4, 0, 0), BorderThickness = new Thickness(0)
+                    Foreground = Brushes.White, FontSize = 10, FontWeight = FontWeights.Bold,
+                    BorderThickness = new Thickness(0)
                 };
-                stack.Children.Add(btnCloseTrade);
+                closeRow.Children.Add(btnCloseOne);
+                closeRow.Children.Add(btnCloseTrade);
+                stack.Children.Add(closeRow);
 
                 // ─── Emergency Kill button ────────────────────────
                 btnExit = new Button
@@ -1395,9 +1616,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                             {
                                 if (current is Button btn)
                                 {
-                                    if (btn == btnLong)            { pendingLong = true; if (lblStatus != null) { lblStatus.Text = "● LONG queued..."; lblStatus.Foreground = Brushes.Yellow; } }
-                                    else if (btn == btnShort)       { pendingShort = true; if (lblStatus != null) { lblStatus.Text = "● SHORT queued..."; lblStatus.Foreground = Brushes.Yellow; } }
+                                    if (btn == btnBuyMkt)           { pendingLong = true; if (lblStatus != null) { lblStatus.Text = "● BUY MKT queued..."; lblStatus.Foreground = Brushes.Yellow; } }
+                                    else if (btn == btnSellMkt)     { pendingShort = true; if (lblStatus != null) { lblStatus.Text = "● SELL MKT queued..."; lblStatus.Foreground = Brushes.Yellow; } }
+                                    else if (btn == btnBuyLmt)      { pendingLongLimit = true; if (lblStatus != null) { lblStatus.Text = "● BUY LMT queued..."; lblStatus.Foreground = Brushes.Yellow; } }
+                                    else if (btn == btnSellLmt)     { pendingShortLimit = true; if (lblStatus != null) { lblStatus.Text = "● SELL LMT queued..."; lblStatus.Foreground = Brushes.Yellow; } }
+                                    else if (btn == btnCloseOne)    { pendingCloseOne = true; if (lblStatus != null) { lblStatus.Text = "● CLOSE 1 queued..."; lblStatus.Foreground = Brushes.Yellow; } }
                                     else if (btn == btnCloseTrade)  { pendingCloseTrade = true; if (lblStatus != null) { lblStatus.Text = "● CLOSE queued..."; lblStatus.Foreground = Brushes.Yellow; } }
+                                    else if (btn == btnJumpSL)      { pendingJumpSL = true; if (lblStatus != null) { lblStatus.Text = "● JUMP SL queued..."; lblStatus.Foreground = Brushes.Yellow; } }
                                     else if (btn == btnExit)        { pendingFlatten = true; if (lblStatus != null) { lblStatus.Text = "⚠ KILL queued..."; lblStatus.Foreground = Brushes.OrangeRed; } }
                                     else if (btn == btnModeManual)  { autoMode = false; UpdateModeButtons(); }
                                     else if (btn == btnModeAuto)    { autoMode = true;  UpdateModeButtons(); }
@@ -1588,6 +1813,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (lblTpVal  != null) lblTpVal.Text  = tpPoints + "pt | " + (tpPoints * 4) + "tk | $" + (tpPoints * 20);
         }
 
+        private void UpdateJumpLabel()
+        {
+            if (lblJumpPct != null) lblJumpPct.Text = jumpSlPercent + "%";
+        }
+
         // ─── Helper: format HHMMSS int to readable string ────────
         private string FormatTime(int hhmmss)
         {
@@ -1741,15 +1971,15 @@ namespace NinjaTrader.NinjaScript.Strategies
         #region Properties
 
         [NinjaScriptProperty]
-        [Range(5, 500)]
+        [Range(1, 500)]
         [Display(Name = "Stop Loss (NQ points)", Order = 1, GroupName = "1 — Risk Management",
-                 Description = "Hidden SL distance from average entry. Adjustable on dashboard with +/- buttons.")]
+                 Description = "Hidden SL distance from average entry. Adjustable on dashboard with +/- buttons. Min 1 point.")]
         public int SlPoints { get { return slPoints; } set { slPoints = value; } }
 
         [NinjaScriptProperty]
-        [Range(5, 500)]
+        [Range(1, 500)]
         [Display(Name = "Take Profit (NQ points)", Order = 2, GroupName = "1 — Risk Management",
-                 Description = "Hidden TP distance from average entry. Adjustable on dashboard with +/- buttons.")]
+                 Description = "Hidden TP distance from average entry. Adjustable on dashboard with +/- buttons. Min 1 point.")]
         public int TpPoints { get { return tpPoints; } set { tpPoints = value; } }
 
         [NinjaScriptProperty]
@@ -1835,6 +2065,12 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "SL/TP Adjust Step (points)", Order = 1, GroupName = "5 — Display",
                  Description = "How many points each +/- click adjusts SL or TP.")]
         public int SlTpAdjustStep { get { return slTpAdjustStep; } set { slTpAdjustStep = value; } }
+
+        [NinjaScriptProperty]
+        [Range(10, 95)]
+        [Display(Name = "Jump SL % (toward price)", Order = 2, GroupName = "5 — Display",
+                 Description = "Percentage of gap to jump SL closer to current price. 50% = halfway, 75% = very close.")]
+        public int JumpSlPercent { get { return jumpSlPercent; } set { jumpSlPercent = value; } }
 
         [NinjaScriptProperty]
         [Display(Name = "Show EMA on chart", Order = 2, GroupName = "5 — Display")]
