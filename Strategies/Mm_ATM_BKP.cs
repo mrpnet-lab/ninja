@@ -27,51 +27,6 @@
 //  - SL/TP reset to defaults after each trade closes
 //
 // ─────────────────────────────────────────────────────────────
-//  STEALTH ORDER NAMING (prop-firm safe)
-// ─────────────────────────────────────────────────────────────
-//  All entry signal names use a single space (" ") so the NT8
-//  Executions → Name column appears blank (NT8 would substitute
-//  "Buy"/"Sell short" for truly empty strings). Exits use "Close".
-//
-//  ★ ENTRY SIGNALS (Name column appears BLANK)
-//    All entries use signalName = " " (single space) — NT8
-//    treats it as a valid non-empty name so it won't substitute
-//    default names, but it renders as blank in the UI.
-//    With EntryHandling.AllEntries and EntriesPerDirection=4,
-//    NT8 allows up to 4 entries per direction under the same
-//    signal name, which matches our DCA limit.
-//
-//    Example session (Name column in Executions tab):
-//      Trade 1, Buy Mkt     →  Name = " " (appears blank)
-//      Trade 1, Buy Mkt DCA →  Name = " " (appears blank)
-//      Trade 1 closed
-//      Trade 2, Sell Lmt    →  Name = " " (appears blank)
-//
-//  ★ EXIT SIGNALS (Name column always shows "Close")
-//    ALL exit types use "Close" as the exit signal name:
-//      - Hidden SL hit        →  "Close"
-//      - Hidden TP hit        →  "Close"
-//      - Adaptive trail hit   →  "Close"
-//      - Close Trade button   →  "Close"
-//      - Close 1 (partial)    →  "Close"
-//      - Emergency Kill       →  Account.Flatten (no signal)
-//
-//  ★ PENDING LIMIT ORDER CANCELLATION
-//    Close Trade and Emergency Kill buttons now cancel any
-//    unfilled limit orders (Working/Accepted/Submitted state)
-//    before closing positions. If flat with only a pending
-//    limit, Close Trade cancels it and resets state.
-//
-//  ★ INTERNAL TRACKING (developer only — Output window)
-//    Print() statements log full context (HIDDEN SL, TRAIL HIT,
-//    DCA #, entry price, etc.) — visible ONLY in NT8's Output
-//    tab, never in Executions or data sent to broker/prop firm.
-//
-//  ★ FIELDS
-//    tradeSequence  — round-trip trade counter (internal logging)
-//    activeEntrySignals — list of entry signals (all " ") for exit pairing
-//
-// ─────────────────────────────────────────────────────────────
 //  ADAPTIVE TRAILING STOP — THE MAIN ADDITION
 // ─────────────────────────────────────────────────────────────
 //
@@ -144,8 +99,7 @@
 //
 //  ★ EXIT MECHANICS
 //  - When price touches or crosses the trail → market exit fires
-//  - Exit signal name: "Close" (stealth — see STEALTH ORDER NAMING)
-//  - Entry signal name: blank "" (stealth — see STEALTH ORDER NAMING)
+//  - Exit signal name: "TRX_" + original entry signal
 //  - Sets pendingExit=true, same flow as hidden SL/TP exits
 //
 //  ★ INTERACTION WITH FIXED SL/TP
@@ -374,8 +328,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int    openDcaCount;
         private double averageEntryPrice;
         private double totalContracts;
-        private int    tradeSequence;       // round-trip trade counter (for internal logging)
-        private readonly List<string> activeEntrySignals = new List<string>(); // entry signals (all "") for exit pairing
+        private int    tradeSequence;       // monotonically increasing for unique signal names
+        private readonly List<string> activeEntrySignals = new List<string>(); // actual signal names used
 
         // ─── Manual VWAP (tick-safe) ──────────────────────────────
         private double vwapCumTPV;          // cumulative for completed bars
@@ -396,10 +350,6 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool     pendingJumpSL;
         private bool     pendingRearm;      // re-arm stops after SL/TP change
         private bool     pendingExit;       // exit orders submitted, waiting for fill
-        private bool     pendingReverseLong;      // reverse: close short → enter long (mkt)
-        private bool     pendingReverseShort;     // reverse: close long → enter short (mkt)
-        private bool     pendingReverseLongLmt;   // reverse: close short → enter long (lmt)
-        private bool     pendingReverseShortLmt;  // reverse: close long → enter short (lmt)
         private bool     pendingLimitFlatten;  // deferred flatten from OnExecutionUpdate (daily limit)
         private int      pendingExitTicks;  // ticks since pendingExit became true (safety net)
         private int      flatSyncGraceTicks; // grace ticks for entry order to fill before state reset
@@ -524,7 +474,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 minSignalConfidence   = 68.0;
                 slTpAdjustStep        = 5;
                 jumpSlPercent         = 50;
-                maxTradesPerDay       = 999;
+                maxTradesPerDay       = 4;
                 showEma               = true;
                 showRsi               = true;
                 showAtr               = true;
@@ -667,16 +617,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             // 4. Button entries (manual BUY/SELL MKT/LMT + partial close + jump SL)
             if ((State == State.Realtime || State == State.Historical) && !pendingExit)
             {
-                // 4a. Reverse entries: position was closed, now fire the queued opposite entry
-                if (Position.MarketPosition == MarketPosition.Flat)
-                {
-                    if (pendingReverseLong)       { pendingReverseLong       = false; ExecuteLongEntry(true); }
-                    else if (pendingReverseShort)  { pendingReverseShort      = false; ExecuteShortEntry(true); }
-                    else if (pendingReverseLongLmt)  { pendingReverseLongLmt  = false; ExecuteLongLimitEntry(); }
-                    else if (pendingReverseShortLmt) { pendingReverseShortLmt = false; ExecuteShortLimitEntry(); }
-                }
-
-                // 4b. Normal button entries
                 if (pendingLong)       { pendingLong       = false; ExecuteLongEntry(true); }
                 if (pendingShort)      { pendingShort      = false; ExecuteShortEntry(true); }
                 if (pendingLongLimit)  { pendingLongLimit  = false; ExecuteLongLimitEntry(); }
@@ -802,7 +742,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     Print(Time[0] + " | HIDDEN SL LONG hit @ " + price.ToString("F2"));
                     foreach (string sig in signals)
-                        ExitLong("Close", sig);
+                        ExitLong("SLX_" + sig, sig);
                     stopsArmed  = false;
                     pendingExit = true;
                 }
@@ -810,7 +750,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     Print(Time[0] + " | HIDDEN TP LONG hit @ " + price.ToString("F2"));
                     foreach (string sig in signals)
-                        ExitLong("Close", sig);
+                        ExitLong("TPX_" + sig, sig);
                     stopsArmed  = false;
                     pendingExit = true;
                 }
@@ -821,7 +761,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     Print(Time[0] + " | HIDDEN SL SHORT hit @ " + price.ToString("F2"));
                     foreach (string sig in signals)
-                        ExitShort("Close", sig);
+                        ExitShort("SLX_" + sig, sig);
                     stopsArmed  = false;
                     pendingExit = true;
                 }
@@ -829,7 +769,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     Print(Time[0] + " | HIDDEN TP SHORT hit @ " + price.ToString("F2"));
                     foreach (string sig in signals)
-                        ExitShort("Close", sig);
+                        ExitShort("TPX_" + sig, sig);
                     stopsArmed  = false;
                     pendingExit = true;
                 }
@@ -934,7 +874,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                         + "pts trend=" + (trailTrendScore * 100).ToString("F0") + "% tier=" + trailTierName
                         + " maxProfit=" + trailMaxProfitPts.ToString("F1") + "pts");
                     foreach (string sig in signals)
-                        ExitLong("Close", sig);
+                        ExitLong("TRX_" + sig, sig);
                     stopsArmed  = false;
                     pendingExit = true;
                 }
@@ -959,7 +899,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                         + "pts trend=" + (trailTrendScore * 100).ToString("F0") + "% tier=" + trailTierName
                         + " maxProfit=" + trailMaxProfitPts.ToString("F1") + "pts");
                     foreach (string sig in signals)
-                        ExitShort("Close", sig);
+                        ExitShort("TRX_" + sig, sig);
                     stopsArmed  = false;
                     pendingExit = true;
                 }
@@ -1060,23 +1000,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (ct >= 165500 && ct < 180000) { Print("Blocked LONG: CME maintenance (" + ct + ")"); UpdateDashboardStatus("⚠ LONG blocked: CME maintenance", Brushes.OrangeRed); return; }
             // Trading hours apply only to auto entries
             if (!isManual && (ct < tradingStartTime || ct >= flattenTime)) { Print("Blocked LONG: outside auto hours (time=" + ct + ")"); UpdateDashboardStatus("⚠ LONG blocked: outside auto hours", Brushes.Orange); return; }
-            if (Position.MarketPosition == MarketPosition.Short)
-            {
-                if (Position.Quantity > contracts)
-                {
-                    // DCA'd: close 1 contract (partial reduce)
-                    Print("LONG pressed while SHORT DCA — closing 1 contract");
-                    ExecuteCloseOne();
-                }
-                else
-                {
-                    // Single entry: full reverse (close short → enter long)
-                    Print("LONG: reversing — closing short first");
-                    pendingReverseLong = true;
-                    ExecuteCloseTrade();
-                }
-                return;
-            }
+            if (Position.MarketPosition == MarketPosition.Short) { Print("Blocked LONG: close short first"); UpdateDashboardStatus("⚠ LONG blocked: close short first", Brushes.Orange); return; }
             if (!dcaEnabled && Position.MarketPosition != MarketPosition.Flat) { Print("Blocked LONG: DCA disabled"); UpdateDashboardStatus("⚠ LONG blocked: DCA off", Brushes.Orange); return; }
             if (Position.MarketPosition == MarketPosition.Long && openDcaCount >= dcaMaxPositions)
             { Print("Blocked LONG: max DCA reached (" + dcaMaxPositions + ")"); UpdateDashboardStatus("⚠ LONG blocked: max DCA", Brushes.Orange); return; }
@@ -1101,7 +1025,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 dailyTradeCount++;
             }
             openDcaCount++;
-            string signalName = " ";
+            string signalName = "LE_" + tradeSequence + "_" + openDcaCount;
             EnterLong(contracts, signalName);
             activeEntrySignals.Add(signalName);
             openTradeDirection = 1;
@@ -1133,23 +1057,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (ct >= 165500 && ct < 180000) { Print("Blocked SHORT: CME maintenance (" + ct + ")"); UpdateDashboardStatus("⚠ SHORT blocked: CME maintenance", Brushes.OrangeRed); return; }
             // Trading hours apply only to auto entries
             if (!isManual && (ct < tradingStartTime || ct >= flattenTime)) { Print("Blocked SHORT: outside auto hours (time=" + ct + ")"); UpdateDashboardStatus("⚠ SHORT blocked: outside auto hours", Brushes.Orange); return; }
-            if (Position.MarketPosition == MarketPosition.Long)
-            {
-                if (Position.Quantity > contracts)
-                {
-                    // DCA'd: close 1 contract (partial reduce)
-                    Print("SHORT pressed while LONG DCA — closing 1 contract");
-                    ExecuteCloseOne();
-                }
-                else
-                {
-                    // Single entry: full reverse (close long → enter short)
-                    Print("SHORT: reversing — closing long first");
-                    pendingReverseShort = true;
-                    ExecuteCloseTrade();
-                }
-                return;
-            }
+            if (Position.MarketPosition == MarketPosition.Long) { Print("Blocked SHORT: close long first"); UpdateDashboardStatus("⚠ SHORT blocked: close long first", Brushes.Orange); return; }
             if (!dcaEnabled && Position.MarketPosition != MarketPosition.Flat) { Print("Blocked SHORT: DCA disabled"); UpdateDashboardStatus("⚠ SHORT blocked: DCA off", Brushes.Orange); return; }
             if (Position.MarketPosition == MarketPosition.Short && openDcaCount >= dcaMaxPositions)
             { Print("Blocked SHORT: max DCA reached (" + dcaMaxPositions + ")"); UpdateDashboardStatus("⚠ SHORT blocked: max DCA", Brushes.Orange); return; }
@@ -1173,7 +1081,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 dailyTradeCount++;
             }
             openDcaCount++;
-            string signalName = " ";
+            string signalName = "SE_" + tradeSequence + "_" + openDcaCount;
             EnterShort(contracts, signalName);
             activeEntrySignals.Add(signalName);
             openTradeDirection = -1;
@@ -1219,18 +1127,6 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void ExecuteFlatten()
         {
-            // Cancel any pending limit orders first
-            CancelPendingOrders();
-
-            // If already flat, just reset state and return — no exit needed
-            if (Position.MarketPosition == MarketPosition.Flat)
-            {
-                ResetPositionState();
-                Print(Time[0] + " | FLATTEN: already flat — state reset");
-                UpdateDashboardStatus("● Already flat — state reset", Brushes.CornflowerBlue);
-                return;
-            }
-
             // PRIMARY: Account.Flatten — 100% reliable, closes ALL positions on this instrument
             try
             {
@@ -1244,44 +1140,29 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // FALLBACK: managed exits
                 var signals = activeEntrySignals.ToList();
                 if (signals.Count > 0 && Position.MarketPosition == MarketPosition.Long)
-                    foreach (string sig in signals) ExitLong("Close", sig);
+                    foreach (string sig in signals) ExitLong("FX_" + sig, sig);
                 else if (signals.Count > 0 && Position.MarketPosition == MarketPosition.Short)
-                    foreach (string sig in signals) ExitShort("Close", sig);
+                    foreach (string sig in signals) ExitShort("FX_" + sig, sig);
                 else if (Position.MarketPosition != MarketPosition.Flat)
                 {
                     if (Position.MarketPosition == MarketPosition.Long)
-                        ExitLong("Close", "");
+                        ExitLong("NUKE_" + (++tradeSequence), "");
                     else
-                        ExitShort("Close", "");
+                        ExitShort("NUKE_" + (++tradeSequence), "");
                 }
             }
 
             stopsArmed  = false;
             pendingExit = true;
-            pendingReverseLong = false; pendingReverseShort = false;
-            pendingReverseLongLmt = false; pendingReverseShortLmt = false;
             Print(Time[0] + " | Flatten submitted (pendingExit=true)");
         }
 
         private void ExecuteCloseTrade()
         {
-            // Cancel any pending limit orders (unfilled Buy/Sell Lmt)
-            bool hadPending = CancelPendingOrders();
-
             if (Position.MarketPosition == MarketPosition.Flat)
             {
-                if (hadPending)
-                {
-                    // We were flat with a pending limit — cancel it and reset state
-                    ResetPositionState();
-                    Print(Time[0] + " | Close Trade: cancelled pending limit order(s), reset state");
-                    UpdateDashboardStatus("● Cancelled pending order", Brushes.Yellow);
-                }
-                else
-                {
-                    Print(Time[0] + " | Close Trade: already flat, nothing to do");
-                    UpdateDashboardStatus("● Already flat", Brushes.CornflowerBlue);
-                }
+                Print(Time[0] + " | Close Trade: already flat, nothing to do");
+                UpdateDashboardStatus("● Already flat", Brushes.CornflowerBlue);
                 return;
             }
 
@@ -1289,57 +1170,22 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (signals.Count > 0)
             {
                 if (Position.MarketPosition == MarketPosition.Long)
-                    foreach (string sig in signals) ExitLong("Close", sig);
+                    foreach (string sig in signals) ExitLong("CX_" + sig, sig);
                 else if (Position.MarketPosition == MarketPosition.Short)
-                    foreach (string sig in signals) ExitShort("Close", sig);
+                    foreach (string sig in signals) ExitShort("CX_" + sig, sig);
             }
             else
             {
                 if (Position.MarketPosition == MarketPosition.Long)
-                    ExitLong("Close", "");
+                    ExitLong("CX_" + (++tradeSequence), "");
                 else
-                    ExitShort("Close", "");
+                    ExitShort("CX_" + (++tradeSequence), "");
             }
 
             stopsArmed  = false;
             pendingExit = true;
             Print(Time[0] + " | Close Trade submitted (managed exits, pendingExit=true)");
             UpdateDashboardStatus("● Closing trade...", Brushes.Yellow);
-        }
-
-        /// <summary>
-        /// Cancel all working/accepted orders for this instrument.
-        /// Returns true if any orders were cancelled.
-        /// </summary>
-        private bool CancelPendingOrders()
-        {
-            bool cancelled = false;
-            try
-            {
-                var working = new List<Order>();
-                foreach (Order order in Account.Orders)
-                {
-                    if (order.Instrument == Instrument
-                        && (order.OrderState == OrderState.Working
-                            || order.OrderState == OrderState.Accepted
-                            || order.OrderState == OrderState.Submitted))
-                    {
-                        working.Add(order);
-                    }
-                }
-
-                if (working.Count > 0)
-                {
-                    Account.Cancel(working.ToArray());
-                    cancelled = true;
-                    Print(Time[0] + " | Cancelled " + working.Count + " pending order(s)");
-                }
-            }
-            catch (Exception ex)
-            {
-                Print(Time[0] + " | CancelPendingOrders error: " + ex.Message);
-            }
-            return cancelled;
         }
 
         // ─── Limit order entries ──────────────────────────────────
@@ -1351,22 +1197,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             { UpdateDashboardStatus("⚠ BUY LMT blocked: max trades/day", Brushes.Orange); return; }
             int ct = ToTime(Time[0]);
             if (ct >= 165500 && ct < 180000) { UpdateDashboardStatus("⚠ BUY LMT blocked: CME maintenance", Brushes.OrangeRed); return; }
-            if (Position.MarketPosition == MarketPosition.Short)
-            {
-                if (Position.Quantity > contracts)
-                {
-                    Print("BUY LMT pressed while SHORT DCA — closing 1 contract");
-                    ExecuteCloseOne();
-                }
-                else
-                {
-                    Print("BUY LMT: reversing — closing short first");
-                    UpdateDashboardStatus("● Reversing — closing short...", Brushes.Yellow);
-                    pendingReverseLongLmt = true;
-                    ExecuteCloseTrade();
-                }
-                return;
-            }
+            if (Position.MarketPosition == MarketPosition.Short) { UpdateDashboardStatus("⚠ BUY LMT blocked: close short first", Brushes.Orange); return; }
             if (!dcaEnabled && Position.MarketPosition != MarketPosition.Flat) { UpdateDashboardStatus("⚠ BUY LMT blocked: DCA off", Brushes.Orange); return; }
             if (Position.MarketPosition == MarketPosition.Long && openDcaCount >= dcaMaxPositions) { UpdateDashboardStatus("⚠ BUY LMT blocked: max DCA", Brushes.Orange); return; }
             if (entryDelaySeconds > 0 && ((State == State.Realtime ? DateTime.Now : Time[0]) - lastEntryWallTime).TotalSeconds < entryDelaySeconds) { UpdateDashboardStatus("⚠ BUY LMT blocked: cooldown", Brushes.Orange); return; }
@@ -1380,7 +1211,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 dailyTradeCount++;
             }
             openDcaCount++;
-            string signalName = " ";
+            string signalName = "LE_LMT_" + tradeSequence + "_" + openDcaCount;
             EnterLongLimit(contracts, limitPrice, signalName);
             activeEntrySignals.Add(signalName);
             openTradeDirection = 1;
@@ -1405,22 +1236,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             { UpdateDashboardStatus("⚠ SELL LMT blocked: max trades/day", Brushes.Orange); return; }
             int ct = ToTime(Time[0]);
             if (ct >= 165500 && ct < 180000) { UpdateDashboardStatus("⚠ SELL LMT blocked: CME maintenance", Brushes.OrangeRed); return; }
-            if (Position.MarketPosition == MarketPosition.Long)
-            {
-                if (Position.Quantity > contracts)
-                {
-                    Print("SELL LMT pressed while LONG DCA — closing 1 contract");
-                    ExecuteCloseOne();
-                }
-                else
-                {
-                    Print("SELL LMT: reversing — closing long first");
-                    UpdateDashboardStatus("● Reversing — closing long...", Brushes.Yellow);
-                    pendingReverseShortLmt = true;
-                    ExecuteCloseTrade();
-                }
-                return;
-            }
+            if (Position.MarketPosition == MarketPosition.Long) { UpdateDashboardStatus("⚠ SELL LMT blocked: close long first", Brushes.Orange); return; }
             if (!dcaEnabled && Position.MarketPosition != MarketPosition.Flat) { UpdateDashboardStatus("⚠ SELL LMT blocked: DCA off", Brushes.Orange); return; }
             if (Position.MarketPosition == MarketPosition.Short && openDcaCount >= dcaMaxPositions) { UpdateDashboardStatus("⚠ SELL LMT blocked: max DCA", Brushes.Orange); return; }
             if (entryDelaySeconds > 0 && ((State == State.Realtime ? DateTime.Now : Time[0]) - lastEntryWallTime).TotalSeconds < entryDelaySeconds) { UpdateDashboardStatus("⚠ SELL LMT blocked: cooldown", Brushes.Orange); return; }
@@ -1434,7 +1250,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 dailyTradeCount++;
             }
             openDcaCount++;
-            string signalName = " ";
+            string signalName = "SE_LMT_" + tradeSequence + "_" + openDcaCount;
             EnterShortLimit(contracts, limitPrice, signalName);
             activeEntrySignals.Add(signalName);
             openTradeDirection = -1;
@@ -1459,21 +1275,20 @@ namespace NinjaTrader.NinjaScript.Strategies
                 UpdateDashboardStatus("● Already flat", Brushes.CornflowerBlue);
                 return;
             }
-
-            // If only 1 contract left, close the full position
             if (Position.Quantity <= 1)
             {
-                ExecuteCloseTrade();
+                UpdateDashboardStatus("⚠ Only 1 qty — use CLOSE TRADE", Brushes.Orange);
                 return;
             }
 
             // Exit the LAST signal (most recent DCA add) for 1 contract
             string sig = activeEntrySignals.Count > 0 ? activeEntrySignals[activeEntrySignals.Count - 1] : "";
+            string exitSig = "PX_" + (++tradeSequence);
 
             if (Position.MarketPosition == MarketPosition.Long)
-                ExitLong(1, "Close", sig);
+                ExitLong(1, exitSig, sig);
             else
-                ExitShort(1, "Close", sig);
+                ExitShort(1, exitSig, sig);
 
             // Update tracking
             if (activeEntrySignals.Count > 0)
@@ -3068,7 +2883,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         public int MaxDailyProfitDollars { get { return maxDailyProfitDollars; } set { maxDailyProfitDollars = value; } }
 
         [NinjaScriptProperty]
-        [Range(0, 999)]
+        [Range(0, 20)]
         [Display(Name = "Max Trades Per Day", Order = 5, GroupName = "1 — Risk Management",
                  Description = "Maximum round-trip trades per session (0 = unlimited). Includes auto and manual entries.")]
         public int MaxTradesPerDay { get { return maxTradesPerDay; } set { maxTradesPerDay = value; } }
