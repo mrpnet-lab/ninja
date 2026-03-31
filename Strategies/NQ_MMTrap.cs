@@ -71,6 +71,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double minSignalConfidence;
         private int    slTpAdjustStep;
         private int    jumpSlPercent;       // % jump toward current price (default 50)
+        private int    maxTradesPerDay;     // max auto+manual round-trip trades per session
+        private int    dailyTradeCount;     // completed round-trip trades today
         private bool   showEma;
         private bool   showRsi;
         private bool   showAtr;
@@ -233,6 +235,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 minSignalConfidence   = 68.0;
                 slTpAdjustStep        = 5;
                 jumpSlPercent         = 50;
+                maxTradesPerDay       = 4;
                 showEma               = true;
                 showRsi               = true;
                 showAtr               = true;
@@ -412,7 +415,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             CalculateSignals();
 
             if (autoMode && !dailyLimitHit && !dailyProfitHit && insideTradingHours
-                && Position.MarketPosition == MarketPosition.Flat && openTradeDirection == 0)
+                && Position.MarketPosition == MarketPosition.Flat && openTradeDirection == 0
+                && (maxTradesPerDay <= 0 || dailyTradeCount < maxTradesPerDay))
             {
                 if (lastBullConfidence >= minSignalConfidence)
                     ExecuteLongEntry(false);
@@ -425,10 +429,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 string reason = "";
                 if (dailyLimitHit) reason = "dailyLossLimit";
                 else if (dailyProfitHit) reason = "dailyProfitHit";
+                else if (maxTradesPerDay > 0 && dailyTradeCount >= maxTradesPerDay) reason = "maxTradesPerDay(" + dailyTradeCount + "/" + maxTradesPerDay + ")";
                 else if (!insideTradingHours) reason = "outsideHours";
                 else if (openTradeDirection != 0) reason = "openTradeDir=" + openTradeDirection;
                 else reason = "lowConfidence(Bull=" + lastBullConfidence.ToString("F0") + "% Bear=" + lastBearConfidence.ToString("F0") + "% need=" + minSignalConfidence.ToString("F0") + "%)";
-                Print(Time[0] + " | AUTO-SCAN: no entry — " + reason + " | DailyPnL=" + dailyRealizedPnL.ToString("C0"));
+                Print(Time[0] + " | AUTO-SCAN: no entry — " + reason + " | Trades=" + dailyTradeCount + "/" + maxTradesPerDay + " | DailyPnL=" + dailyRealizedPnL.ToString("C0"));
             }
 
             // ─── Chart & dashboard (non-latency path) ─────────────
@@ -499,6 +504,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (pendingExit) { Print("Blocked LONG: exit pending"); UpdateDashboardStatus("⚠ LONG blocked: exit pending", Brushes.Orange); return; }
             if (dailyLimitHit || dailyProfitHit) { Print("Blocked LONG: daily limit hit"); UpdateDashboardStatus("⚠ LONG blocked: daily limit", Brushes.OrangeRed); return; }
+            if (maxTradesPerDay > 0 && dailyTradeCount >= maxTradesPerDay && Position.MarketPosition == MarketPosition.Flat)
+            { Print("Blocked LONG: max trades/day (" + dailyTradeCount + "/" + maxTradesPerDay + ")"); UpdateDashboardStatus("⚠ LONG blocked: max trades/day", Brushes.Orange); return; }
             int ct = ToTime(Time[0]);
             // CME maintenance window 4:55 PM - 5:59 PM ET — block ALL entries
             if (ct >= 165500 && ct < 180000) { Print("Blocked LONG: CME maintenance (" + ct + ")"); UpdateDashboardStatus("⚠ LONG blocked: CME maintenance", Brushes.OrangeRed); return; }
@@ -524,7 +531,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             if (Position.MarketPosition == MarketPosition.Flat)
+            {
                 tradeSequence++;
+                dailyTradeCount++;
+            }
             openDcaCount++;
             string signalName = "LE_" + tradeSequence + "_" + openDcaCount;
             EnterLong(contracts, signalName);
@@ -551,6 +561,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (pendingExit) { Print("Blocked SHORT: exit pending"); UpdateDashboardStatus("⚠ SHORT blocked: exit pending", Brushes.Orange); return; }
             if (dailyLimitHit || dailyProfitHit) { Print("Blocked SHORT: daily limit hit"); UpdateDashboardStatus("⚠ SHORT blocked: daily limit", Brushes.OrangeRed); return; }
+            if (maxTradesPerDay > 0 && dailyTradeCount >= maxTradesPerDay && Position.MarketPosition == MarketPosition.Flat)
+            { Print("Blocked SHORT: max trades/day (" + dailyTradeCount + "/" + maxTradesPerDay + ")"); UpdateDashboardStatus("⚠ SHORT blocked: max trades/day", Brushes.Orange); return; }
             int ct = ToTime(Time[0]);
             // CME maintenance window 4:55 PM - 5:59 PM ET — block ALL entries
             if (ct >= 165500 && ct < 180000) { Print("Blocked SHORT: CME maintenance (" + ct + ")"); UpdateDashboardStatus("⚠ SHORT blocked: CME maintenance", Brushes.OrangeRed); return; }
@@ -575,7 +587,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             if (Position.MarketPosition == MarketPosition.Flat)
+            {
                 tradeSequence++;
+                dailyTradeCount++;
+            }
             openDcaCount++;
             string signalName = "SE_" + tradeSequence + "_" + openDcaCount;
             EnterShort(contracts, signalName);
@@ -689,6 +704,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (pendingExit) { UpdateDashboardStatus("⚠ BUY LMT blocked: exit pending", Brushes.Orange); return; }
             if (dailyLimitHit || dailyProfitHit) { UpdateDashboardStatus("⚠ BUY LMT blocked: daily limit", Brushes.OrangeRed); return; }
+            if (maxTradesPerDay > 0 && dailyTradeCount >= maxTradesPerDay && Position.MarketPosition == MarketPosition.Flat)
+            { UpdateDashboardStatus("⚠ BUY LMT blocked: max trades/day", Brushes.Orange); return; }
             int ct = ToTime(Time[0]);
             if (ct >= 165500 && ct < 180000) { UpdateDashboardStatus("⚠ BUY LMT blocked: CME maintenance", Brushes.OrangeRed); return; }
             if (Position.MarketPosition == MarketPosition.Short) { UpdateDashboardStatus("⚠ BUY LMT blocked: close short first", Brushes.Orange); return; }
@@ -700,7 +717,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (limitPrice <= 0) limitPrice = Close[0] - TickSize;
 
             if (Position.MarketPosition == MarketPosition.Flat)
+            {
                 tradeSequence++;
+                dailyTradeCount++;
+            }
             openDcaCount++;
             string signalName = "LE_LMT_" + tradeSequence + "_" + openDcaCount;
             EnterLongLimit(contracts, limitPrice, signalName);
@@ -723,6 +743,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (pendingExit) { UpdateDashboardStatus("⚠ SELL LMT blocked: exit pending", Brushes.Orange); return; }
             if (dailyLimitHit || dailyProfitHit) { UpdateDashboardStatus("⚠ SELL LMT blocked: daily limit", Brushes.OrangeRed); return; }
+            if (maxTradesPerDay > 0 && dailyTradeCount >= maxTradesPerDay && Position.MarketPosition == MarketPosition.Flat)
+            { UpdateDashboardStatus("⚠ SELL LMT blocked: max trades/day", Brushes.Orange); return; }
             int ct = ToTime(Time[0]);
             if (ct >= 165500 && ct < 180000) { UpdateDashboardStatus("⚠ SELL LMT blocked: CME maintenance", Brushes.OrangeRed); return; }
             if (Position.MarketPosition == MarketPosition.Long) { UpdateDashboardStatus("⚠ SELL LMT blocked: close long first", Brushes.Orange); return; }
@@ -734,7 +756,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (limitPrice <= 0) limitPrice = Close[0] + TickSize;
 
             if (Position.MarketPosition == MarketPosition.Flat)
+            {
                 tradeSequence++;
+                dailyTradeCount++;
+            }
             openDcaCount++;
             string signalName = "SE_LMT_" + tradeSequence + "_" + openDcaCount;
             EnterShortLimit(contracts, limitPrice, signalName);
@@ -1004,25 +1029,31 @@ namespace NinjaTrader.NinjaScript.Strategies
             double price = Close[0];
             double prev  = Close[1];
 
-            bool longEma  = emaF > emaS;
-            bool longVwap = price > vwapValue && prev <= vwapValue;
-            bool longRsi  = rsi > 50 && rsi < 75;
-            bool longMom  = Close[0] > High[1];
+            // ── Long ──
+            bool longEma       = emaF > emaS;
+            bool longVwapCross = price > vwapValue && prev <= vwapValue;  // crossover (primary)
+            bool longVwapAbove = price > vwapValue;                       // continuation (staying above)
+            bool longRsi       = rsi > 50 && rsi < 75;
+            bool longMom       = Close[0] > High[1];
 
-            if (longEma)  lastBullConfidence += 30;
-            if (longVwap) lastBullConfidence += 35;
-            if (longRsi)  lastBullConfidence += 20;
-            if (longMom)  lastBullConfidence += 15;
+            if (longEma)       lastBullConfidence += 30;
+            if (longVwapCross) lastBullConfidence += 35;  // full credit on crossover
+            else if (longVwapAbove) lastBullConfidence += 20;  // partial credit for continuation
+            if (longRsi)       lastBullConfidence += 20;
+            if (longMom)       lastBullConfidence += 15;
 
-            bool shortEma  = emaF < emaS;
-            bool shortVwap = price < vwapValue && prev >= vwapValue;
-            bool shortRsi  = rsi < 50 && rsi > 25;
-            bool shortMom  = Close[0] < Low[1];
+            // ── Short ──
+            bool shortEma       = emaF < emaS;
+            bool shortVwapCross = price < vwapValue && prev >= vwapValue;
+            bool shortVwapBelow = price < vwapValue;
+            bool shortRsi       = rsi < 50 && rsi > 25;
+            bool shortMom       = Close[0] < Low[1];
 
-            if (shortEma)  lastBearConfidence += 30;
-            if (shortVwap) lastBearConfidence += 35;
-            if (shortRsi)  lastBearConfidence += 20;
-            if (shortMom)  lastBearConfidence += 15;
+            if (shortEma)       lastBearConfidence += 30;
+            if (shortVwapCross) lastBearConfidence += 35;
+            else if (shortVwapBelow) lastBearConfidence += 20;
+            if (shortRsi)       lastBearConfidence += 20;
+            if (shortMom)       lastBearConfidence += 15;
         }
 
         // ─── Strategy 1: Key Level Breakout ──────────────────────
@@ -1038,21 +1069,27 @@ namespace NinjaTrader.NinjaScript.Strategies
             double price     = Close[0];
             double prevClose = Close[1];
 
-            bool longBreak    = price > priorHigh && prevClose <= priorHigh;
-            bool longAtrConf  = atr > 0 && (price - priorHigh) > atr * 0.15;
-            bool longEmaAlign = indEmaFast[0] > indEmaSlow[0];
+            // ── Long ──
+            bool longBreakCross = price > priorHigh && prevClose <= priorHigh;  // crossover
+            bool longBreakAbove = price > priorHigh;                             // continuation
+            bool longAtrConf    = atr > 0 && (price - priorHigh) > atr * 0.15;
+            bool longEmaAlign   = indEmaFast[0] > indEmaSlow[0];
 
-            if (longBreak)    lastBullConfidence += 50;
-            if (longAtrConf)  lastBullConfidence += 30;
-            if (longEmaAlign) lastBullConfidence += 20;
+            if (longBreakCross)     lastBullConfidence += 50;
+            else if (longBreakAbove) lastBullConfidence += 25;  // holding above breakout level
+            if (longAtrConf)        lastBullConfidence += 30;
+            if (longEmaAlign)       lastBullConfidence += 20;
 
-            bool shortBreak    = price < priorLow && prevClose >= priorLow;
-            bool shortAtrConf  = atr > 0 && (priorLow - price) > atr * 0.15;
-            bool shortEmaAlign = indEmaFast[0] < indEmaSlow[0];
+            // ── Short ──
+            bool shortBreakCross = price < priorLow && prevClose >= priorLow;
+            bool shortBreakBelow = price < priorLow;
+            bool shortAtrConf    = atr > 0 && (priorLow - price) > atr * 0.15;
+            bool shortEmaAlign   = indEmaFast[0] < indEmaSlow[0];
 
-            if (shortBreak)    lastBearConfidence += 50;
-            if (shortAtrConf)  lastBearConfidence += 30;
-            if (shortEmaAlign) lastBearConfidence += 20;
+            if (shortBreakCross)     lastBearConfidence += 50;
+            else if (shortBreakBelow) lastBearConfidence += 25;
+            if (shortAtrConf)        lastBearConfidence += 30;
+            if (shortEmaAlign)       lastBearConfidence += 20;
         }
 
         // ─── Strategy 2: Liquidity Sweep Reversal ────────────────
@@ -1067,21 +1104,27 @@ namespace NinjaTrader.NinjaScript.Strategies
             double prevLow   = Low[1];
             double prevHigh  = High[1];
 
-            bool longSweep    = prevLow < swingLow && price > swingLow;
-            bool longRsiConf  = indRsi[0] < 40;
-            bool longSnapback = atr > 0 && (price - prevLow) > atr * 0.3;
+            // ── Long (sweep lows then recover) ──
+            bool longSweep     = prevLow < swingLow && price > swingLow;              // immediate snap-back
+            bool longRecovery  = price > swingLow && MIN(Low, 5)[1] < swingLow;      // recent sweep within 5 bars
+            bool longRsiConf   = indRsi[0] < 40;
+            bool longSnapback  = atr > 0 && (price - prevLow) > atr * 0.3;
 
-            if (longSweep)    lastBullConfidence += 45;
-            if (longRsiConf)  lastBullConfidence += 30;
-            if (longSnapback) lastBullConfidence += 25;
+            if (longSweep)          lastBullConfidence += 45;
+            else if (longRecovery)  lastBullConfidence += 25;  // continuation after recent sweep
+            if (longRsiConf)        lastBullConfidence += 30;
+            if (longSnapback)       lastBullConfidence += 25;
 
-            bool shortSweep    = prevHigh > swingHigh && price < swingHigh;
-            bool shortRsiConf  = indRsi[0] > 60;
-            bool shortSnapback = atr > 0 && (prevHigh - price) > atr * 0.3;
+            // ── Short (sweep highs then drop) ──
+            bool shortSweep     = prevHigh > swingHigh && price < swingHigh;
+            bool shortRecovery  = price < swingHigh && MAX(High, 5)[1] > swingHigh;
+            bool shortRsiConf   = indRsi[0] > 60;
+            bool shortSnapback  = atr > 0 && (prevHigh - price) > atr * 0.3;
 
-            if (shortSweep)    lastBearConfidence += 45;
-            if (shortRsiConf)  lastBearConfidence += 30;
-            if (shortSnapback) lastBearConfidence += 25;
+            if (shortSweep)          lastBearConfidence += 45;
+            else if (shortRecovery)  lastBearConfidence += 25;
+            if (shortRsiConf)        lastBearConfidence += 30;
+            if (shortSnapback)       lastBearConfidence += 25;
         }
 
         // ─── Strategy 3: Opening Range Breakout ──────────────────
@@ -1095,16 +1138,23 @@ namespace NinjaTrader.NinjaScript.Strategies
             double prevClose = Close[1];
             bool   emaAlign  = indEmaFast[0] > indEmaSlow[0];
 
-            bool longBreak  = price > orbHigh && prevClose <= orbHigh;
-            bool shortBreak = price < orbLow  && prevClose >= orbLow;
+            // ── Long ──
+            bool longBreakCross = price > orbHigh && prevClose <= orbHigh;  // crossover
+            bool longBreakAbove = price > orbHigh;                           // continuation
 
-            if (longBreak)      lastBullConfidence += 55;
-            if (emaAlign)       lastBullConfidence += 25;
-            if (indAtr[0] > 0)  lastBullConfidence += 20;
+            if (longBreakCross)      lastBullConfidence += 55;
+            else if (longBreakAbove) lastBullConfidence += 30;  // holding above ORB high
+            if (emaAlign)            lastBullConfidence += 25;
+            if (indAtr[0] > 0)       lastBullConfidence += 20;
 
-            if (shortBreak)     lastBearConfidence += 55;
-            if (!emaAlign)      lastBearConfidence += 25;
-            if (indAtr[0] > 0)  lastBearConfidence += 20;
+            // ── Short ──
+            bool shortBreakCross = price < orbLow && prevClose >= orbLow;
+            bool shortBreakBelow = price < orbLow;
+
+            if (shortBreakCross)      lastBearConfidence += 55;
+            else if (shortBreakBelow) lastBearConfidence += 30;
+            if (!emaAlign)            lastBearConfidence += 25;
+            if (indAtr[0] > 0)        lastBearConfidence += 20;
         }
 
         // ═══════════════════════════════════════════════════════════
@@ -1286,12 +1336,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             dailyRealizedPnL = 0;
             dailyLimitHit    = false;
             dailyProfitHit   = false;
+            dailyTradeCount  = 0;
             flattenFired     = false;
             orbSet           = false;
             orbHigh          = 0;
             orbLow           = 0;
             Print("Session reset: " + sessionDate.ToShortDateString()
-                + " MaxLoss=$" + maxDailyLossDollars + " ProfitTarget=$" + maxDailyProfitDollars);
+                + " MaxLoss=$" + maxDailyLossDollars + " ProfitTarget=$" + maxDailyProfitDollars
+                + " MaxTrades=" + (maxTradesPerDay > 0 ? maxTradesPerDay.ToString() : "∞"));
         }
 
         // ═══════════════════════════════════════════════════════════
@@ -1868,7 +1920,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 lblUnrealized.Foreground  = unrealizedPnL >= 0 ? Brushes.LimeGreen : Brushes.OrangeRed;
 
                 double totalPnL = dailyRealizedPnL + unrealizedPnL;
-                lblPnL.Text       = "Daily P&L:   " + dailyRealizedPnL.ToString("C2") + "  (Total: " + totalPnL.ToString("C2") + ")";
+                string tradeCountStr = maxTradesPerDay > 0
+                    ? "  [Trades: " + dailyTradeCount + "/" + maxTradesPerDay + "]"
+                    : "  [Trades: " + dailyTradeCount + "]";
+                lblPnL.Text       = "Daily P&L:   " + dailyRealizedPnL.ToString("C2") + "  (Total: " + totalPnL.ToString("C2") + ")" + tradeCountStr;
                 lblPnL.Foreground = dailyRealizedPnL >= 0 ? Brushes.LimeGreen : Brushes.OrangeRed;
 
                 // ─── Position status ──────────────────────────────
@@ -1920,6 +1975,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                     else if (flattenFired)
                     {
                         lblStatus.Text       = "■ EOD flatten — done for today";
+                        lblStatus.Foreground = Brushes.Orange;
+                    }
+                    else if (maxTradesPerDay > 0 && dailyTradeCount >= maxTradesPerDay)
+                    {
+                        lblStatus.Text       = "■ Max trades reached (" + dailyTradeCount + "/" + maxTradesPerDay + ") — done";
                         lblStatus.Foreground = Brushes.Orange;
                     }
                     else
@@ -2042,8 +2102,14 @@ namespace NinjaTrader.NinjaScript.Strategies
         public int MaxDailyProfitDollars { get { return maxDailyProfitDollars; } set { maxDailyProfitDollars = value; } }
 
         [NinjaScriptProperty]
+        [Range(0, 20)]
+        [Display(Name = "Max Trades Per Day", Order = 5, GroupName = "1 — Risk Management",
+                 Description = "Maximum round-trip trades per session (0 = unlimited). Includes auto and manual entries.")]
+        public int MaxTradesPerDay { get { return maxTradesPerDay; } set { maxTradesPerDay = value; } }
+
+        [NinjaScriptProperty]
         [Range(1, 10)]
-        [Display(Name = "Contracts per entry", Order = 5, GroupName = "1 — Risk Management",
+        [Display(Name = "Contracts per entry", Order = 6, GroupName = "1 — Risk Management",
                  Description = "Default contracts per entry. Adjustable on dashboard.")]
         public int Contracts { get { return contracts; } set { contracts = value; } }
 
