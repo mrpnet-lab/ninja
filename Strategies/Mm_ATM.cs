@@ -453,6 +453,21 @@ namespace NinjaTrader.NinjaScript.Strategies
                 defaultSlPoints  = slPoints;
                 defaultTpPoints  = tpPoints;
             }
+            else if (State == State.Realtime)
+            {
+                // Reset daily limits on Historical → Realtime transition.
+                // In playback mode, disabling and re-enabling replays all historical
+                // bars which re-triggers auto trades and re-increments dailyTradeCount.
+                // Without this reset, re-enabling after max trades just hits the limit
+                // again immediately. dailyRealizedPnL is recalculated from
+                // SystemPerformance.AllTrades on each fill, so it self-corrects.
+                dailyTradeCount  = 0;
+                dailyRealizedPnL = 0;
+                dailyLimitHit    = false;
+                dailyProfitHit   = false;
+                flattenFired     = false;
+                Print("State.Realtime: daily limits reset (tradeCount=0, PnL=$0, limits cleared)");
+            }
             else if (State == State.Terminated)
             {
                 RemoveDashboard();
