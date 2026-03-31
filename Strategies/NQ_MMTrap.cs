@@ -130,7 +130,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool     pendingExit;       // exit orders submitted, waiting for fill
         private int      pendingExitTicks;  // ticks since pendingExit became true (safety net)
         private int      flatSyncGraceTicks; // grace ticks for entry order to fill before state reset
-        private DateTime lastEntryWallTime;  // wall-clock time of last entry (for reliable cooldown)
+        private DateTime lastEntryWallTime;  // cooldown reference: DateTime.Now in Realtime, Time[0] in Historical
         private bool     firstBarSeen;
 
         // ─── ORB state ────────────────────────────────────────────
@@ -497,7 +497,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (!dcaEnabled && Position.MarketPosition != MarketPosition.Flat) { Print("Blocked LONG: DCA disabled"); UpdateDashboardStatus("⚠ LONG blocked: DCA off", Brushes.Orange); return; }
             if (Position.MarketPosition == MarketPosition.Long && openDcaCount >= dcaMaxPositions)
             { Print("Blocked LONG: max DCA reached (" + dcaMaxPositions + ")"); UpdateDashboardStatus("⚠ LONG blocked: max DCA", Brushes.Orange); return; }
-            if (entryDelaySeconds > 0 && (DateTime.Now - lastEntryWallTime).TotalSeconds < entryDelaySeconds)
+            if (entryDelaySeconds > 0 && ((State == State.Realtime ? DateTime.Now : Time[0]) - lastEntryWallTime).TotalSeconds < entryDelaySeconds)
             { Print("Blocked LONG: cooldown (" + entryDelaySeconds + "s)"); UpdateDashboardStatus("⚠ LONG blocked: cooldown", Brushes.Orange); return; }
 
             // DCA distance check (skip if dcaDistancePoints == 0)
@@ -519,7 +519,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             EnterLong(contracts, signalName);
             activeEntrySignals.Add(signalName);
             openTradeDirection = 1;
-            lastEntryWallTime = DateTime.Now;
+            lastEntryWallTime = (State == State.Realtime) ? DateTime.Now : Time[0];
 
             double newQty = totalContracts + contracts;
             averageEntryPrice = totalContracts > 0
@@ -549,7 +549,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (!dcaEnabled && Position.MarketPosition != MarketPosition.Flat) { Print("Blocked SHORT: DCA disabled"); UpdateDashboardStatus("⚠ SHORT blocked: DCA off", Brushes.Orange); return; }
             if (Position.MarketPosition == MarketPosition.Short && openDcaCount >= dcaMaxPositions)
             { Print("Blocked SHORT: max DCA reached (" + dcaMaxPositions + ")"); UpdateDashboardStatus("⚠ SHORT blocked: max DCA", Brushes.Orange); return; }
-            if (entryDelaySeconds > 0 && (DateTime.Now - lastEntryWallTime).TotalSeconds < entryDelaySeconds)
+            if (entryDelaySeconds > 0 && ((State == State.Realtime ? DateTime.Now : Time[0]) - lastEntryWallTime).TotalSeconds < entryDelaySeconds)
             { Print("Blocked SHORT: cooldown (" + entryDelaySeconds + "s)"); UpdateDashboardStatus("⚠ SHORT blocked: cooldown", Brushes.Orange); return; }
 
             if (dcaDistancePoints > 0 && Position.MarketPosition == MarketPosition.Short)
@@ -570,7 +570,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             EnterShort(contracts, signalName);
             activeEntrySignals.Add(signalName);
             openTradeDirection = -1;
-            lastEntryWallTime = DateTime.Now;
+            lastEntryWallTime = (State == State.Realtime) ? DateTime.Now : Time[0];
 
             double newQty = totalContracts + contracts;
             averageEntryPrice = totalContracts > 0
@@ -683,7 +683,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (Position.MarketPosition == MarketPosition.Short) { UpdateDashboardStatus("⚠ BUY LMT blocked: close short first", Brushes.Orange); return; }
             if (!dcaEnabled && Position.MarketPosition != MarketPosition.Flat) { UpdateDashboardStatus("⚠ BUY LMT blocked: DCA off", Brushes.Orange); return; }
             if (Position.MarketPosition == MarketPosition.Long && openDcaCount >= dcaMaxPositions) { UpdateDashboardStatus("⚠ BUY LMT blocked: max DCA", Brushes.Orange); return; }
-            if (entryDelaySeconds > 0 && (DateTime.Now - lastEntryWallTime).TotalSeconds < entryDelaySeconds) { UpdateDashboardStatus("⚠ BUY LMT blocked: cooldown", Brushes.Orange); return; }
+            if (entryDelaySeconds > 0 && ((State == State.Realtime ? DateTime.Now : Time[0]) - lastEntryWallTime).TotalSeconds < entryDelaySeconds) { UpdateDashboardStatus("⚠ BUY LMT blocked: cooldown", Brushes.Orange); return; }
 
             double limitPrice = GetCurrentBid();
             if (limitPrice <= 0) limitPrice = Close[0] - TickSize;
@@ -695,7 +695,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             EnterLongLimit(contracts, limitPrice, signalName);
             activeEntrySignals.Add(signalName);
             openTradeDirection = 1;
-            lastEntryWallTime = DateTime.Now;
+            lastEntryWallTime = (State == State.Realtime) ? DateTime.Now : Time[0];
 
             double newQty = totalContracts + contracts;
             averageEntryPrice = totalContracts > 0
@@ -717,7 +717,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (Position.MarketPosition == MarketPosition.Long) { UpdateDashboardStatus("⚠ SELL LMT blocked: close long first", Brushes.Orange); return; }
             if (!dcaEnabled && Position.MarketPosition != MarketPosition.Flat) { UpdateDashboardStatus("⚠ SELL LMT blocked: DCA off", Brushes.Orange); return; }
             if (Position.MarketPosition == MarketPosition.Short && openDcaCount >= dcaMaxPositions) { UpdateDashboardStatus("⚠ SELL LMT blocked: max DCA", Brushes.Orange); return; }
-            if (entryDelaySeconds > 0 && (DateTime.Now - lastEntryWallTime).TotalSeconds < entryDelaySeconds) { UpdateDashboardStatus("⚠ SELL LMT blocked: cooldown", Brushes.Orange); return; }
+            if (entryDelaySeconds > 0 && ((State == State.Realtime ? DateTime.Now : Time[0]) - lastEntryWallTime).TotalSeconds < entryDelaySeconds) { UpdateDashboardStatus("⚠ SELL LMT blocked: cooldown", Brushes.Orange); return; }
 
             double limitPrice = GetCurrentAsk();
             if (limitPrice <= 0) limitPrice = Close[0] + TickSize;
@@ -729,7 +729,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             EnterShortLimit(contracts, limitPrice, signalName);
             activeEntrySignals.Add(signalName);
             openTradeDirection = -1;
-            lastEntryWallTime = DateTime.Now;
+            lastEntryWallTime = (State == State.Realtime) ? DateTime.Now : Time[0];
 
             double newQty = totalContracts + contracts;
             averageEntryPrice = totalContracts > 0
