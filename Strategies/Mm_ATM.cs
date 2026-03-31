@@ -29,46 +29,45 @@
 // ─────────────────────────────────────────────────────────────
 //  STEALTH ORDER NAMING (prop-firm safe)
 // ─────────────────────────────────────────────────────────────
-//  All signal names are plain numbers or "Close" so the NT8
-//  Executions → Name column looks like manual trading.
+//  All signal names are blank ("") or "Close" so the NT8
+//  Executions → Name column looks identical to manual trading.
 //
-//  ★ ENTRY SIGNALS (Name column shows a plain number)
-//    Uses a session-wide orderCounter that increments globally.
-//    Format: (++orderCounter).ToString()  →  "1", "2", "3"...
-//    The number NEVER resets mid-session, so each entry across
-//    all trades is globally unique within a single session.
+//  ★ ENTRY SIGNALS (Name column is BLANK)
+//    All entries use signalName = "" — the Name column shows
+//    empty, exactly like a manual order placed via DOM/Chart.
+//    With EntryHandling.AllEntries and EntriesPerDirection=4,
+//    NT8 allows up to 4 entries per direction under the same
+//    signal name, which matches our DCA limit.
 //
-//    Example session:
-//      Trade 1, entry 1  →  Name = "1"   (Buy Mkt, first DCA)
-//      Trade 1, DCA add   →  Name = "2"   (Buy Mkt, second DCA)
+//    Example session (Name column in Executions tab):
+//      Trade 1, Buy Mkt   →  Name = ""  (blank)
+//      Trade 1, Buy Mkt DCA →  Name = "" (blank)
 //      Trade 1 closed
-//      Trade 2, entry 1  →  Name = "3"   (Sell Lmt, first DCA)
-//      Trade 2, DCA add   →  Name = "4"   (Sell Lmt, second DCA)
+//      Trade 2, Sell Lmt   →  Name = ""  (blank)
 //
 //  ★ EXIT SIGNALS (Name column always shows "Close")
 //    ALL exit types use "Close" as the exit signal name:
-//      - Hidden SL hit        →  "Close"  (was SLX_*)
-//      - Hidden TP hit        →  "Close"  (was TPX_*)
-//      - Adaptive trail hit   →  "Close"  (was TRX_*)
-//      - Close Trade button   →  "Close"  (was CX_*)
-//      - Close 1 (partial)    →  "Close"  (was PX_*)
-//      - Account.Flatten fail →  "Close"  (was FX_* / NUKE_*)
+//      - Hidden SL hit        →  "Close"
+//      - Hidden TP hit        →  "Close"
+//      - Adaptive trail hit   →  "Close"
+//      - Close Trade button   →  "Close"
+//      - Close 1 (partial)    →  "Close"
+//      - Emergency Kill       →  Account.Flatten (no signal)
 //
-//    NT8 internally matches exits to entries via the
-//    (exitSignal, fromEntrySignal) pair, so "Close"+"3" and
-//    "Close"+"4" are correctly processed as distinct orders.
+//  ★ PENDING LIMIT ORDER CANCELLATION
+//    Close Trade and Emergency Kill buttons now cancel any
+//    unfilled limit orders (Working/Accepted/Submitted state)
+//    before closing positions. If flat with only a pending
+//    limit, Close Trade cancels it and resets state.
 //
-//  ★ INTERNAL TRACKING (developer only)
-//    Print() statements still log full context to the Output
-//    window: HIDDEN SL, TRAIL HIT, sig=5, etc. This is only
-//    visible in NT8's Output tab — never in Executions, Account
-//    Performance, or any data sent to the broker/prop firm.
+//  ★ INTERNAL TRACKING (developer only — Output window)
+//    Print() statements log full context (HIDDEN SL, TRAIL HIT,
+//    DCA #, entry price, etc.) — visible ONLY in NT8's Output
+//    tab, never in Executions or data sent to broker/prop firm.
 //
 //  ★ FIELDS
-//    orderCounter   — session-wide, never resets, drives entry names
-//    tradeSequence  — round-trip trade counter, for internal logging
-//    activeEntrySignals — list of current entry signal names (e.g.
-//                         ["3","4"]) used to pair exits correctly
+//    tradeSequence  — round-trip trade counter (internal logging)
+//    activeEntrySignals — list of entry signals (all "") for exit pairing
 //
 // ─────────────────────────────────────────────────────────────
 //  ADAPTIVE TRAILING STOP — THE MAIN ADDITION
@@ -144,7 +143,7 @@
 //  ★ EXIT MECHANICS
 //  - When price touches or crosses the trail → market exit fires
 //  - Exit signal name: "Close" (stealth — see STEALTH ORDER NAMING)
-//  - Entry signal name: orderCounter number (see STEALTH ORDER NAMING)
+//  - Entry signal name: blank "" (stealth — see STEALTH ORDER NAMING)
 //  - Sets pendingExit=true, same flow as hidden SL/TP exits
 //
 //  ★ INTERACTION WITH FIXED SL/TP
@@ -374,8 +373,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double averageEntryPrice;
         private double totalContracts;
         private int    tradeSequence;       // round-trip trade counter (for internal logging)
-        private int    orderCounter;        // session-wide entry counter → used as signal name ("1","2",...)
-        private readonly List<string> activeEntrySignals = new List<string>(); // actual signal names used
+        private readonly List<string> activeEntrySignals = new List<string>(); // entry signals (all "") for exit pairing
 
         // ─── Manual VWAP (tick-safe) ──────────────────────────────
         private double vwapCumTPV;          // cumulative for completed bars
@@ -1071,7 +1069,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 dailyTradeCount++;
             }
             openDcaCount++;
-            string signalName = (++orderCounter).ToString();
+            string signalName = "";
             EnterLong(contracts, signalName);
             activeEntrySignals.Add(signalName);
             openTradeDirection = 1;
@@ -1088,8 +1086,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 + " @ " + Close[0].ToString("F2")
                 + " | AvgEntry=" + averageEntryPrice.ToString("F2")
                 + " | HiddenSL=" + hiddenStopPrice.ToString("F2")
-                + " | HiddenTP=" + hiddenTargetPrice.ToString("F2")
-                + " | sig=" + signalName);
+                + " | HiddenTP=" + hiddenTargetPrice.ToString("F2"));
             UpdateDashboardStatus("● LONG #" + openDcaCount + " @ " + Close[0].ToString("F2"), Brushes.LimeGreen);
         }
 
@@ -1128,7 +1125,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 dailyTradeCount++;
             }
             openDcaCount++;
-            string signalName = (++orderCounter).ToString();
+            string signalName = "";
             EnterShort(contracts, signalName);
             activeEntrySignals.Add(signalName);
             openTradeDirection = -1;
@@ -1174,6 +1171,9 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void ExecuteFlatten()
         {
+            // Cancel any pending limit orders first
+            CancelPendingOrders();
+
             // PRIMARY: Account.Flatten — 100% reliable, closes ALL positions on this instrument
             try
             {
@@ -1206,10 +1206,23 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void ExecuteCloseTrade()
         {
+            // Cancel any pending limit orders (unfilled Buy/Sell Lmt)
+            bool hadPending = CancelPendingOrders();
+
             if (Position.MarketPosition == MarketPosition.Flat)
             {
-                Print(Time[0] + " | Close Trade: already flat, nothing to do");
-                UpdateDashboardStatus("● Already flat", Brushes.CornflowerBlue);
+                if (hadPending)
+                {
+                    // We were flat with a pending limit — cancel it and reset state
+                    ResetPositionState();
+                    Print(Time[0] + " | Close Trade: cancelled pending limit order(s), reset state");
+                    UpdateDashboardStatus("● Cancelled pending order", Brushes.Yellow);
+                }
+                else
+                {
+                    Print(Time[0] + " | Close Trade: already flat, nothing to do");
+                    UpdateDashboardStatus("● Already flat", Brushes.CornflowerBlue);
+                }
                 return;
             }
 
@@ -1235,6 +1248,41 @@ namespace NinjaTrader.NinjaScript.Strategies
             UpdateDashboardStatus("● Closing trade...", Brushes.Yellow);
         }
 
+        /// <summary>
+        /// Cancel all working/accepted orders for this instrument.
+        /// Returns true if any orders were cancelled.
+        /// </summary>
+        private bool CancelPendingOrders()
+        {
+            bool cancelled = false;
+            try
+            {
+                var working = new List<Order>();
+                foreach (Order order in Account.Orders)
+                {
+                    if (order.Instrument == Instrument
+                        && (order.OrderState == OrderState.Working
+                            || order.OrderState == OrderState.Accepted
+                            || order.OrderState == OrderState.Submitted))
+                    {
+                        working.Add(order);
+                    }
+                }
+
+                if (working.Count > 0)
+                {
+                    Account.Cancel(working.ToArray());
+                    cancelled = true;
+                    Print(Time[0] + " | Cancelled " + working.Count + " pending order(s)");
+                }
+            }
+            catch (Exception ex)
+            {
+                Print(Time[0] + " | CancelPendingOrders error: " + ex.Message);
+            }
+            return cancelled;
+        }
+
         // ─── Limit order entries ──────────────────────────────────
         private void ExecuteLongLimitEntry()
         {
@@ -1258,7 +1306,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 dailyTradeCount++;
             }
             openDcaCount++;
-            string signalName = (++orderCounter).ToString();
+            string signalName = "";
             EnterLongLimit(contracts, limitPrice, signalName);
             activeEntrySignals.Add(signalName);
             openTradeDirection = 1;
@@ -1297,7 +1345,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 dailyTradeCount++;
             }
             openDcaCount++;
-            string signalName = (++orderCounter).ToString();
+            string signalName = "";
             EnterShortLimit(contracts, limitPrice, signalName);
             activeEntrySignals.Add(signalName);
             openTradeDirection = -1;
