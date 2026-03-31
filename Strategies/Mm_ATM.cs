@@ -518,7 +518,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 minSignalConfidence   = 68.0;
                 slTpAdjustStep        = 5;
                 jumpSlPercent         = 50;
-                maxTradesPerDay       = 4;
+                maxTradesPerDay       = 999;
                 showEma               = true;
                 showRsi               = true;
                 showAtr               = true;
