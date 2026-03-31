@@ -2023,9 +2023,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         public bool AutoMode { get { return autoMode; } set { autoMode = value; } }
 
         [NinjaScriptProperty]
-        [Range(0, 3)]
-        [Display(Name = "Auto Strategy (0-3)", Order = 2, GroupName = "3 — Trading Mode",
-                 Description = "0=Momentum+VWAP  1=Key Level Breakout  2=Liquidity Sweep  3=ORB. Changeable on dashboard.")]
+        [Range(0, 4)]
+        [Display(Name = "Auto Strategy (0-4)", Order = 2, GroupName = "3 — Trading Mode",
+                 Description = "0=Momentum+VWAP  1=Key Level Breakout  2=Liquidity Sweep  3=ORB  4=Auto Select. Changeable on dashboard.")]
         public int AutoStrategy { get { return autoStrategy; } set { autoStrategy = value; } }
 
         [NinjaScriptProperty]
