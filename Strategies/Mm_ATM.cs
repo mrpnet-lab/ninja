@@ -2977,7 +2977,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         public int MaxDailyProfitDollars { get { return maxDailyProfitDollars; } set { maxDailyProfitDollars = value; } }
 
         [NinjaScriptProperty]
-        [Range(0, 20)]
+        [Range(0, 999)]
         [Display(Name = "Max Trades Per Day", Order = 5, GroupName = "1 — Risk Management",
                  Description = "Maximum round-trip trades per session (0 = unlimited). Includes auto and manual entries.")]
         public int MaxTradesPerDay { get { return maxTradesPerDay; } set { maxTradesPerDay = value; } }
