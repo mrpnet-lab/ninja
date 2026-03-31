@@ -5,32 +5,139 @@
 //
 //  Based on NQ MM-Trap v2.1 with Intelligent Adaptive Trailing Stop.
 //
-//  FEATURES:
-//  - Everything from NQ MM-Trap v2.1 (dashboard, signals, DCA, etc.)
-//  - ADAPTIVE TRAILING STOP (hidden, no resting orders)
-//    Follows price using market regime detection:
-//    * Trending  → conservative (wider) trail to let profits run
-//    * Choppy    → aggressive (tighter) trail to lock in gains
-//    * Activates only after configurable profit threshold
-//    * Ratchets in favor only — never moves against the trade
-//    * Dashboard toggle ON/OFF + live trail info display
-//    * Chart line shows current trail price + regime status
+// ─────────────────────────────────────────────────────────────
+//  CORE FEATURES
+// ─────────────────────────────────────────────────────────────
+//  - Floating overlay dashboard (drag title bar, resize grip)
+//  - Buy Mkt / Sell Mkt / Buy Lmt / Sell Lmt buttons
+//  - Close 1 (partial close), Close Trade, Emergency Kill
+//  - Jump SL button (move SL closer by configurable %)
+//  - Adjustable hidden SL/TP via +/- buttons (live mid-trade)
+//  - Auto / Manual mode toggle on dashboard
+//  - Auto strategy selector (5 modes: 0-3 + Auto Select)
+//  - Adjustable order qty on dashboard
+//  - Unrealized + Daily P&L + trade count display
+//  - Confidence score display for selected auto strategy
+//  - EMA / RSI / ATR / VWAP indicators on chart (toggleable)
+//  - Liquidity sweep reversal markers on chart
+//  - Key level breakout lines on chart
+//  - DCA: press same-direction button to add (up to max)
+//  - SL/TP reset to defaults after each trade closes
 //
-//  ADAPTIVE TRAIL — REGIME DETECTION:
-//  Scores 0% (pure chop) to 100% (strong trend) using:
-//    - ATR expansion (30%): rising ATR = trending environment
-//    - EMA spread   (30%): wider fast/slow gap = strong trend
-//    - Directional bars (25%): consecutive bars in trade direction
-//    - RSI extremity (15%): away from 50 = directional conviction
-//  Trail distance = lerp(min, max, trendScore) blended with ATR×mult.
+// ─────────────────────────────────────────────────────────────
+//  ADAPTIVE TRAILING STOP — THE MAIN ADDITION
+// ─────────────────────────────────────────────────────────────
 //
-//  TRAIL + HIDDEN SL/TP INTERACTION:
-//  - Fixed hidden SL/TP always active as hard safety net
-//  - Trail activates after reaching profit threshold
-//  - Once trail ratchets past the fixed SL, trail exits first
-//  - Whichever level is hit first triggers the exit
+//  ★ WHAT IT DOES
+//  A hidden (no resting orders) trailing stop that dynamically
+//  adjusts its distance from price based on real-time market
+//  conditions. It aims to:
+//    • Lock in gains quickly in choppy/ranging markets
+//    • Give trades room to run in trending markets
+//    • Fire a market order exit the instant price touches it
 //
-//  RISK MANAGEMENT:
+//  ★ HOW IT ACTIVATES
+//  The trail stays dormant until unrealized profit reaches a
+//  configurable threshold (default: 8 NQ points = $160/ct).
+//  This prevents premature trailing on normal noise after entry.
+//  Once activated, the trail NEVER deactivates until the trade
+//  closes — it only ratchets in favor of the trade.
+//
+//  ★ REGIME DETECTION (Trend Score 0–100%)
+//  Every tick, the strategy scores the market on a 0–100% scale:
+//
+//    Factor 1 — ATR Expansion (30% weight)
+//      Compares current ATR to its 10-bar average.
+//      Rising ATR → expanding volatility → likely trending.
+//      Flat/falling ATR → contracting → likely ranging.
+//      Score: (currentATR / avgATR - 0.8) / 0.6, clamped 0–1.
+//
+//    Factor 2 — EMA Spread (30% weight)
+//      Measures fast/slow EMA gap relative to ATR.
+//      Wide gap → strong directional move → trending.
+//      Narrow gap → indecision → choppy.
+//      Score: |EMA_fast - EMA_slow| / ATR / 3.0, clamped 0–1.
+//
+//    Factor 3 — Directional Bars (25% weight)
+//      Counts last 8 bars moving in the trade direction.
+//      8/8 in direction → strong trend. 4/8 → mixed.
+//      Score: directional_bars / total_bars.
+//
+//    Factor 4 — RSI Extremity (15% weight)
+//      Measures how far RSI is from neutral 50.
+//      RSI at 75 or 25 → directional conviction → trending.
+//      RSI near 50 → no conviction → choppy.
+//      Score: |RSI - 50| / 50 × 1.5, clamped 0–1.
+//
+//    Composite: 0.30×ATR + 0.30×EMA + 0.25×Dir + 0.15×RSI
+//
+//  ★ TRAIL DISTANCE CALCULATION
+//  The trend score maps to a trail distance in NQ points:
+//
+//    1. Regime distance = lerp(minPoints, maxPoints, trendScore)
+//       - Score 0% (pure chop) → uses trailMinPoints (default 4)
+//       - Score 100% (strong trend) → uses trailMaxPoints (default 25)
+//
+//    2. ATR-scaled distance = ATR × trailAtrMultiplier / ticksPerPoint
+//       - Adapts to the current volatility amplitude
+//
+//    3. Final distance = average(regimeDist, atrDist), clamped to [min, max]
+//
+//  Example scenarios (1 contract, NQ):
+//    Choppy market (score 20%) → trail ~5 pts ($100 from price)
+//    Mixed market  (score 50%) → trail ~12 pts ($240 from price)
+//    Strong trend  (score 85%) → trail ~22 pts ($440 from price)
+//
+//  ★ RATCHET BEHAVIOR
+//  - Long trades:  trail moves UP only (new = max(old, price - dist))
+//  - Short trades: trail moves DOWN only (new = min(old, price + dist))
+//  - Trail is recalculated every tick, but NEVER moves against you
+//  - As trend score changes, the distance adapts, but the trail
+//    price itself can only improve
+//
+//  ★ EXIT MECHANICS
+//  - When price touches or crosses the trail → market exit fires
+//  - Exit signal name: "TRX_" + original entry signal
+//  - Sets pendingExit=true, same flow as hidden SL/TP exits
+//
+//  ★ INTERACTION WITH FIXED SL/TP
+//  Both systems run simultaneously on every tick:
+//    - Fixed SL/TP = hard safety net (always armed, never moves*)
+//    - Adaptive trail = profit-maximizing layer
+//  Whichever is hit first triggers the exit. In practice:
+//    - Losing trade → fixed SL fires (trail never activated)
+//    - Small winner → fixed TP may fire before trail activated
+//    - Big winner → trail activates, ratchets up, locks gain
+//    - Trail often exits BETTER than the fixed TP because it
+//      follows the move and captures excess profit
+//  * Note: SL/TP can be adjusted via dashboard +/- or Jump SL
+//
+//  ★ DASHBOARD DISPLAY
+//  A row below SL/TP shows:
+//    [TRAIL: ON]  Trail: 21345.50 (8.2pt Trend 72%)
+//    [TRAIL: OFF] Trail: OFF
+//  States:
+//    - "Trail: —"            = enabled, flat (no trade)
+//    - "Trail: waiting (X/8pt)" = in trade, below activation threshold
+//    - "Trail: 21345 (Xpt Regime %)" = active, showing distance+regime
+//    - "Trail: OFF"          = disabled via toggle or parameter
+//
+//  ★ CHART VISUALIZATION
+//  When trail is active:
+//    - Magenta dash-dot line at trail price
+//    - Text label: "Trail 21345.50 (8.2pt | Trending 72%)"
+//  Lines auto-remove when trade closes or trail disabled.
+//
+//  ★ CONFIGURABLE PARAMETERS (Group 7 — Adaptive Trail)
+//    TrailEnabled          (bool)   ON/OFF (default: true)
+//    TrailActivationPoints (int)    Profit threshold (default: 8 pts)
+//    TrailMinPoints        (int)    Tightest distance (default: 4 pts)
+//    TrailMaxPoints        (int)    Widest distance (default: 25 pts)
+//    TrailAtrMultiplier    (double) ATR scale factor (default: 1.5)
+//
+// ─────────────────────────────────────────────────────────────
+//  RISK MANAGEMENT
+// ─────────────────────────────────────────────────────────────
 //  - Hidden SL/TP (no resting orders on exchange)
 //  - Adaptive trailing stop (regime-aware, hidden)
 //  - Max daily loss $ — flattens and halts trading
@@ -39,18 +146,38 @@
 //  - CME maintenance window block (4:55-5:59 PM ET)
 //  - Auto-flatten at configurable time (default 3:59 PM ET)
 //
-//  AUTO STRATEGIES (0-4):
+// ─────────────────────────────────────────────────────────────
+//  AUTO STRATEGIES (0-4)
+// ─────────────────────────────────────────────────────────────
 //  Each strategy scores confidence 0-100% with two tiers:
 //    - Crossover signals  = full credit (first entry)
 //    - Continuation signals = partial credit (re-entry)
 //
 //  0: Momentum + VWAP
+//     Crossover: price crosses VWAP (+35%), EMA align (+30),
+//                RSI 50-75 (+20), momentum vs prior bar (+15)
+//     Continuation: price stays above/below VWAP (+20)
+//
 //  1: Key Level Breakout
+//     Crossover: price breaks 20-bar high/low (+50),
+//                ATR confirmation (+30), EMA align (+20)
+//     Continuation: price holds above/below level (+25)
+//
 //  2: Liquidity Sweep Reversal
+//     Crossover: sweep + snap-back on same bar (+45),
+//                RSI confirmation (+30), ATR snapback (+25)
+//     Continuation: recent sweep within 5 bars (+25)
+//
 //  3: Opening Range Breakout (9:45 AM - 11:30 AM ET)
+//     Crossover: price breaks ORB high/low (+55),
+//                EMA align (+25), ATR > 0 (+20)
+//     Continuation: price holds above/below ORB (+30)
+//
 //  4: Auto Select — evaluates all 4, picks highest confidence
 //
-//  DASHBOARD STATUS (when flat):
+// ─────────────────────────────────────────────────────────────
+//  DASHBOARD STATUS (when flat)
+// ─────────────────────────────────────────────────────────────
 //  - "■ DAILY LOSS LIMIT"      = loss cap hit, halted
 //  - "■ DAILY PROFIT TARGET"   = profit cap hit, halted
 //  - "■ Max trades reached"    = trade limit hit, done
