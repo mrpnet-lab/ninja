@@ -329,7 +329,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int    openDcaCount;
         private double averageEntryPrice;
         private double totalContracts;
-        private int    tradeSequence;       // monotonically increasing for unique signal names
+        private int    tradeSequence;       // round-trip trade counter (for internal logging)
+        private int    orderCounter;        // session-wide entry counter → used as signal name ("1","2",...)
         private readonly List<string> activeEntrySignals = new List<string>(); // actual signal names used
 
         // ─── Manual VWAP (tick-safe) ──────────────────────────────
@@ -1026,7 +1027,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 dailyTradeCount++;
             }
             openDcaCount++;
-            string signalName = openDcaCount.ToString();
+            string signalName = (++orderCounter).ToString();
             EnterLong(contracts, signalName);
             activeEntrySignals.Add(signalName);
             openTradeDirection = 1;
@@ -1043,7 +1044,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 + " @ " + Close[0].ToString("F2")
                 + " | AvgEntry=" + averageEntryPrice.ToString("F2")
                 + " | HiddenSL=" + hiddenStopPrice.ToString("F2")
-                + " | HiddenTP=" + hiddenTargetPrice.ToString("F2"));
+                + " | HiddenTP=" + hiddenTargetPrice.ToString("F2")
+                + " | sig=" + signalName);
             UpdateDashboardStatus("● LONG #" + openDcaCount + " @ " + Close[0].ToString("F2"), Brushes.LimeGreen);
         }
 
@@ -1082,7 +1084,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 dailyTradeCount++;
             }
             openDcaCount++;
-            string signalName = openDcaCount.ToString();
+            string signalName = (++orderCounter).ToString();
             EnterShort(contracts, signalName);
             activeEntrySignals.Add(signalName);
             openTradeDirection = -1;
@@ -1212,7 +1214,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 dailyTradeCount++;
             }
             openDcaCount++;
-            string signalName = openDcaCount.ToString();
+            string signalName = (++orderCounter).ToString();
             EnterLongLimit(contracts, limitPrice, signalName);
             activeEntrySignals.Add(signalName);
             openTradeDirection = 1;
@@ -1251,7 +1253,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 dailyTradeCount++;
             }
             openDcaCount++;
-            string signalName = openDcaCount.ToString();
+            string signalName = (++orderCounter).ToString();
             EnterShortLimit(contracts, limitPrice, signalName);
             activeEntrySignals.Add(signalName);
             openTradeDirection = -1;
