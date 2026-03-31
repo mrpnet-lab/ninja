@@ -1,21 +1,69 @@
 // ============================================================
 //  NQ MM-Trap Strategy for NinjaTrader 8
-//  Version : 2.0
+//  Version : 2.1
 //  Author  : Custom Build — NQ Semi-Auto / Auto Trader
 //
-//  FEATURES (v2.0):
-//  - On-chart dashboard with LONG/SHORT/FLATTEN buttons
+//  FEATURES:
+//  - Floating overlay dashboard (drag title bar, resize grip)
+//  - Buy Mkt / Sell Mkt / Buy Lmt / Sell Lmt buttons
+//  - Close 1 (partial close), Close Trade, Emergency Kill
+//  - Jump SL button (move SL closer by configurable %)
 //  - Adjustable hidden SL/TP via +/- buttons (live mid-trade)
 //  - Auto / Manual mode toggle on dashboard
-//  - Auto strategy selector (4 strategies) on dashboard
+//  - Auto strategy selector (5 modes: 0-3 + Auto Select)
 //  - Adjustable order qty on dashboard
-//  - Unrealized + Daily P&L display
+//  - Unrealized + Daily P&L + trade count display
 //  - Confidence score display for selected auto strategy
 //  - EMA / RSI / ATR / VWAP indicators on chart (toggleable)
 //  - Liquidity sweep reversal markers on chart
 //  - Key level breakout lines on chart
 //  - DCA: press same-direction button to add (up to max)
-//  - Dashboard placed bottom-right (below Chart Trader area)
+//  - SL/TP reset to defaults after each trade closes
+//
+//  RISK MANAGEMENT:
+//  - Hidden SL/TP (no resting orders on exchange)
+//  - Max daily loss $ — flattens and halts trading
+//  - Daily profit target $ — flattens and halts trading
+//  - Max trades per day (default 4, 0 = unlimited)
+//  - CME maintenance window block (4:55-5:59 PM ET)
+//  - Auto-flatten at configurable time (default 3:59 PM ET)
+//
+//  AUTO STRATEGIES (0-4):
+//  Each strategy scores confidence 0-100% with two tiers:
+//    - Crossover signals  = full credit (first entry)
+//    - Continuation signals = partial credit (re-entry)
+//  This allows multiple trades per day when conditions persist.
+//
+//  0: Momentum + VWAP
+//     Crossover: price crosses VWAP (+35%), EMA align (+30),
+//                RSI 50-75 (+20), momentum vs prior bar (+15)
+//     Continuation: price stays above/below VWAP (+20)
+//
+//  1: Key Level Breakout
+//     Crossover: price breaks 20-bar high/low (+50),
+//                ATR confirmation (+30), EMA align (+20)
+//     Continuation: price holds above/below level (+25)
+//
+//  2: Liquidity Sweep Reversal
+//     Crossover: sweep + snap-back on same bar (+45),
+//                RSI confirmation (+30), ATR snapback (+25)
+//     Continuation: recent sweep within 5 bars (+25)
+//
+//  3: Opening Range Breakout (9:45 AM - 11:30 AM ET)
+//     Crossover: price breaks ORB high/low (+55),
+//                EMA align (+25), ATR > 0 (+20)
+//     Continuation: price holds above/below ORB (+30)
+//
+//  4: Auto Select — evaluates all 4, picks highest confidence
+//
+//  DASHBOARD STATUS (when flat):
+//  - "■ DAILY LOSS LIMIT"      = loss cap hit, halted
+//  - "■ DAILY PROFIT TARGET"   = profit cap hit, halted
+//  - "■ Max trades reached"    = trade limit hit, done
+//  - "■ EOD flatten"           = auto-flatten fired
+//  - "○ Flat — outside hours"  = before/after trading window
+//  - "● Flat — scanning (X%)"  = auto mode, showing confidence
+//  - "● Flat — manual mode"    = waiting for button press
 //
 //  INSTALLATION:
 //  1. NinjaTrader 8 → Tools → NinjaScript Editor
