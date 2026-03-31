@@ -419,6 +419,17 @@ namespace NinjaTrader.NinjaScript.Strategies
                 else if (lastBearConfidence >= minSignalConfidence)
                     ExecuteShortEntry(false);
             }
+            // Diagnostic: log why auto entry didn't fire (every 100 bars to avoid spam)
+            else if (autoMode && CurrentBar % 100 == 0 && Position.MarketPosition == MarketPosition.Flat)
+            {
+                string reason = "";
+                if (dailyLimitHit) reason = "dailyLossLimit";
+                else if (dailyProfitHit) reason = "dailyProfitHit";
+                else if (!insideTradingHours) reason = "outsideHours";
+                else if (openTradeDirection != 0) reason = "openTradeDir=" + openTradeDirection;
+                else reason = "lowConfidence(Bull=" + lastBullConfidence.ToString("F0") + "% Bear=" + lastBearConfidence.ToString("F0") + "% need=" + minSignalConfidence.ToString("F0") + "%)";
+                Print(Time[0] + " | AUTO-SCAN: no entry — " + reason + " | DailyPnL=" + dailyRealizedPnL.ToString("C0"));
+            }
 
             // ─── Chart & dashboard (non-latency path) ─────────────
             UpdateOrbLevels();
@@ -1895,8 +1906,44 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 else
                 {
-                    lblStatus.Text       = "● Flat — ready";
-                    lblStatus.Foreground = Brushes.CornflowerBlue;
+                    // Show specific reason why we're flat / not trading
+                    if (dailyLimitHit)
+                    {
+                        lblStatus.Text       = "■ DAILY LOSS LIMIT — halted (" + dailyRealizedPnL.ToString("C0") + ")";
+                        lblStatus.Foreground = Brushes.OrangeRed;
+                    }
+                    else if (dailyProfitHit)
+                    {
+                        lblStatus.Text       = "■ DAILY PROFIT TARGET — halted (" + dailyRealizedPnL.ToString("C0") + ")";
+                        lblStatus.Foreground = Brushes.Gold;
+                    }
+                    else if (flattenFired)
+                    {
+                        lblStatus.Text       = "■ EOD flatten — done for today";
+                        lblStatus.Foreground = Brushes.Orange;
+                    }
+                    else
+                    {
+                        int ct2 = ToTime(Time[0]);
+                        bool inAutoHours = ct2 >= tradingStartTime && ct2 < tradingEndTime;
+                        if (autoMode && !inAutoHours)
+                        {
+                            lblStatus.Text       = "○ Flat — outside auto hours";
+                            lblStatus.Foreground = Brushes.Gray;
+                        }
+                        else if (autoMode)
+                        {
+                            double best = Math.Max(lastBullConfidence, lastBearConfidence);
+                            string dir  = lastBullConfidence >= lastBearConfidence ? "Bull" : "Bear";
+                            lblStatus.Text       = "● Flat — scanning (" + dir + " " + best.ToString("F0") + "% / need " + minSignalConfidence.ToString("F0") + "%)";
+                            lblStatus.Foreground = best >= minSignalConfidence ? Brushes.LimeGreen : Brushes.CornflowerBlue;
+                        }
+                        else
+                        {
+                            lblStatus.Text       = "● Flat — manual mode";
+                            lblStatus.Foreground = Brushes.CornflowerBlue;
+                        }
+                    }
                     lblPosition.Text     = "DCA: 0/" + dcaMaxPositions + "  |  Avg: —";
                     lblHiddenSL.Text     = "SL: —  (" + slPoints + "pt | " + (slPoints * 4) + "tk | $" + (slPoints * 20) + "/ct)";
                     lblHiddenTP.Text     = "TP: —  (" + tpPoints + "pt | " + (tpPoints * 4) + "tk | $" + (tpPoints * 20) + "/ct)";
