@@ -285,12 +285,12 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             // ═════ CRITICAL PATH — lowest latency ═════════════════
             // 1. Close trade / emergency kill
-            if (State == State.Realtime && pendingCloseTrade)
+            if ((State == State.Realtime || State == State.Historical) && pendingCloseTrade)
             {
                 pendingCloseTrade = false;
                 ExecuteCloseTrade();
             }
-            if (State == State.Realtime && pendingFlatten)
+            if ((State == State.Realtime || State == State.Historical) && pendingFlatten)
             {
                 pendingFlatten = false;
                 ExecuteFlatten();
@@ -351,7 +351,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             // 4. Button entries (manual BUY/SELL MKT/LMT + partial close + jump SL)
-            if (State == State.Realtime && !pendingExit)
+            if ((State == State.Realtime || State == State.Historical) && !pendingExit)
             {
                 if (pendingLong)       { pendingLong       = false; ExecuteLongEntry(true); }
                 if (pendingShort)      { pendingShort      = false; ExecuteShortEntry(true); }
@@ -382,7 +382,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             UpdateVwap();
 
             // ─── Build dashboard on first real-time bar ───────────
-            if (State == State.Realtime && !dashboardAttached)
+            if ((State == State.Realtime || State == State.Historical) && !dashboardAttached)
                 BuildDashboard();
 
             // ─── Auto-flatten & CME maintenance ──────────────────
