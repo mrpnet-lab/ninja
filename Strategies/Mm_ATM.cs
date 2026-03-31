@@ -1,9 +1,11 @@
 // ============================================================
 //  Mm-ATM Strategy for NinjaTrader 8
-//  Version : 1.0
+//  Version : 2.0  (Smart Signal Filters + Profit-Tier Trail)
 //  Author  : Custom Build — NQ Semi-Auto / Auto Trader
 //
 //  Based on NQ MM-Trap v2.1 with Intelligent Adaptive Trailing Stop.
+//  v2.0 adds trap detection, volume filters, breakeven lock, and
+//  profit-tiered trailing to avoid giving back gains.
 //
 // ─────────────────────────────────────────────────────────────
 //  CORE FEATURES
@@ -134,6 +136,62 @@
 //    TrailMinPoints        (int)    Tightest distance (default: 4 pts)
 //    TrailMaxPoints        (int)    Widest distance (default: 25 pts)
 //    TrailAtrMultiplier    (double) ATR scale factor (default: 1.5)
+//
+// ─────────────────────────────────────────────────────────────
+//  v2.0 — SMART SIGNAL FILTERS (Trap Detection)
+// ─────────────────────────────────────────────────────────────
+//  Post-processing layer applied after EVERY signal calculation.
+//  Prevents entries into common NQ traps and low-quality setups.
+//
+//  Filter 1: Volume Confirmation
+//    - Compares current bar volume to 20-bar average
+//    - <60% of avg → 35% penalty (thin breakouts reverse)
+//    - <85% of avg → 15% penalty (below-average conviction)
+//    - >150% of avg → 10% bonus (strong institutional flow)
+//
+//  Filter 2: Bull/Bear Conflict (Whipsaw Rejection)
+//    - When both bull and bear confidence are high (>65% ratio)
+//    - Market is indecisive → both signals penalized
+//    - Prevents chop-induced back-to-back losing entries
+//
+//  Filter 3: Momentum Exhaustion
+//    - Tracks price position within 20-bar range
+//    - If price is >82% into the range AND moved >2× ATR
+//    - Penalizes same-direction entries (chasing a spent move)
+//
+//  Filter 4: Bar Quality (Wick Rejection)
+//    - Upper wick >45% of bar → penalizes bullish signals
+//    - Lower wick >45% of bar → penalizes bearish signals
+//    - Detects rejection/trap candles at key levels
+//
+//  Strategy-level enhancements:
+//    - Momentum+VWAP: bar conviction bonus on VWAP cross
+//    - Key Level Breakout: fake-out filter (close must be near
+//      extreme for full credit; weak close = half credit)
+//    - Liq Sweep Reversal: volume spike required for full credit
+//    - ORB: conviction filter + ORB range quality scaling
+//
+// ─────────────────────────────────────────────────────────────
+//  v2.0 — PROFIT-TIER TRAILING STOP
+// ─────────────────────────────────────────────────────────────
+//  Tracks the max profit reached during each trade and enforces
+//  progressively tighter floor prices to prevent giving back gains.
+//
+//  Tier 1 (T1-BE): profit ≥ 2× activation (default 16pt)
+//    → Trail can never go below breakeven (entry + 1 tick)
+//    → You'll never lose money on a trade that was +16pts
+//
+//  Tier 2 (T2-Strong): profit ≥ 2.5× activation (default 20pt)
+//    → Trail floor = 45% of max profit above entry
+//    → E.g. max profit 24pts → floor at +10.8pts ($216/ct)
+//
+//  Tier 3 (T3-Runner): profit ≥ 4× activation (default 32pt)
+//    → Trail floor = 55% of max profit above entry
+//    → E.g. max profit 40pts → floor at +22pts ($440/ct)
+//
+//  Dashboard shows tier name + color-coded trail info:
+//    Active = Magenta, T1-BE = Yellow, T2-Strong = Cyan,
+//    T3-Runner = Gold
 //
 // ─────────────────────────────────────────────────────────────
 //  RISK MANAGEMENT
@@ -369,8 +427,14 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double    trailPrice;              // current adaptive trail stop price
         private bool      trailActive;             // trail has been activated this trade
         private double    trailTrendScore;         // 0.0 (ranging) to 1.0 (trending)
+        private double    trailMaxProfitPts;      // max profit reached this trade (for breakeven/tiers)
+        private string    trailTierName;           // current tier name for dashboard display
         private TextBlock lblTrailInfo;            // dashboard trail info label
         private Button    btnTrailToggle;          // dashboard trail on/off button
+
+        // ─── Smart Signal Filters (trap detection) ────────────────
+        private double lastRawBull;   // raw bull confidence before filters
+        private double lastRawBear;   // raw bear confidence before filters
 
         #endregion
 
@@ -382,7 +446,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (State == State.SetDefaults)
             {
-                Description  = "Mm-ATM v1.0 — Adaptive Trailing Stop, Hidden SL/TP, Semi-Auto & Auto, Dashboard";
+                Description  = "Mm-ATM v2.0 — Smart Signal Filters, Profit-Tier Trail, Hidden SL/TP, Dashboard";
                 Name         = "Mm_ATM";
                 Calculate    = Calculate.OnEachTick;
                 EntriesPerDirection          = 4;
@@ -728,12 +792,17 @@ namespace NinjaTrader.NinjaScript.Strategies
             else if (openTradeDirection == -1)
                 profitPoints = (averageEntryPrice - price) / (TickSize * 4.0);
 
+            // Track max profit for breakeven lock & profit tiers
+            if (profitPoints > trailMaxProfitPts)
+                trailMaxProfitPts = profitPoints;
+
             // Activate trailing only after reaching profit threshold
             if (!trailActive)
             {
                 if (profitPoints >= trailActivationPoints)
                 {
                     trailActive = true;
+                    trailTierName = "Active";
                     double initDist = CalculateTrailDistance();
                     double distOff  = initDist * 4.0 * TickSize;
                     if (openTradeDirection == 1)
@@ -755,6 +824,36 @@ namespace NinjaTrader.NinjaScript.Strategies
             var signals = activeEntrySignals.ToList();
             if (signals.Count == 0) return;
 
+            // ── Profit Tier System ────────────────────────────────
+            // As profit grows, enforce progressively tighter floor prices
+            // to prevent giving back large gains. The trail can NEVER move
+            // below these floors.
+            double tierFloor = 0;
+            double tickPt = TickSize * 4.0;  // 1 NQ point in price terms
+
+            if (trailMaxProfitPts >= trailActivationPoints * 4)
+            {
+                // Tier 3: Runner mode (32+ pts default) — lock 55% of max profit
+                tierFloor = 0.55 * trailMaxProfitPts * tickPt;
+                trailTierName = "T3-Runner";
+            }
+            else if (trailMaxProfitPts >= trailActivationPoints * 2.5)
+            {
+                // Tier 2: Strong profit (20+ pts default) — lock 45% of max profit
+                tierFloor = 0.45 * trailMaxProfitPts * tickPt;
+                trailTierName = "T2-Strong";
+            }
+            else if (trailMaxProfitPts >= trailActivationPoints * 2)
+            {
+                // Tier 1: Breakeven lock (16+ pts default) — never let it go red
+                tierFloor = TickSize;  // 1 tick above entry
+                trailTierName = "T1-BE";
+            }
+            else
+            {
+                trailTierName = "Active";
+            }
+
             if (openTradeDirection == 1)
             {
                 // Ratchet trail UP only (never moves down for longs)
@@ -762,12 +861,18 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (newTrail > trailPrice)
                     trailPrice = newTrail;
 
+                // Enforce tier floor: trail can never drop below entry + tierFloor
+                double floorPrice = Math.Round((averageEntryPrice + tierFloor) / TickSize) * TickSize;
+                if (tierFloor > 0 && trailPrice < floorPrice)
+                    trailPrice = floorPrice;
+
                 // Check if trail hit
                 if (price <= trailPrice)
                 {
                     Print(Time[0] + " | ADAPTIVE TRAIL HIT (LONG) @ " + price.ToString("F2")
                         + " trail=" + trailPrice.ToString("F2") + " dist=" + trailDist.ToString("F1")
-                        + "pts trend=" + (trailTrendScore * 100).ToString("F0") + "%");
+                        + "pts trend=" + (trailTrendScore * 100).ToString("F0") + "% tier=" + trailTierName
+                        + " maxProfit=" + trailMaxProfitPts.ToString("F1") + "pts");
                     foreach (string sig in signals)
                         ExitLong("TRX_" + sig, sig);
                     stopsArmed  = false;
@@ -781,12 +886,18 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (newTrail < trailPrice)
                     trailPrice = newTrail;
 
+                // Enforce tier floor: trail can never rise above entry - tierFloor
+                double floorPrice = Math.Round((averageEntryPrice - tierFloor) / TickSize) * TickSize;
+                if (tierFloor > 0 && trailPrice > floorPrice)
+                    trailPrice = floorPrice;
+
                 // Check if trail hit
                 if (price >= trailPrice)
                 {
                     Print(Time[0] + " | ADAPTIVE TRAIL HIT (SHORT) @ " + price.ToString("F2")
                         + " trail=" + trailPrice.ToString("F2") + " dist=" + trailDist.ToString("F1")
-                        + "pts trend=" + (trailTrendScore * 100).ToString("F0") + "%");
+                        + "pts trend=" + (trailTrendScore * 100).ToString("F0") + "% tier=" + trailTierName
+                        + " maxProfit=" + trailMaxProfitPts.ToString("F1") + "pts");
                     foreach (string sig in signals)
                         ExitShort("TRX_" + sig, sig);
                     stopsArmed  = false;
@@ -1247,9 +1358,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             activeEntrySignals.Clear();
 
             // Reset adaptive trail state
-            trailPrice      = 0;
-            trailActive     = false;
-            trailTrendScore = 0;
+            trailPrice         = 0;
+            trailActive        = false;
+            trailTrendScore    = 0;
+            trailMaxProfitPts  = 0;
+            trailTierName      = "";
 
             // Reset SL/TP to default values for next trade
             if (defaultSlPoints > 0) slPoints = defaultSlPoints;
@@ -1376,6 +1489,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                         case 2: CalcLiquiditySweepReversal(); break;
                         case 3: CalcOpeningRangeBreakout();   break;
                     }
+                    // Apply smart filters to each strategy before comparing
+                    ApplySmartFilters();
                     double score = Math.Max(lastBullConfidence, lastBearConfidence);
                     if (score > bestScore)
                     {
@@ -1400,6 +1515,127 @@ namespace NinjaTrader.NinjaScript.Strategies
                 case 2: CalcLiquiditySweepReversal(); break;
                 case 3: CalcOpeningRangeBreakout();   break;
             }
+
+            // Apply smart filters (trap detection, volume, exhaustion, conflict)
+            ApplySmartFilters();
+        }
+
+        /// <summary>
+        /// Post-processing intelligence layer applied after every raw signal calculation.
+        /// Detects traps, fake-outs, volume anomalies, and conflicting signals.
+        /// Stores raw scores for dashboard comparison.
+        /// </summary>
+        private void ApplySmartFilters()
+        {
+            if (CurrentBar < emaPeriodSlow + 5) return;
+
+            lastRawBull = lastBullConfidence;
+            lastRawBear = lastBearConfidence;
+
+            double atr = indAtr[0];
+            if (atr <= 0) return;
+
+            // ── Filter 1: Volume Confirmation ─────────────────────
+            // Thin-volume breakouts reverse; high-volume confirms conviction.
+            double volSum = 0;
+            int volLookback = Math.Min(20, CurrentBar - 1);
+            for (int i = 1; i <= volLookback; i++)
+                volSum += Volume[i];
+            double volAvg = volLookback > 0 ? volSum / volLookback : Volume[0];
+            double volRatio = volAvg > 0 ? Volume[0] / volAvg : 1.0;
+
+            if (volRatio < 0.6)
+            {
+                // Very thin volume — heavy penalty, likely trap / fake move
+                lastBullConfidence *= 0.65;
+                lastBearConfidence *= 0.65;
+            }
+            else if (volRatio < 0.85)
+            {
+                // Below-average volume — mild penalty
+                lastBullConfidence *= 0.85;
+                lastBearConfidence *= 0.85;
+            }
+            else if (volRatio > 1.5)
+            {
+                // Strong volume confirmation — bonus
+                lastBullConfidence *= 1.10;
+                lastBearConfidence *= 1.10;
+            }
+
+            // ── Filter 2: Bull/Bear Conflict (Whipsaw Rejection) ──
+            // When both sides have high confidence, market is indecisive → chop trap.
+            double maxConf = Math.Max(lastBullConfidence, lastBearConfidence);
+            double minConf = Math.Min(lastBullConfidence, lastBearConfidence);
+            if (maxConf > 30 && minConf > 0)
+            {
+                double conflictRatio = minConf / maxConf;
+                if (conflictRatio > 0.65)
+                {
+                    // Heavy conflict — both directions scoring high, likely whipsaw
+                    double penalty = 0.55 + (1.0 - conflictRatio) * 1.25;  // ratio 0.65→0.99, penalty 0.99→0.56
+                    penalty = Math.Min(1.0, Math.Max(0.5, penalty));
+                    lastBullConfidence *= penalty;
+                    lastBearConfidence *= penalty;
+                }
+            }
+
+            // ── Filter 3: Momentum Exhaustion ─────────────────────
+            // If price has already moved significantly in one direction,
+            // don't chase — it's likely near a reversal or pullback zone.
+            if (CurrentBar > 20)
+            {
+                double recentHigh = MAX(High, 20)[0];
+                double recentLow  = MIN(Low,  20)[0];
+                double recentRange = recentHigh - recentLow;
+                double price = Close[0];
+
+                // How far are we from the 20-bar low (bullish exhaustion)
+                double bullExhaustion = recentRange > 0 ? (price - recentLow) / recentRange : 0.5;
+                // How far are we from the 20-bar high (bearish exhaustion)
+                double bearExhaustion = recentRange > 0 ? (recentHigh - price) / recentRange : 0.5;
+
+                // Also check ATR-relative move size
+                double moveFromLow  = (price - recentLow)  / atr;
+                double moveFromHigh = (recentHigh - price)  / atr;
+
+                // Penalize bullish entries when already near the top of the range AND extended
+                if (bullExhaustion > 0.82 && moveFromLow > 2.0)
+                {
+                    double exhaust = Math.Min(0.45, (bullExhaustion - 0.82) * 2.5);  // up to 45% penalty
+                    lastBullConfidence *= (1.0 - exhaust);
+                }
+                // Penalize bearish entries when already near the bottom of the range AND extended
+                if (bearExhaustion > 0.82 && moveFromHigh > 2.0)
+                {
+                    double exhaust = Math.Min(0.45, (bearExhaustion - 0.82) * 2.5);
+                    lastBearConfidence *= (1.0 - exhaust);
+                }
+            }
+
+            // ── Filter 4: Bar Quality (Wick Rejection) ────────────
+            // Long upper wick on a bullish signal = rejection, likely trap
+            double bodySize = Math.Abs(Close[0] - Open[0]);
+            double barRange = High[0] - Low[0];
+            if (barRange > 0)
+            {
+                double upperWick = High[0] - Math.Max(Close[0], Open[0]);
+                double lowerWick = Math.Min(Close[0], Open[0]) - Low[0];
+                double upperWickPct = upperWick / barRange;
+                double lowerWickPct = lowerWick / barRange;
+
+                // Big upper wick (>45% of bar) penalizes bullish signals
+                if (upperWickPct > 0.45)
+                    lastBullConfidence *= (1.0 - (upperWickPct - 0.45) * 1.5);
+
+                // Big lower wick (>45% of bar) penalizes bearish signals
+                if (lowerWickPct > 0.45)
+                    lastBearConfidence *= (1.0 - (lowerWickPct - 0.45) * 1.5);
+            }
+
+            // Clamp to [0, 120] — allow slight boost above 100 from volume bonus
+            lastBullConfidence = Math.Max(0, Math.Min(120, lastBullConfidence));
+            lastBearConfidence = Math.Max(0, Math.Min(120, lastBearConfidence));
         }
 
         // ─── Strategy 0: Momentum + VWAP ─────────────────────────
@@ -1414,6 +1650,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             double price = Close[0];
             double prev  = Close[1];
 
+            // Bar quality: closing near extreme = conviction
+            double barRange = High[0] - Low[0];
+            bool bullishClose = barRange > 0 && (price - Low[0]) / barRange > 0.65;  // close in top 35%
+            bool bearishClose = barRange > 0 && (High[0] - price) / barRange > 0.65;  // close in bottom 35%
+
             // ── Long ──
             bool longEma       = emaF > emaS;
             bool longVwapCross = price > vwapValue && prev <= vwapValue;  // crossover (primary)
@@ -1426,6 +1667,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             else if (longVwapAbove) lastBullConfidence += 20;  // partial credit for continuation
             if (longRsi)       lastBullConfidence += 20;
             if (longMom)       lastBullConfidence += 15;
+            // Bar quality bonus: VWAP cross with a strong close = high conviction
+            if (longVwapCross && bullishClose) lastBullConfidence += 10;
 
             // ── Short ──
             bool shortEma       = emaF < emaS;
@@ -1439,6 +1682,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             else if (shortVwapBelow) lastBearConfidence += 20;
             if (shortRsi)       lastBearConfidence += 20;
             if (shortMom)       lastBearConfidence += 15;
+            // Bar quality bonus
+            if (shortVwapCross && bearishClose) lastBearConfidence += 10;
         }
 
         // ─── Strategy 1: Key Level Breakout ──────────────────────
@@ -1454,14 +1699,24 @@ namespace NinjaTrader.NinjaScript.Strategies
             double price     = Close[0];
             double prevClose = Close[1];
 
+            // Bar quality for fake-out filter: breakout bar should close near the extreme
+            double barRange = High[0] - Low[0];
+            bool bullConviction = barRange > 0 && (price - Low[0]) / barRange > 0.60;  // close in top 40%
+            bool bearConviction = barRange > 0 && (High[0] - price) / barRange > 0.60;  // close in bottom 40%
+
             // ── Long ──
             bool longBreakCross = price > priorHigh && prevClose <= priorHigh;  // crossover
             bool longBreakAbove = price > priorHigh;                             // continuation
             bool longAtrConf    = atr > 0 && (price - priorHigh) > atr * 0.15;
             bool longEmaAlign   = indEmaFast[0] > indEmaSlow[0];
 
-            if (longBreakCross)     lastBullConfidence += 50;
-            else if (longBreakAbove) lastBullConfidence += 25;  // holding above breakout level
+            // Fake-out filter: on fresh crossover, require bullish close conviction
+            if (longBreakCross && bullConviction)
+                lastBullConfidence += 50;
+            else if (longBreakCross)  // crossover but bar closing weak = possible trap
+                lastBullConfidence += 25;
+            else if (longBreakAbove)
+                lastBullConfidence += 25;  // holding above breakout level
             if (longAtrConf)        lastBullConfidence += 30;
             if (longEmaAlign)       lastBullConfidence += 20;
 
@@ -1471,8 +1726,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             bool shortAtrConf    = atr > 0 && (priorLow - price) > atr * 0.15;
             bool shortEmaAlign   = indEmaFast[0] < indEmaSlow[0];
 
-            if (shortBreakCross)     lastBearConfidence += 50;
-            else if (shortBreakBelow) lastBearConfidence += 25;
+            if (shortBreakCross && bearConviction)
+                lastBearConfidence += 50;
+            else if (shortBreakCross)
+                lastBearConfidence += 25;
+            else if (shortBreakBelow)
+                lastBearConfidence += 25;
             if (shortAtrConf)        lastBearConfidence += 30;
             if (shortEmaAlign)       lastBearConfidence += 20;
         }
@@ -1489,6 +1748,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             double prevLow   = Low[1];
             double prevHigh  = High[1];
 
+            // Volume spike: real sweeps are driven by stops hitting → volume surges
+            double volSum = 0;
+            int vlb = Math.Min(20, CurrentBar - 1);
+            for (int i = 1; i <= vlb; i++) volSum += Volume[i];
+            double volAvg = vlb > 0 ? volSum / vlb : Volume[0];
+            bool volSpike = volAvg > 0 && Volume[0] > volAvg * 1.2;  // 20%+ above average
+
             // ── Long (sweep lows then recover) ──
             bool longSweep     = prevLow < swingLow && price > swingLow;              // immediate snap-back
             bool longRecovery  = price > swingLow && MIN(Low, 5)[1] < swingLow;      // recent sweep within 5 bars
@@ -1499,6 +1765,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             else if (longRecovery)  lastBullConfidence += 25;  // continuation after recent sweep
             if (longRsiConf)        lastBullConfidence += 30;
             if (longSnapback)       lastBullConfidence += 25;
+            // Volume spike confirms genuine liquidity grab (not just a drift)
+            if ((longSweep || longRecovery) && volSpike) lastBullConfidence += 10;
 
             // ── Short (sweep highs then drop) ──
             bool shortSweep     = prevHigh > swingHigh && price < swingHigh;
@@ -1510,6 +1778,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             else if (shortRecovery)  lastBearConfidence += 25;
             if (shortRsiConf)        lastBearConfidence += 30;
             if (shortSnapback)       lastBearConfidence += 25;
+            if ((shortSweep || shortRecovery) && volSpike) lastBearConfidence += 10;
         }
 
         // ─── Strategy 3: Opening Range Breakout ──────────────────
@@ -1522,24 +1791,40 @@ namespace NinjaTrader.NinjaScript.Strategies
             double price     = Close[0];
             double prevClose = Close[1];
             bool   emaAlign  = indEmaFast[0] > indEmaSlow[0];
+            double atr       = indAtr[0];
+
+            // ORB range quality: narrow ORB = cleaner breakout; wide ORB = noisy
+            double orbRange = orbHigh - orbLow;
+            double orbQuality = (atr > 0 && orbRange > 0) ? Math.Min(1.0, atr / orbRange) : 1.0;
+
+            // Bar conviction: close near the breakout extreme
+            double barRange = High[0] - Low[0];
+            bool bullConviction = barRange > 0 && (price - Low[0]) / barRange > 0.60;
+            bool bearConviction = barRange > 0 && (High[0] - price) / barRange > 0.60;
 
             // ── Long ──
             bool longBreakCross = price > orbHigh && prevClose <= orbHigh;  // crossover
             bool longBreakAbove = price > orbHigh;                           // continuation
 
-            if (longBreakCross)      lastBullConfidence += 55;
+            if (longBreakCross && bullConviction)
+                lastBullConfidence += 55;
+            else if (longBreakCross)
+                lastBullConfidence += 30;  // weak conviction crossover
             else if (longBreakAbove) lastBullConfidence += 30;  // holding above ORB high
             if (emaAlign)            lastBullConfidence += 25;
-            if (indAtr[0] > 0)       lastBullConfidence += 20;
+            if (atr > 0)             lastBullConfidence += (int)(20 * orbQuality);  // scale by ORB quality
 
             // ── Short ──
             bool shortBreakCross = price < orbLow && prevClose >= orbLow;
             bool shortBreakBelow = price < orbLow;
 
-            if (shortBreakCross)      lastBearConfidence += 55;
+            if (shortBreakCross && bearConviction)
+                lastBearConfidence += 55;
+            else if (shortBreakCross)
+                lastBearConfidence += 30;
             else if (shortBreakBelow) lastBearConfidence += 30;
             if (!emaAlign)            lastBearConfidence += 25;
-            if (indAtr[0] > 0)        lastBearConfidence += 20;
+            if (atr > 0)              lastBearConfidence += (int)(20 * orbQuality);
         }
 
         // ═══════════════════════════════════════════════════════════
@@ -2121,7 +2406,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                                         btnTrailToggle.Background = trailEnabled
                                             ? new SolidColorBrush(Color.FromRgb(120, 50, 140))
                                             : new SolidColorBrush(Color.FromRgb(50, 55, 65));
-                                        if (!trailEnabled) { trailActive = false; trailPrice = 0; RemoveDrawObject("adaptiveTrail"); RemoveDrawObject("trailLabel"); }
+                                        if (!trailEnabled) { trailActive = false; trailPrice = 0; trailMaxProfitPts = 0; trailTierName = ""; RemoveDrawObject("adaptiveTrail"); RemoveDrawObject("trailLabel"); }
                                     }
                                     else
                                     {
@@ -2403,8 +2688,17 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 : openTradeDirection == -1
                                     ? (trailPrice - Close[0]) / (TickSize * 4.0) : 0;
                             string regime = trailTrendScore > 0.6 ? "Trend" : (trailTrendScore < 0.35 ? "Chop" : "Mix");
-                            lblTrailInfo.Text = "Trail: " + trailPrice.ToString("F2") + " (" + dist.ToString("F1") + "pt " + regime + " " + (trailTrendScore * 100).ToString("F0") + "%)";
-                            lblTrailInfo.Foreground = Brushes.Magenta;
+                            string tierStr = !string.IsNullOrEmpty(trailTierName) ? " " + trailTierName : "";
+                            lblTrailInfo.Text = "Trail: " + trailPrice.ToString("F2") + " (" + dist.ToString("F1") + "pt " + regime + " " + (trailTrendScore * 100).ToString("F0") + "%" + tierStr + ")";
+                            // Color by tier: runner=gold, strong=cyan, BE=magenta, active=magenta
+                            if (trailTierName == "T3-Runner")
+                                lblTrailInfo.Foreground = Brushes.Gold;
+                            else if (trailTierName == "T2-Strong")
+                                lblTrailInfo.Foreground = Brushes.Cyan;
+                            else if (trailTierName == "T1-BE")
+                                lblTrailInfo.Foreground = Brushes.Yellow;
+                            else
+                                lblTrailInfo.Foreground = Brushes.Magenta;
                         }
                         else if (trailEnabled && !trailActive)
                         {
