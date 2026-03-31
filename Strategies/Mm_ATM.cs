@@ -99,7 +99,8 @@
 //
 //  ★ EXIT MECHANICS
 //  - When price touches or crosses the trail → market exit fires
-//  - Exit signal name: "TRX_" + original entry signal
+//  - Exit signal name: "Close" (same as manual trading)
+//  - Entry signal name: DCA count ("1", "2", etc.)
 //  - Sets pendingExit=true, same flow as hidden SL/TP exits
 //
 //  ★ INTERACTION WITH FIXED SL/TP
@@ -742,7 +743,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     Print(Time[0] + " | HIDDEN SL LONG hit @ " + price.ToString("F2"));
                     foreach (string sig in signals)
-                        ExitLong("SLX_" + sig, sig);
+                        ExitLong("Close", sig);
                     stopsArmed  = false;
                     pendingExit = true;
                 }
@@ -750,7 +751,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     Print(Time[0] + " | HIDDEN TP LONG hit @ " + price.ToString("F2"));
                     foreach (string sig in signals)
-                        ExitLong("TPX_" + sig, sig);
+                        ExitLong("Close", sig);
                     stopsArmed  = false;
                     pendingExit = true;
                 }
@@ -761,7 +762,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     Print(Time[0] + " | HIDDEN SL SHORT hit @ " + price.ToString("F2"));
                     foreach (string sig in signals)
-                        ExitShort("SLX_" + sig, sig);
+                        ExitShort("Close", sig);
                     stopsArmed  = false;
                     pendingExit = true;
                 }
@@ -769,7 +770,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     Print(Time[0] + " | HIDDEN TP SHORT hit @ " + price.ToString("F2"));
                     foreach (string sig in signals)
-                        ExitShort("TPX_" + sig, sig);
+                        ExitShort("Close", sig);
                     stopsArmed  = false;
                     pendingExit = true;
                 }
@@ -874,7 +875,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                         + "pts trend=" + (trailTrendScore * 100).ToString("F0") + "% tier=" + trailTierName
                         + " maxProfit=" + trailMaxProfitPts.ToString("F1") + "pts");
                     foreach (string sig in signals)
-                        ExitLong("TRX_" + sig, sig);
+                        ExitLong("Close", sig);
                     stopsArmed  = false;
                     pendingExit = true;
                 }
@@ -899,7 +900,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                         + "pts trend=" + (trailTrendScore * 100).ToString("F0") + "% tier=" + trailTierName
                         + " maxProfit=" + trailMaxProfitPts.ToString("F1") + "pts");
                     foreach (string sig in signals)
-                        ExitShort("TRX_" + sig, sig);
+                        ExitShort("Close", sig);
                     stopsArmed  = false;
                     pendingExit = true;
                 }
@@ -1025,7 +1026,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 dailyTradeCount++;
             }
             openDcaCount++;
-            string signalName = "LE_" + tradeSequence + "_" + openDcaCount;
+            string signalName = openDcaCount.ToString();
             EnterLong(contracts, signalName);
             activeEntrySignals.Add(signalName);
             openTradeDirection = 1;
@@ -1081,7 +1082,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 dailyTradeCount++;
             }
             openDcaCount++;
-            string signalName = "SE_" + tradeSequence + "_" + openDcaCount;
+            string signalName = openDcaCount.ToString();
             EnterShort(contracts, signalName);
             activeEntrySignals.Add(signalName);
             openTradeDirection = -1;
@@ -1140,15 +1141,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // FALLBACK: managed exits
                 var signals = activeEntrySignals.ToList();
                 if (signals.Count > 0 && Position.MarketPosition == MarketPosition.Long)
-                    foreach (string sig in signals) ExitLong("FX_" + sig, sig);
+                    foreach (string sig in signals) ExitLong("Close", sig);
                 else if (signals.Count > 0 && Position.MarketPosition == MarketPosition.Short)
-                    foreach (string sig in signals) ExitShort("FX_" + sig, sig);
+                    foreach (string sig in signals) ExitShort("Close", sig);
                 else if (Position.MarketPosition != MarketPosition.Flat)
                 {
                     if (Position.MarketPosition == MarketPosition.Long)
-                        ExitLong("NUKE_" + (++tradeSequence), "");
+                        ExitLong("Close", "");
                     else
-                        ExitShort("NUKE_" + (++tradeSequence), "");
+                        ExitShort("Close", "");
                 }
             }
 
@@ -1170,16 +1171,16 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (signals.Count > 0)
             {
                 if (Position.MarketPosition == MarketPosition.Long)
-                    foreach (string sig in signals) ExitLong("CX_" + sig, sig);
+                    foreach (string sig in signals) ExitLong("Close", sig);
                 else if (Position.MarketPosition == MarketPosition.Short)
-                    foreach (string sig in signals) ExitShort("CX_" + sig, sig);
+                    foreach (string sig in signals) ExitShort("Close", sig);
             }
             else
             {
                 if (Position.MarketPosition == MarketPosition.Long)
-                    ExitLong("CX_" + (++tradeSequence), "");
+                    ExitLong("Close", "");
                 else
-                    ExitShort("CX_" + (++tradeSequence), "");
+                    ExitShort("Close", "");
             }
 
             stopsArmed  = false;
@@ -1211,7 +1212,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 dailyTradeCount++;
             }
             openDcaCount++;
-            string signalName = "LE_LMT_" + tradeSequence + "_" + openDcaCount;
+            string signalName = openDcaCount.ToString();
             EnterLongLimit(contracts, limitPrice, signalName);
             activeEntrySignals.Add(signalName);
             openTradeDirection = 1;
@@ -1250,7 +1251,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 dailyTradeCount++;
             }
             openDcaCount++;
-            string signalName = "SE_LMT_" + tradeSequence + "_" + openDcaCount;
+            string signalName = openDcaCount.ToString();
             EnterShortLimit(contracts, limitPrice, signalName);
             activeEntrySignals.Add(signalName);
             openTradeDirection = -1;
@@ -1283,12 +1284,11 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             // Exit the LAST signal (most recent DCA add) for 1 contract
             string sig = activeEntrySignals.Count > 0 ? activeEntrySignals[activeEntrySignals.Count - 1] : "";
-            string exitSig = "PX_" + (++tradeSequence);
 
             if (Position.MarketPosition == MarketPosition.Long)
-                ExitLong(1, exitSig, sig);
+                ExitLong(1, "Close", sig);
             else
-                ExitShort(1, exitSig, sig);
+                ExitShort(1, "Close", sig);
 
             // Update tracking
             if (activeEntrySignals.Count > 0)
