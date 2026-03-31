@@ -358,6 +358,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         // ─── Session / daily tracking ─────────────────────────────
         private double   dailyRealizedPnL;
+        private double   pnlBaselineOffset;  // subtract prior-run trades from SystemPerformance.AllTrades on re-enable
         private bool     dailyLimitHit;
         private bool     dailyProfitHit;
         private DateTime sessionDate;
@@ -438,6 +439,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private TextBlock lblStatus;
         private TextBlock lblPnL;
         private TextBlock lblUnrealized;
+        private TextBlock lblAccountPnL;
         private TextBlock lblConfBull;
         private TextBlock lblConfBear;
         private TextBlock lblPosition;
@@ -570,18 +572,89 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             else if (State == State.Realtime)
             {
-                // Reset daily limits on Historical → Realtime transition.
-                // In playback mode, disabling and re-enabling replays all historical
-                // bars which re-triggers auto trades and re-increments dailyTradeCount.
-                // Without this reset, re-enabling after max trades just hits the limit
-                // again immediately. dailyRealizedPnL is recalculated from
-                // SystemPerformance.AllTrades on each fill, so it self-corrects.
-                dailyTradeCount  = 0;
-                dailyRealizedPnL = 0;
-                dailyLimitHit    = false;
-                dailyProfitHit   = false;
-                flattenFired     = false;
-                Print("State.Realtime: daily limits reset (tradeCount=0, PnL=$0, limits cleared)");
+                // ── Full transient state reset on Historical → Realtime transition ──
+                // On disable/re-enable, NT8 replays all historical bars which can
+                // leave stale flags. Reset EVERYTHING transient so the strategy
+                // starts clean — only user parameters and indicator refs survive.
+
+                // Daily tracking
+                dailyTradeCount        = 0;
+                dailyRealizedPnL       = 0;
+                dailyLimitHit          = false;
+                dailyProfitHit         = false;
+                flattenFired           = false;
+
+                // Pending action flags
+                pendingExit            = false;
+                pendingExitTicks       = 0;
+                pendingLimitFlatten    = false;
+                pendingReverseLong     = false;
+                pendingReverseShort    = false;
+                pendingReverseLongLmt  = false;
+                pendingReverseShortLmt = false;
+                pendingLong            = false;
+                pendingShort           = false;
+                pendingLongLimit       = false;
+                pendingShortLimit      = false;
+                pendingFlatten         = false;
+                pendingCloseTrade      = false;
+                pendingCloseOne        = false;
+                pendingJumpSL          = false;
+                pendingRearm           = false;
+
+                // Position / trade state
+                stopsArmed             = false;
+                openTradeDirection     = 0;
+                openDcaCount           = 0;
+                totalContracts         = 0;
+                averageEntryPrice      = 0;
+                hiddenStopPrice        = 0;
+                hiddenTargetPrice      = 0;
+                flatSyncGraceTicks     = 0;
+                lastEntryWallTime      = DateTime.MinValue;
+                activeEntrySignals.Clear();
+
+                // Adaptive trail
+                trailPrice             = 0;
+                trailActive            = false;
+                trailTrendScore        = 0;
+                trailMaxProfitPts      = 0;
+                trailTierName          = "";
+
+                // ORB
+                orbHigh                = 0;
+                orbLow                 = 0;
+                orbSet                 = false;
+
+                // Signal confidence
+                lastBullConfidence     = 0;
+                lastBearConfidence     = 0;
+                lastRawBull            = 0;
+                lastRawBear            = 0;
+                bestAutoStrategy       = 0;
+
+                // Session detection
+                firstBarSeen           = false;
+
+                // Drag/resize state (dashboard will be rebuilt)
+                dashDragging           = false;
+                dashResizing           = false;
+
+                // Reset SL/TP to user-configured defaults
+                if (defaultSlPoints > 0) slPoints = defaultSlPoints;
+                if (defaultTpPoints > 0) tpPoints = defaultTpPoints;
+
+                // Snapshot existing P&L from prior runs so daily P&L starts at $0.
+                // SystemPerformance.AllTrades accumulates across disable/re-enable cycles.
+                pnlBaselineOffset = 0;
+                if (SystemPerformance != null && SystemPerformance.AllTrades != null)
+                {
+                    foreach (Trade t in SystemPerformance.AllTrades)
+                        if (t.Entry.Time.Date == sessionDate)
+                            pnlBaselineOffset += t.ProfitCurrency;
+                }
+                Print("State.Realtime: FULL RESET — pnlBaseline=" + pnlBaselineOffset.ToString("C2")
+                    + " SL=" + slPoints + " TP=" + tpPoints);
             }
             else if (State == State.Terminated)
             {
@@ -1597,6 +1670,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             foreach (Trade t in SystemPerformance.AllTrades)
                 if (t.Entry.Time.Date == sessionDate)
                     dailyRealizedPnL += t.ProfitCurrency;
+            dailyRealizedPnL -= pnlBaselineOffset;
 
             if (dailyRealizedPnL <= -maxDailyLossDollars && !dailyLimitHit)
             {
@@ -2208,6 +2282,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             sessionDate      = Time[0].Date;
             dailyRealizedPnL = 0;
+            pnlBaselineOffset = 0;   // new session → no prior-run trades to subtract
             dailyLimitHit    = false;
             dailyProfitHit   = false;
             dailyTradeCount  = 0;
@@ -2232,6 +2307,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             dashboardAttached = true;
             ChartControl.Dispatcher.InvokeAsync(() =>
             {
+              try
+              {
                 // Safety: if RemoveDashboard ran between enqueue and execution
                 if (!dashboardAttached) return;
 
@@ -2470,8 +2547,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // ─── P&L display ──────────────────────────────────
                 lblUnrealized = MakeLabel("Unrealized:  $0.00",  Brushes.White, 11, FontWeights.Normal, HorizontalAlignment.Left);
                 lblPnL        = MakeLabel("Daily P&L:   $0.00",  Brushes.White, 11, FontWeights.Normal, HorizontalAlignment.Left);
+                lblAccountPnL = MakeLabel("Account P&L: $0.00",  Brushes.Gray,  10, FontWeights.Normal, HorizontalAlignment.Left);
                 stack.Children.Add(lblUnrealized);
                 stack.Children.Add(lblPnL);
+                stack.Children.Add(lblAccountPnL);
 
                 stack.Children.Add(MakeSeparator());
 
@@ -2645,7 +2724,18 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
 
                 if (!placed)
-                    Print("Dashboard: FAILED to find host — not attached");
+                {
+                    Print("Dashboard: FAILED to find host — will retry");
+                    dashboardPanel    = null;
+                    dashboardAttached = false;
+                }
+              }
+              catch (Exception ex)
+              {
+                Print("Dashboard build error: " + ex.Message + " — will retry");
+                dashboardPanel    = null;
+                dashboardAttached = false;
+              }
             });
         }
 
@@ -2829,6 +2919,20 @@ namespace NinjaTrader.NinjaScript.Strategies
                     : "  [Trades: " + dailyTradeCount + "]";
                 lblPnL.Text       = "Daily P&L:   " + dailyRealizedPnL.ToString("C2") + "  (Total: " + totalPnL.ToString("C2") + ")" + tradeCountStr;
                 lblPnL.Foreground = dailyRealizedPnL >= 0 ? Brushes.LimeGreen : Brushes.OrangeRed;
+
+                // ─── Account-level P&L (all strategies + manual trades) ───
+                if (lblAccountPnL != null)
+                {
+                    try
+                    {
+                        double acctRealized   = Account.Get(AccountItem.RealizedProfitLoss, Currency.UsDollar);
+                        double acctUnrealized = Account.Get(AccountItem.UnrealizedProfitLoss, Currency.UsDollar);
+                        double acctTotal      = acctRealized + acctUnrealized;
+                        lblAccountPnL.Text       = "Account P&L: " + acctTotal.ToString("C2") + "  (R: " + acctRealized.ToString("C2") + "  U: " + acctUnrealized.ToString("C2") + ")";
+                        lblAccountPnL.Foreground = acctTotal >= 0 ? Brushes.LimeGreen : Brushes.OrangeRed;
+                    }
+                    catch { lblAccountPnL.Text = "Account P&L: N/A"; lblAccountPnL.Foreground = Brushes.Gray; }
+                }
 
                 // ─── Position status ──────────────────────────────
                 if (pendingExit)
@@ -3021,8 +3125,10 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             try
             {
-                // Use Invoke (blocking) — guarantees removal completes before Terminated finishes
-                chart.Dispatcher.Invoke(() =>
+                // Use InvokeAsync (non-blocking) — Dispatcher.Invoke deadlocks on
+                // disable/re-enable because the strategy thread blocks waiting for
+                // the UI thread while NT8 waits for Terminated to finish.
+                chart.Dispatcher.InvokeAsync(() =>
                 {
                     try
                     {
