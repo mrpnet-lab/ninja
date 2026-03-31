@@ -27,6 +27,50 @@
 //  - SL/TP reset to defaults after each trade closes
 //
 // ─────────────────────────────────────────────────────────────
+//  STEALTH ORDER NAMING (prop-firm safe)
+// ─────────────────────────────────────────────────────────────
+//  All signal names are plain numbers or "Close" so the NT8
+//  Executions → Name column looks like manual trading.
+//
+//  ★ ENTRY SIGNALS (Name column shows a plain number)
+//    Uses a session-wide orderCounter that increments globally.
+//    Format: (++orderCounter).ToString()  →  "1", "2", "3"...
+//    The number NEVER resets mid-session, so each entry across
+//    all trades is globally unique within a single session.
+//
+//    Example session:
+//      Trade 1, entry 1  →  Name = "1"   (Buy Mkt, first DCA)
+//      Trade 1, DCA add   →  Name = "2"   (Buy Mkt, second DCA)
+//      Trade 1 closed
+//      Trade 2, entry 1  →  Name = "3"   (Sell Lmt, first DCA)
+//      Trade 2, DCA add   →  Name = "4"   (Sell Lmt, second DCA)
+//
+//  ★ EXIT SIGNALS (Name column always shows "Close")
+//    ALL exit types use "Close" as the exit signal name:
+//      - Hidden SL hit        →  "Close"  (was SLX_*)
+//      - Hidden TP hit        →  "Close"  (was TPX_*)
+//      - Adaptive trail hit   →  "Close"  (was TRX_*)
+//      - Close Trade button   →  "Close"  (was CX_*)
+//      - Close 1 (partial)    →  "Close"  (was PX_*)
+//      - Account.Flatten fail →  "Close"  (was FX_* / NUKE_*)
+//
+//    NT8 internally matches exits to entries via the
+//    (exitSignal, fromEntrySignal) pair, so "Close"+"3" and
+//    "Close"+"4" are correctly processed as distinct orders.
+//
+//  ★ INTERNAL TRACKING (developer only)
+//    Print() statements still log full context to the Output
+//    window: HIDDEN SL, TRAIL HIT, sig=5, etc. This is only
+//    visible in NT8's Output tab — never in Executions, Account
+//    Performance, or any data sent to the broker/prop firm.
+//
+//  ★ FIELDS
+//    orderCounter   — session-wide, never resets, drives entry names
+//    tradeSequence  — round-trip trade counter, for internal logging
+//    activeEntrySignals — list of current entry signal names (e.g.
+//                         ["3","4"]) used to pair exits correctly
+//
+// ─────────────────────────────────────────────────────────────
 //  ADAPTIVE TRAILING STOP — THE MAIN ADDITION
 // ─────────────────────────────────────────────────────────────
 //
@@ -99,8 +143,8 @@
 //
 //  ★ EXIT MECHANICS
 //  - When price touches or crosses the trail → market exit fires
-//  - Exit signal name: "Close" (same as manual trading)
-//  - Entry signal name: DCA count ("1", "2", etc.)
+//  - Exit signal name: "Close" (stealth — see STEALTH ORDER NAMING)
+//  - Entry signal name: orderCounter number (see STEALTH ORDER NAMING)
 //  - Sets pendingExit=true, same flow as hidden SL/TP exits
 //
 //  ★ INTERACTION WITH FIXED SL/TP
