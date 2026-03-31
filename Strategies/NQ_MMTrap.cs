@@ -65,13 +65,6 @@
 //  - "● Flat — scanning (X%)"  = auto mode, showing confidence
 //  - "● Flat — manual mode"    = waiting for button press
 //
-//  INSTALLATION:
-//  1. NinjaTrader 8 → Tools → NinjaScript Editor
-//  2. File → New → Strategy → name it NQ_MMTrap
-//  3. Select all default code → paste this entire file
-//  4. Press F5 to compile
-//  5. Right-click NQ chart → Strategies → Add → NQ_MMTrap
-//  6. Always run on SIM first before going live
 // ============================================================
 
 #region Using declarations
@@ -1401,10 +1394,13 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void BuildDashboard()
         {
             if (ChartControl == null || dashboardAttached) return;
+            // Set flag on caller thread FIRST to prevent re-entrant calls
+            // before the dispatcher runs (prevents duplicate dashboards)
+            dashboardAttached = true;
             ChartControl.Dispatcher.InvokeAsync(() =>
             {
-                if (dashboardAttached) return;
-                dashboardAttached = true;
+                // Safety: if RemoveDashboard ran between enqueue and execution
+                if (!dashboardAttached) return;
 
                 // ─── Main container with drag support ─────────────
                 dashboardPanel = new Grid();
@@ -2099,21 +2095,41 @@ namespace NinjaTrader.NinjaScript.Strategies
         // ─── Remove dashboard on termination ──────────────────────
         private void RemoveDashboard()
         {
-            if (dashboardPanel == null || ChartControl == null) return;
+            // Capture references before they go null
+            var panel = dashboardPanel;
+            var host  = dashboardHostPanel;
+            var chart = ChartControl;
+
+            // Clear state immediately on caller thread
+            dashboardPanel     = null;
+            dashboardHostPanel = null;
+            dashboardAttached  = false;
+
+            if (panel == null) return;
+            if (chart == null)
+            {
+                // ChartControl already gone — try direct removal (we're likely on the UI thread during teardown)
+                try
+                {
+                    if (host != null) host.Children.Remove(panel);
+                }
+                catch { }
+                return;
+            }
+
             try
             {
-                ChartControl.Dispatcher.InvokeAsync(() =>
+                // Use Invoke (blocking) — guarantees removal completes before Terminated finishes
+                chart.Dispatcher.Invoke(() =>
                 {
                     try
                     {
-                        if (dashboardHostPanel != null)
-                            dashboardHostPanel.Children.Remove(dashboardPanel);
-                        else if (ChartControl.Parent is Grid g)
-                            g.Children.Remove(dashboardPanel);
+                        if (host != null)
+                            host.Children.Remove(panel);
+                        else if (chart.Parent is Grid g)
+                            g.Children.Remove(panel);
                     }
                     catch { }
-                    dashboardPanel    = null;
-                    dashboardAttached = false;
                 });
             }
             catch { }
