@@ -292,6 +292,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool     pendingJumpSL;
         private bool     pendingRearm;      // re-arm stops after SL/TP change
         private bool     pendingExit;       // exit orders submitted, waiting for fill
+        private bool     pendingLimitFlatten;  // deferred flatten from OnExecutionUpdate (daily limit)
         private int      pendingExitTicks;  // ticks since pendingExit became true (safety net)
         private int      flatSyncGraceTicks; // grace ticks for entry order to fill before state reset
         private DateTime lastEntryWallTime;  // cooldown reference: DateTime.Now in Realtime, Time[0] in Historical
@@ -423,7 +424,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // ─── Adaptive Trailing Stop defaults ──────────────
                 trailEnabled          = true;
                 trailActivationPoints = 8;     // activate after 8 NQ pts profit
-                trailMinPoints        = 4;     // tightest: 4 pts ($80/ct) in chop
+                trailMinPoints        = 3;     // tightest: 3 pts ($60/ct) in chop
                 trailMaxPoints        = 25;    // widest: 25 pts ($500/ct) in trend
                 trailAtrMultiplier    = 1.5;   // ATR multiplier for dynamic distance
             }
@@ -605,6 +606,21 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 Print(Time[0] + " | CME SESSION CLOSE FLATTEN at " + Time[0].ToString("HH:mm:ss") + " — closing all positions");
                 ExecuteFlatten();
+            }
+
+            // ─── Deferred daily limit flatten (from OnExecutionUpdate) ─
+            // NEVER call ExecuteFlatten inside OnExecutionUpdate — NT8 holds
+            // an internal lock during execution callbacks and Account.Flatten
+            // tries to acquire the same lock → deadlock → NinjaTrader freeze.
+            if (pendingLimitFlatten && Position.MarketPosition != MarketPosition.Flat)
+            {
+                pendingLimitFlatten = false;
+                Print(Time[0] + " | DEFERRED FLATTEN executing from OnBarUpdate");
+                ExecuteFlatten();
+            }
+            else if (pendingLimitFlatten)
+            {
+                pendingLimitFlatten = false;
             }
 
             // ─── Daily limit guard ────────────────────────────────
@@ -796,18 +812,19 @@ namespace NinjaTrader.NinjaScript.Strategies
             double atr = indAtr[0];
             if (atr <= 0) atr = TickSize;
 
-            // Factor 1: ATR expansion (30%) — rising ATR = trending
+            // Factor 1: ATR contraction/expansion (25%) — falling ATR = ranging
             double atrSum = 0;
             int lookback = Math.Min(10, CurrentBar);
             for (int i = 0; i < lookback; i++)
                 atrSum += indAtr[i];
             double atrAvg = atrSum / lookback;
             double atrExpansion = atrAvg > 0 ? (atr / atrAvg) : 1.0;
-            double atrScore = Math.Min(1.0, Math.Max(0.0, (atrExpansion - 0.8) / 0.6));
+            // Shifted range: <0.9 = contracting (chop), >1.2 = expanding (trend)
+            double atrScore = Math.Min(1.0, Math.Max(0.0, (atrExpansion - 0.9) / 0.5));
 
-            // Factor 2: EMA spread (30%) — wider gap = stronger trend
+            // Factor 2: EMA spread (25%) — wider gap = stronger trend
             double emaSpread = Math.Abs(indEmaFast[0] - indEmaSlow[0]) / atr;
-            double emaScore = Math.Min(1.0, emaSpread / 3.0);
+            double emaScore = Math.Min(1.0, emaSpread / 2.5);  // tighter threshold
 
             // Factor 3: Directional consistency (25%) — bars moving in trade dir
             int dirBars = 0;
@@ -819,20 +836,33 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             double dirScore = checkBars > 0 ? (double)dirBars / checkBars : 0.5;
 
-            // Factor 4: RSI extremity (15%) — away from 50 = directional
+            // Factor 4: RSI extremity (10%) — away from 50 = directional
             double rsiDist = Math.Abs(indRsi[0] - 50.0) / 50.0;
             double rsiScore = Math.Min(1.0, rsiDist * 1.5);
 
-            // Weighted composite
-            trailTrendScore = atrScore * 0.30 + emaScore * 0.30 + dirScore * 0.25 + rsiScore * 0.15;
+            // Factor 5: Range compression (15%) — NEW: bar range vs ATR
+            // Small bars relative to ATR = choppy/indecisive
+            double barRange = High[0] - Low[0];
+            double rangeRatio = atr > 0 ? barRange / atr : 1.0;
+            double rangeScore = Math.Min(1.0, Math.Max(0.0, (rangeRatio - 0.3) / 0.9));
+
+            // Weighted composite — more sensitive to chop signals
+            trailTrendScore = atrScore * 0.25 + emaScore * 0.25 + dirScore * 0.25 + rsiScore * 0.10 + rangeScore * 0.15;
             trailTrendScore = Math.Min(1.0, Math.Max(0.0, trailTrendScore));
+
+            // Chop squeeze: when trend score is very low, apply exponential
+            // tightening to make the trail snap much closer to price
+            // score 0.0 → multiplier 0.5 (half of min), score 0.3 → ~0.85, score 0.5+ → 1.0
+            double chopMultiplier = trailTrendScore < 0.5
+                ? 0.5 + trailTrendScore  // linear ramp: 0→0.5, 0.5→1.0
+                : 1.0;
 
             // ATR-scaled dynamic distance (in NQ points)
             double atrDist = atr * trailAtrMultiplier / (TickSize * 4.0);
 
             // Blend regime-based range with ATR scaling
             double regimeDist = LerpD(trailMinPoints, trailMaxPoints, trailTrendScore);
-            double finalDist  = (regimeDist + atrDist) / 2.0;
+            double finalDist  = (regimeDist * 0.6 + atrDist * 0.4) * chopMultiplier;
 
             // Clamp to user-defined min/max
             finalDist = Math.Max(trailMinPoints, Math.Min(trailMaxPoints, finalDist));
@@ -1273,14 +1303,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (dailyRealizedPnL <= -maxDailyLossDollars && !dailyLimitHit)
             {
                 dailyLimitHit = true;
-                Print("*** DAILY LOSS LIMIT HIT: " + dailyRealizedPnL.ToString("C0") + " — trading halted ***");
-                ExecuteFlatten();
+                pendingLimitFlatten = true;
+                Print("*** DAILY LOSS LIMIT HIT: " + dailyRealizedPnL.ToString("C0") + " — flatten deferred to OnBarUpdate ***");
             }
             if (dailyRealizedPnL >= maxDailyProfitDollars && !dailyProfitHit)
             {
                 dailyProfitHit = true;
-                Print("*** DAILY PROFIT TARGET HIT: " + dailyRealizedPnL.ToString("C0") + " — trading halted, position flattened ***");
-                ExecuteFlatten();
+                pendingLimitFlatten = true;
+                Print("*** DAILY PROFIT TARGET HIT: " + dailyRealizedPnL.ToString("C0") + " — flatten deferred to OnBarUpdate ***");
             }
         }
 

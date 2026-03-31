@@ -171,6 +171,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool     pendingJumpSL;
         private bool     pendingRearm;      // re-arm stops after SL/TP change
         private bool     pendingExit;       // exit orders submitted, waiting for fill
+        private bool     pendingLimitFlatten;  // deferred flatten from OnExecutionUpdate (daily limit)
         private int      pendingExitTicks;  // ticks since pendingExit became true (safety net)
         private int      flatSyncGraceTicks; // grace ticks for entry order to fill before state reset
         private DateTime lastEntryWallTime;  // cooldown reference: DateTime.Now in Realtime, Time[0] in Historical
@@ -461,6 +462,21 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 Print(Time[0] + " | CME SESSION CLOSE FLATTEN at " + Time[0].ToString("HH:mm:ss") + " — closing all positions");
                 ExecuteFlatten();
+            }
+
+            // ─── Deferred daily limit flatten (from OnExecutionUpdate) ─
+            // NEVER call ExecuteFlatten inside OnExecutionUpdate — NT8 holds
+            // an internal lock during execution callbacks and Account.Flatten
+            // tries to acquire the same lock → deadlock → NinjaTrader freeze.
+            if (pendingLimitFlatten && Position.MarketPosition != MarketPosition.Flat)
+            {
+                pendingLimitFlatten = false;
+                Print(Time[0] + " | DEFERRED FLATTEN executing from OnBarUpdate");
+                ExecuteFlatten();
+            }
+            else if (pendingLimitFlatten)
+            {
+                pendingLimitFlatten = false;
             }
 
             // ─── Daily limit guard ────────────────────────────────
@@ -974,14 +990,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (dailyRealizedPnL <= -maxDailyLossDollars && !dailyLimitHit)
             {
                 dailyLimitHit = true;
-                Print("*** DAILY LOSS LIMIT HIT: " + dailyRealizedPnL.ToString("C0") + " — trading halted ***");
-                ExecuteFlatten();
+                pendingLimitFlatten = true;
+                Print("*** DAILY LOSS LIMIT HIT: " + dailyRealizedPnL.ToString("C0") + " — flatten deferred to OnBarUpdate ***");
             }
             if (dailyRealizedPnL >= maxDailyProfitDollars && !dailyProfitHit)
             {
                 dailyProfitHit = true;
-                Print("*** DAILY PROFIT TARGET HIT: " + dailyRealizedPnL.ToString("C0") + " — trading halted, position flattened ***");
-                ExecuteFlatten();
+                pendingLimitFlatten = true;
+                Print("*** DAILY PROFIT TARGET HIT: " + dailyRealizedPnL.ToString("C0") + " — flatten deferred to OnBarUpdate ***");
             }
         }
 
