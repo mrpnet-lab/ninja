@@ -80,6 +80,16 @@ Close Trade and Emergency Kill buttons cancel any unfilled limit orders (Working
 
 ## Adaptive Trailing Stop
 
+### Quick Summary
+
+The adaptive trail is a **hidden trailing stop** (no resting orders on the exchange) that dynamically adjusts how far it sits from the current price. In choppy markets it tightens aggressively to lock gains; in trending markets it widens to let profits run. Combined with the profit-tier system, it ensures you never give back large gains once they've been reached.
+
+| Market Condition | Trail Distance | Effect |
+|---|---|---|
+| Choppy (score ~20%) | ~4 pts ($80/ct) | Locks gains fast |
+| Mixed (score ~50%) | ~12 pts ($240/ct) | Balanced protection |
+| Trending (score ~85%) | ~22 pts ($440/ct) | Lets profits run |
+
 ### What It Does
 
 A hidden (no resting orders) trailing stop that dynamically adjusts its distance from price based on real-time market conditions. It aims to:
@@ -291,12 +301,35 @@ Each strategy scores confidence 0-100% with two tiers: crossover (full credit) a
 
 ## Post-Entry Trap Detector (v1)
 
-Monitors trades after entry for signs of a trap:
-- **HIGH risk**: Fast adverse move (>3pts in ≤5 bars) with no favorable excursion
-- **Medium risk**: Slow bleed (>2pts adverse in ≤10 bars), or was profitable but gave it all back
-- **Low risk**: Normal trade progression
+The trap detector monitors your **open position** after entry to detect if you've walked into a market-maker trap — a situation where price reversed against you immediately after entry. It does **not** filter entries (that's the Smart Signal Filters above); instead it watches live trades for danger signs.
 
-Dashboard displays: `Trap: [Level] (MFE:X MAE:Y bars:N)`
+### How It Scores (0–100)
+
+Once in a trade, 4 factors are evaluated every bar:
+
+| Factor | Points | What it detects |
+|---|---|---|
+| Move ratio | up to ~30 | Price moved significantly against your direction since entry (adverse excursion vs ATR) |
+| Spread/volatility spike | ~20 | Sudden ATR expansion = institutional activity against you |
+| Directional bar count | ~15 | Consecutive bars moving against your trade direction |
+| Range compression → expansion | ~10 | Coiling then snapping against you (classic MM trap pattern) |
+
+When `trapScore >= 50` **and** 3+ bars have elapsed since entry, the detector flags `trapDetected = true`.
+
+### What Happens When a Trap Is Detected
+
+The detector does **not** auto-exit. Instead it:
+1. **Tightens the adaptive trail** — makes it more aggressive about locking remaining gains
+2. **Shows a dashboard warning** — e.g. `"⚠ TRAP 72% bars=5"` so you can decide to close manually
+3. **Can adjust TP** — optionally reduces take-profit to limit exposure on a deteriorating trade
+
+### Dashboard Toggle
+
+The `TRAP` button on the dashboard enables/disables the detector at runtime. The `EnablePostEntryTrapDetector` property (Group 8) controls the default on strategy load.
+
+### State Reset
+
+`trapScore`, `trapDetected`, and `trapBarsInTrade` are all reset to zero in `ResetPositionState()` when a trade closes, ensuring no stale trap data carries into the next trade.
 
 ---
 
