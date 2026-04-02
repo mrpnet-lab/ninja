@@ -176,6 +176,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private TextBlock lblUnrealized;
         private TextBlock lblTotalPnL;
         private TextBlock lblAccountBal;
+        private TextBlock lblAccountPnL;
         private TextBlock lblConfBull;
         private TextBlock lblConfBear;
         private TextBlock lblPosition;
@@ -237,6 +238,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int    trapAdaptiveMode;
         private double trapOriginalTP;
         private int    trapExpiryCandidateBars;
+        private double trapScore;
+        private bool   trapDetected;
+        private int    trapBarsInTrade;
         private readonly Queue<int> trapDirectionHistory = new Queue<int>();
         private Button btnTrapToggle;
 
