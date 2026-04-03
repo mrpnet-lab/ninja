@@ -141,6 +141,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool     firstBarSeen;
         private bool     emergencyKillActive;
         private DateTime aggressiveLimitSubmitTime;
+        private bool     pendingRemoveTrailDraw;
 
         // ─── Dashboard build retry ────────────────────────────────
         private int  dashBuildRetryCount;
@@ -252,7 +253,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private Button btnTrapToggle;
 
         // ─── Volume Profile ───────────────────────────────────────
-        private Dictionary<double, double> volumeAtPrice;
+        private SortedDictionary<double, double> volumeAtPrice;
         private double pocLevel;
         private double vahLevel;
         private double valLevel;
@@ -341,7 +342,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             else if (State == State.DataLoaded)
             {
                 ResetVwap();
-                volumeAtPrice = new Dictionary<double, double>();
+                volumeAtPrice = new SortedDictionary<double, double>();
                 dailyRealizedPnL = 0;
                 dailyLimitHit    = false;
                 dailyProfitHit   = false;
@@ -414,7 +415,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 consecutiveLosses      = 0;
                 lastLossTime           = DateTime.MinValue;
 
-                volumeAtPrice          = new Dictionary<double, double>();
+                volumeAtPrice          = new SortedDictionary<double, double>();
                 pocLevel               = 0;
                 vahLevel               = 0;
                 valLevel               = 0;
@@ -475,9 +476,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 pendingFlatten = false;
                 ExecuteFlatten();
             }
-
-            // Position state sync
-            SyncPositionState();
+            if (pendingRemoveTrailDraw)
+            {
+                pendingRemoveTrailDraw = false;
+                RemoveDrawObject("adaptiveTrail");
+                RemoveDrawObject("trailLabel");
+            }
 
             // Block entries while exit pending + stale exit safety net
             if (pendingExit)
@@ -527,6 +531,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (pendingRearm)      { pendingRearm      = false; if (stopsArmed) ArmHiddenStops(); }
             }
 
+            // Position state sync — MUST be AFTER button processing so entries aren't wiped
+            SyncPositionState();
+
             // Hidden SL/TP monitor \u2014 every tick
             if (stopsArmed && !pendingExit && Position.MarketPosition != MarketPosition.Flat)
                 MonitorHiddenStops();
@@ -566,7 +573,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 else
                 {
                     dashBuildTickCounter++;
-                    if (dashBuildTickCounter >= 2)
+                    if (dashBuildTickCounter >= 5)
                     {
                         dashBuildTickCounter = 0;
                         BuildDashboard();
@@ -607,13 +614,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                     UpdateDashboardStatus("DAILY LOSS LIMIT \u2014 NO TRADES", Brushes.OrangeRed);
             }
 
-            // Calculate signals (perf: only on first tick when flat)
+            // Calculate signals — only needed for entries; skip entirely when in position
             bool isFlat = Position.MarketPosition == MarketPosition.Flat;
-            if (isFlat && !IsFirstTickOfBar && !stopsArmed)
-            {
-                // Skip signal calc on non-first ticks when flat \u2014 saves CPU
-            }
-            else
+            if (isFlat && IsFirstTickOfBar)
             {
                 CalculateSignals();
             }
@@ -656,7 +659,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             // Chart & dashboard (gate draws to first tick of bar when possible)
             if (IsFirstTickOfBar)
                 UpdateOrbLevels();
-            if (IsFirstTickOfBar || stopsArmed)
+            if (IsFirstTickOfBar)
             {
                 DrawChartAnnotations();
                 DrawDcaLevels();
@@ -667,10 +670,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (IsFirstTickOfBar)
                 DrawVwapLine();
 
-            // Throttle dashboard: every tick in trade, every 3rd tick when flat
+            // Throttle dashboard: every 3rd tick in trade, every 8th tick when flat
             bool inPosition = Position.MarketPosition != MarketPosition.Flat;
             dashUpdateTickCounter++;
-            if (inPosition || stopsArmed || pendingExit || IsFirstTickOfBar || dashUpdateTickCounter >= 3)
+            int dashInterval = (inPosition || stopsArmed || pendingExit) ? 3 : 8;
+            if (IsFirstTickOfBar || dashUpdateTickCounter >= dashInterval)
             {
                 dashUpdateTickCounter = 0;
                 UpdateDashboard();
@@ -1475,7 +1479,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
             }
 
-            double checkPnL = dailyRealizedPnL - pnlBaselineOffset;
+            // v2 uses incremental tracking — dailyRealizedPnL already contains only
+            // trades completed after Realtime start; no baseline subtraction needed
+            double checkPnL = dailyRealizedPnL;
             if (checkPnL <= -maxDailyLossDollars && !dailyLimitHit)
             {
                 dailyLimitHit = true;
@@ -1533,7 +1539,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             double vol = Volume[0];
             if (volumeAtPrice.ContainsKey(tp)) volumeAtPrice[tp] += vol;
             else volumeAtPrice[tp] = vol;
-            CalculateVolumeProfileLevels();
+            // Only recalculate levels every 10 bars to avoid expensive sort/expansion
+            if (CurrentBar % 10 == 0)
+                CalculateVolumeProfileLevels();
         }
 
         private void CalculateVolumeProfileLevels()
@@ -1553,10 +1561,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             foreach (var kvp in volumeAtPrice) totalVol += kvp.Value;
             double targetVol = totalVol * VALUE_AREA_PCT;
 
-            // Sort prices for expansion
+            // Keys are already sorted (SortedDictionary)
             var sortedPrices = new List<double>(volumeAtPrice.Keys);
-            sortedPrices.Sort();
-            int pocIdx = sortedPrices.IndexOf(pocLevel);
+            int pocIdx = sortedPrices.BinarySearch(pocLevel);
             if (pocIdx < 0) { vahLevel = pocLevel; valLevel = pocLevel; return; }
 
             double areaVol = volumeAtPrice[pocLevel];
@@ -1606,7 +1613,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             orbSet               = false;
             orbHigh              = 0;
             orbLow               = 0;
-            if (volumeAtPrice != null) volumeAtPrice.Clear();
+            if (volumeAtPrice != null) { volumeAtPrice.Clear(); volumeProfileReady = false; }
             pocLevel = 0; vahLevel = 0; valLevel = 0;
             Print("Session reset: " + sessionDate.ToShortDateString()
                 + " MaxLoss=$" + maxDailyLossDollars + " ProfitTarget=$" + maxDailyProfitDollars
@@ -1755,8 +1762,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (CurrentBar < emaPeriodSlow + 5) return;
 
-            UpdateVwap();
-            UpdateVolumeProfile();
+            // UpdateVwap & UpdateVolumeProfile already called in OnBarUpdate
 
             lastBullConfidence = 0;
             lastBearConfidence = 0;
@@ -2504,7 +2510,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 if (current is Button btn)
                                 {
                                     // Part 3b: freeze strategy selector in trade
-                                    bool inTrade = Position.MarketPosition != MarketPosition.Flat;
+                                    bool inTrade = openTradeDirection != 0;
 
                                     if (btn == btnBuyMkt)           { pendingLong = true; if (lblStatus != null) { lblStatus.Text = "\u25cf BUY MKT queued..."; lblStatus.Foreground = Brushes.Yellow; } }
                                     else if (btn == btnSellMkt)     { pendingShort = true; if (lblStatus != null) { lblStatus.Text = "\u25cf SELL MKT queued..."; lblStatus.Foreground = Brushes.Yellow; } }
@@ -2515,7 +2521,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                                     else if (btn == btnCloseOne)    { pendingCloseOne = true; if (lblStatus != null) { lblStatus.Text = "\u25cf CLOSE 1 queued..."; lblStatus.Foreground = Brushes.Yellow; } }
                                     else if (btn == btnCloseTrade)  { pendingCloseTrade = true; if (lblStatus != null) { lblStatus.Text = "\u25cf CLOSE queued..."; lblStatus.Foreground = Brushes.Yellow; } }
                                     else if (btn == btnJumpSL)      { pendingJumpSL = true; if (lblStatus != null) { lblStatus.Text = "\u25cf JUMP SL queued..."; lblStatus.Foreground = Brushes.Yellow; } }
-                                    else if (btn == btnExit)        { pendingEmergencyKill = true; if (lblStatus != null) { lblStatus.Text = "\u26a0 EMERGENCY KILL executing..."; lblStatus.Foreground = Brushes.OrangeRed; } }
+                                    else if (btn == btnExit)        { pendingFlatten = true; if (lblStatus != null) { lblStatus.Text = "\u26a0 KILL queued..."; lblStatus.Foreground = Brushes.OrangeRed; } }
                                     else if (btn == btnModeManual)  { autoMode = false; UpdateModeButtons(); }
                                     else if (btn == btnModeAuto)    { autoMode = true;  UpdateModeButtons(); }
                                     else if (btn == btnStratPrevConf)
@@ -2533,7 +2539,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                                         btnTrailToggle.Background = trailEnabled
                                             ? new SolidColorBrush(Color.FromRgb(120, 50, 140))
                                             : new SolidColorBrush(Color.FromRgb(50, 55, 65));
-                                        if (!trailEnabled) { trailActive = false; trailPrice = 0; trailMaxProfitPts = 0; trailTierName = ""; RemoveDrawObject("adaptiveTrail"); RemoveDrawObject("trailLabel"); }
+                                        if (!trailEnabled) { trailActive = false; trailPrice = 0; trailMaxProfitPts = 0; trailTierName = ""; pendingRemoveTrailDraw = true; }
                                     }
                                     else if (btn == btnTrapToggle)
                                     {
@@ -2743,20 +2749,62 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (ChartControl == null) return;
             if (lblPnL == null || lblStatus == null || lblPosition == null) return;
+
+            // ── Capture ALL NinjaTrader data on the data thread (thread-safe) ──
+            double snapClose         = Close[0];
+            MarketPosition snapMktPos = Position.MarketPosition;
+            int    snapPosQty        = Position.Quantity;
+            double snapPosAvgPrice   = Position.AveragePrice;
+            int    snapTimeVal       = ToTime(Time[0]);
+
+            double snapUnrealized = 0;
+            if (snapMktPos != MarketPosition.Flat && averageEntryPrice > 0)
+            {
+                double priceDiff = snapMktPos == MarketPosition.Long
+                    ? snapClose - averageEntryPrice
+                    : averageEntryPrice - snapClose;
+                double qty = Math.Max(totalContracts, snapPosQty);
+                snapUnrealized = priceDiff * NQ_DOLLARS_PER_POINT * qty;
+            }
+
+            // Snapshot all mutable strategy state used by dashboard
+            int    snapDcaCount    = openDcaCount;
+            int    snapTradeDir    = openTradeDirection;
+            bool   snapStopsArmed  = stopsArmed;
+            bool   snapPendingExit = pendingExit;
+            double snapAvgEntry    = averageEntryPrice;
+            double snapHiddenSL    = hiddenStopPrice;
+            double snapHiddenTP    = hiddenTargetPrice;
+            int    snapSlPts       = slPoints;
+            int    snapTpPts       = tpPoints;
+            double snapTotalContracts = totalContracts;
+            double snapTrailPrice  = trailPrice;
+            bool   snapTrailActive = trailActive;
+            double snapTrailScore  = trailTrendScore;
+            double snapTrailMaxPt  = trailMaxProfitPts;
+            string snapTrailTier   = trailTierName;
+            double snapTrapScore   = trapScore;
+            bool   snapTrapDetect  = trapDetected;
+            int    snapTrapBars    = trapBarsInTrade;
+            double snapBullConf    = lastBullConfidence;
+            double snapBearConf    = lastBearConfidence;
+            double snapDailyPnL    = dailyRealizedPnL;
+            int    snapDailyTrades = dailyTradeCount;
+            bool   snapDailyLimit  = dailyLimitHit;
+            bool   snapProfitHit   = dailyProfitHit;
+            bool   snapEmergKill   = emergencyKillActive;
+            bool   snapFlattenDone = flattenFired;
+            double snapVwap        = vwapValue;
+            double snapPoc         = pocLevel;
+            string snapLastStrat   = lastAutoStrategyUsed;
+
             ChartControl.Dispatcher.InvokeAsync(() =>
             {
+                try
+                {
                 if (lblPnL == null || lblStatus == null) return;
 
-                // Bug 1 fix: Manual unrealized P&L calculation
-                double unrealizedPnL = 0;
-                if (Position.MarketPosition != MarketPosition.Flat && averageEntryPrice > 0)
-                {
-                    double priceDiff = Position.MarketPosition == MarketPosition.Long
-                        ? Close[0] - averageEntryPrice
-                        : averageEntryPrice - Close[0];
-                    double qty = Math.Max(totalContracts, Position.Quantity);
-                    unrealizedPnL = priceDiff * NQ_DOLLARS_PER_POINT * qty;
-                }
+                double unrealizedPnL = snapUnrealized;
 
                 if (lblUnrealized != null)
                 {
@@ -2764,12 +2812,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                     lblUnrealized.Foreground  = unrealizedPnL >= 0 ? Brushes.LimeGreen : Brushes.OrangeRed;
                 }
 
-                double totalPnL = dailyRealizedPnL + unrealizedPnL;
+                double totalPnL = snapDailyPnL + unrealizedPnL;
                 string tradeCountStr = maxTradesPerDay > 0
-                    ? "  [Trades: " + dailyTradeCount + "/" + maxTradesPerDay + "]"
-                    : "  [Trades: " + dailyTradeCount + "]";
-                lblPnL.Text       = "Daily P&L:   " + dailyRealizedPnL.ToString("C2") + tradeCountStr;
-                lblPnL.Foreground = dailyRealizedPnL >= 0 ? Brushes.LimeGreen : Brushes.OrangeRed;
+                    ? "  [Trades: " + snapDailyTrades + "/" + maxTradesPerDay + "]"
+                    : "  [Trades: " + snapDailyTrades + "]";
+                lblPnL.Text       = "Daily P&L:   " + snapDailyPnL.ToString("C2") + tradeCountStr;
+                lblPnL.Foreground = snapDailyPnL >= 0 ? Brushes.LimeGreen : Brushes.OrangeRed;
 
                 if (lblTotalPnL != null)
                 {
@@ -2803,19 +2851,19 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
 
                 // Position status
-                if (pendingExit)
+                if (snapPendingExit)
                 {
                     lblStatus.Text       = "\u25cf CLOSING... (exit pending)";
                     lblStatus.Foreground = Brushes.Yellow;
                 }
-                else if (Position.MarketPosition != MarketPosition.Flat)
+                else if (snapMktPos != MarketPosition.Flat)
                 {
-                    string dir = Position.MarketPosition == MarketPosition.Long ? "LONG" : "SHORT";
-                    int qty = Position.Quantity;
-                    if (openTradeDirection != 0 && stopsArmed)
+                    string dir = snapMktPos == MarketPosition.Long ? "LONG" : "SHORT";
+                    int qty = snapPosQty;
+                    if (snapTradeDir != 0 && snapStopsArmed)
                     {
                         lblStatus.Text       = "\u25cf " + dir + "  \u00d7" + qty;
-                        lblStatus.Foreground = Position.MarketPosition == MarketPosition.Long ? Brushes.LimeGreen : Brushes.OrangeRed;
+                        lblStatus.Foreground = snapMktPos == MarketPosition.Long ? Brushes.LimeGreen : Brushes.OrangeRed;
                     }
                     else
                     {
@@ -2823,41 +2871,41 @@ namespace NinjaTrader.NinjaScript.Strategies
                         lblStatus.Foreground = Brushes.Yellow;
                     }
                     if (lblPosition != null)
-                        lblPosition.Text = "Pos: " + openDcaCount + "/" + maxContracts
-                                         + "  |  Avg: " + (averageEntryPrice > 0 ? averageEntryPrice.ToString("F2") : Position.AveragePrice.ToString("F2"));
+                        lblPosition.Text = "Pos: " + snapDcaCount + "/" + maxContracts
+                                         + "  |  Avg: " + (snapAvgEntry > 0 ? snapAvgEntry.ToString("F2") : snapPosAvgPrice.ToString("F2"));
                     if (lblHiddenSL != null)
-                        lblHiddenSL.Text = hiddenStopPrice > 0
-                            ? "SL: " + hiddenStopPrice.ToString("F2")
-                              + "  (" + slPoints + "pt | " + (slPoints * 4) + "tk | " + (slPoints * NQ_DOLLARS_PER_POINT * Math.Max(totalContracts, qty)).ToString("C0") + ")"
+                        lblHiddenSL.Text = snapHiddenSL > 0
+                            ? "SL: " + snapHiddenSL.ToString("F2")
+                              + "  (" + snapSlPts + "pt | " + (snapSlPts * 4) + "tk | " + (snapSlPts * NQ_DOLLARS_PER_POINT * Math.Max(snapTotalContracts, qty)).ToString("C0") + ")"
                             : "SL: \u2014  (stops not armed)";
                     if (lblHiddenTP != null)
-                        lblHiddenTP.Text = hiddenTargetPrice > 0
-                            ? "TP: " + hiddenTargetPrice.ToString("F2")
-                              + "  (" + tpPoints + "pt | " + (tpPoints * 4) + "tk | " + (tpPoints * NQ_DOLLARS_PER_POINT * Math.Max(totalContracts, qty)).ToString("C0") + ")"
+                        lblHiddenTP.Text = snapHiddenTP > 0
+                            ? "TP: " + snapHiddenTP.ToString("F2")
+                              + "  (" + snapTpPts + "pt | " + (snapTpPts * 4) + "tk | " + (snapTpPts * NQ_DOLLARS_PER_POINT * Math.Max(snapTotalContracts, qty)).ToString("C0") + ")"
                             : "TP: \u2014  (stops not armed)";
 
                     // Trail info
                     if (lblTrailInfo != null)
                     {
-                        if (trailEnabled && trailActive && trailPrice > 0)
+                        if (trailEnabled && snapTrailActive && snapTrailPrice > 0)
                         {
-                            double dist = openTradeDirection == 1
-                                ? (Close[0] - trailPrice) / (TickSize * NQ_TICKS_PER_POINT)
-                                : openTradeDirection == -1
-                                    ? (trailPrice - Close[0]) / (TickSize * NQ_TICKS_PER_POINT) : 0;
-                            string regime = trailTrendScore > 0.6 ? "Trend" : (trailTrendScore < 0.35 ? "Chop" : "Mix");
-                            string tierStr = !string.IsNullOrEmpty(trailTierName) ? " " + trailTierName : "";
-                            lblTrailInfo.Text = "Trail: " + trailPrice.ToString("F2") + " (" + dist.ToString("F1") + "pt " + regime + " " + (trailTrendScore * 100).ToString("F0") + "%" + tierStr + ")";
-                            if (trailTierName == "T3-Runner") lblTrailInfo.Foreground = Brushes.Gold;
-                            else if (trailTierName == "T2-Strong") lblTrailInfo.Foreground = Brushes.Cyan;
-                            else if (trailTierName == "T1-BE") lblTrailInfo.Foreground = Brushes.Yellow;
+                            double dist = snapTradeDir == 1
+                                ? (snapClose - snapTrailPrice) / (TickSize * NQ_TICKS_PER_POINT)
+                                : snapTradeDir == -1
+                                    ? (snapTrailPrice - snapClose) / (TickSize * NQ_TICKS_PER_POINT) : 0;
+                            string regime = snapTrailScore > 0.6 ? "Trend" : (snapTrailScore < 0.35 ? "Chop" : "Mix");
+                            string tierStr = !string.IsNullOrEmpty(snapTrailTier) ? " " + snapTrailTier : "";
+                            lblTrailInfo.Text = "Trail: " + snapTrailPrice.ToString("F2") + " (" + dist.ToString("F1") + "pt " + regime + " " + (snapTrailScore * 100).ToString("F0") + "%" + tierStr + ")";
+                            if (snapTrailTier == "T3-Runner") lblTrailInfo.Foreground = Brushes.Gold;
+                            else if (snapTrailTier == "T2-Strong") lblTrailInfo.Foreground = Brushes.Cyan;
+                            else if (snapTrailTier == "T1-BE") lblTrailInfo.Foreground = Brushes.Yellow;
                             else lblTrailInfo.Foreground = Brushes.Magenta;
                         }
-                        else if (trailEnabled && !trailActive)
+                        else if (trailEnabled && !snapTrailActive)
                         {
                             double profitPts = 0;
-                            if (openTradeDirection == 1) profitPts = (Close[0] - averageEntryPrice) / (TickSize * NQ_TICKS_PER_POINT);
-                            else if (openTradeDirection == -1) profitPts = (averageEntryPrice - Close[0]) / (TickSize * NQ_TICKS_PER_POINT);
+                            if (snapTradeDir == 1) profitPts = (snapClose - snapAvgEntry) / (TickSize * NQ_TICKS_PER_POINT);
+                            else if (snapTradeDir == -1) profitPts = (snapAvgEntry - snapClose) / (TickSize * NQ_TICKS_PER_POINT);
                             lblTrailInfo.Text = "Trail: waiting (" + profitPts.ToString("F1") + "/" + trailActivationPoints + "pt)";
                             lblTrailInfo.Foreground = Brushes.Gray;
                         }
@@ -2871,14 +2919,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                     // Trap info
                     if (lblTrapInfo != null)
                     {
-                        if (trapDetectorEnabled && trapDetected)
+                        if (trapDetectorEnabled && snapTrapDetect)
                         {
-                            lblTrapInfo.Text = "Trap: DETECTED (" + trapScore.ToString("F0") + "%) bars=" + trapBarsInTrade;
+                            lblTrapInfo.Text = "Trap: DETECTED (" + snapTrapScore.ToString("F0") + "%) bars=" + snapTrapBars;
                             lblTrapInfo.Foreground = Brushes.OrangeRed;
                         }
                         else if (trapDetectorEnabled)
                         {
-                            lblTrapInfo.Text = "Trap: score " + trapScore.ToString("F0") + "% bars=" + trapBarsInTrade;
+                            lblTrapInfo.Text = "Trap: score " + snapTrapScore.ToString("F0") + "% bars=" + snapTrapBars;
                             lblTrapInfo.Foreground = Brushes.Orange;
                         }
                         else
@@ -2890,40 +2938,39 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                     // Active strategy
                     if (lblActiveStrategy != null)
-                        lblActiveStrategy.Text = "Active: " + (!string.IsNullOrEmpty(lastAutoStrategyUsed) ? lastAutoStrategyUsed : "\u2014");
+                        lblActiveStrategy.Text = "Active: " + (!string.IsNullOrEmpty(snapLastStrat) ? snapLastStrat : "\u2014");
                 }
                 else
                 {
                     // Flat status
-                    if (dailyLimitHit)
+                    if (snapDailyLimit)
                     {
-                        lblStatus.Text       = "\u25a0 DAILY LOSS LIMIT \u2014 halted (" + dailyRealizedPnL.ToString("C0") + ")";
+                        lblStatus.Text       = "\u25a0 DAILY LOSS LIMIT \u2014 halted (" + snapDailyPnL.ToString("C0") + ")";
                         lblStatus.Foreground = Brushes.OrangeRed;
                     }
-                    else if (emergencyKillActive)
+                    else if (snapEmergKill)
                     {
                         lblStatus.Text       = "\u26a0 EMERGENCY KILL \u2014 halted";
                         lblStatus.Foreground = Brushes.OrangeRed;
                     }
-                    else if (dailyProfitHit)
+                    else if (snapProfitHit)
                     {
-                        lblStatus.Text       = "\u25a0 DAILY PROFIT TARGET \u2014 halted (" + dailyRealizedPnL.ToString("C0") + ")";
+                        lblStatus.Text       = "\u25a0 DAILY PROFIT TARGET \u2014 halted (" + snapDailyPnL.ToString("C0") + ")";
                         lblStatus.Foreground = Brushes.Gold;
                     }
-                    else if (flattenFired)
+                    else if (snapFlattenDone)
                     {
                         lblStatus.Text       = "\u25a0 EOD flatten \u2014 done for today";
                         lblStatus.Foreground = Brushes.Orange;
                     }
-                    else if (maxTradesPerDay > 0 && dailyTradeCount >= maxTradesPerDay)
+                    else if (maxTradesPerDay > 0 && snapDailyTrades >= maxTradesPerDay)
                     {
-                        lblStatus.Text       = "\u25a0 Max trades reached (" + dailyTradeCount + "/" + maxTradesPerDay + ") \u2014 done";
+                        lblStatus.Text       = "\u25a0 Max trades reached (" + snapDailyTrades + "/" + maxTradesPerDay + ") \u2014 done";
                         lblStatus.Foreground = Brushes.Orange;
                     }
                     else
                     {
-                        int ct2 = ToTime(Time[0]);
-                        bool inAutoHours = !tradingHoursEnabled || (ct2 >= tradingStartTime && ct2 < tradingEndTime);
+                        bool inAutoHours = !tradingHoursEnabled || (snapTimeVal >= tradingStartTime && snapTimeVal < tradingEndTime);
                         if (autoMode && !inAutoHours)
                         {
                             lblStatus.Text       = "\u25cb Flat \u2014 outside auto hours";
@@ -2931,8 +2978,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                         }
                         else if (autoMode)
                         {
-                            double best = Math.Max(lastBullConfidence, lastBearConfidence);
-                            string dirStr = lastBullConfidence >= lastBearConfidence ? "Bull" : "Bear";
+                            double best = Math.Max(snapBullConf, snapBearConf);
+                            string dirStr = snapBullConf >= snapBearConf ? "Bull" : "Bear";
                             string cooldownStr = "";
                             if (lossCooldownSeconds > 0 && consecutiveLosses > 0)
                             {
@@ -2950,8 +2997,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                         }
                     }
                     if (lblPosition != null) lblPosition.Text = "Pos: 0/" + maxContracts + "  |  Avg: \u2014";
-                    if (lblHiddenSL != null) lblHiddenSL.Text = "SL: \u2014  (" + slPoints + "pt | " + (slPoints * 4) + "tk | $" + (slPoints * 20) + "/ct)";
-                    if (lblHiddenTP != null) lblHiddenTP.Text = "TP: \u2014  (" + tpPoints + "pt | " + (tpPoints * 4) + "tk | $" + (tpPoints * 20) + "/ct)";
+                    if (lblHiddenSL != null) lblHiddenSL.Text = "SL: \u2014  (" + snapSlPts + "pt | " + (snapSlPts * 4) + "tk | $" + (snapSlPts * 20) + "/ct)";
+                    if (lblHiddenTP != null) lblHiddenTP.Text = "TP: \u2014  (" + snapTpPts + "pt | " + (snapTpPts * 4) + "tk | $" + (snapTpPts * 20) + "/ct)";
                     if (lblTrailInfo != null)
                     {
                         lblTrailInfo.Text = trailEnabled ? "Trail: \u2014" : "Trail: OFF";
@@ -2967,21 +3014,21 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 // VWAP
                 if (lblVwapVal != null)
-                    lblVwapVal.Text = "VWAP: " + (vwapValue > 0 ? vwapValue.ToString("F2") : "\u2014")
-                        + (pocLevel > 0 ? "  POC:" + pocLevel.ToString("F2") : "");
+                    lblVwapVal.Text = "VWAP: " + (snapVwap > 0 ? snapVwap.ToString("F2") : "\u2014")
+                        + (snapPoc > 0 ? "  POC:" + snapPoc.ToString("F2") : "");
 
                 // Bug 4 fix: Confidence colors always green/red with opacity
                 if (lblConfBull != null)
                 {
-                    lblConfBull.Text = "Bull: " + lastBullConfidence.ToString("F0") + "%";
-                    double bullOpacity = lastBullConfidence >= minSignalConfidence ? 1.0 : Math.Max(0.35, lastBullConfidence / minSignalConfidence);
+                    lblConfBull.Text = "Bull: " + snapBullConf.ToString("F0") + "%";
+                    double bullOpacity = snapBullConf >= minSignalConfidence ? 1.0 : Math.Max(0.35, snapBullConf / minSignalConfidence);
                     lblConfBull.Foreground = Brushes.LimeGreen;
                     lblConfBull.Opacity    = bullOpacity;
                 }
                 if (lblConfBear != null)
                 {
-                    lblConfBear.Text = "Bear: " + lastBearConfidence.ToString("F0") + "%";
-                    double bearOpacity = lastBearConfidence >= minSignalConfidence ? 1.0 : Math.Max(0.35, lastBearConfidence / minSignalConfidence);
+                    lblConfBear.Text = "Bear: " + snapBearConf.ToString("F0") + "%";
+                    double bearOpacity = snapBearConf >= minSignalConfidence ? 1.0 : Math.Max(0.35, snapBearConf / minSignalConfidence);
                     lblConfBear.Foreground = Brushes.OrangeRed;
                     lblConfBear.Opacity    = bearOpacity;
                 }
@@ -2989,14 +3036,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // Trading hours
                 if (lblTradeHours != null)
                 {
-                    int ct = ToTime(Time[0]);
-                    bool inHours = !tradingHoursEnabled || (ct >= tradingStartTime && ct < flattenTime);
-                    if (dailyLimitHit || emergencyKillActive)
+                    bool inHours = !tradingHoursEnabled || (snapTimeVal >= tradingStartTime && snapTimeVal < flattenTime);
+                    if (snapDailyLimit || snapEmergKill)
                     {
                         lblTradeHours.Text       = "\u25cf Daily limit hit \u2014 trading halted";
                         lblTradeHours.Foreground  = Brushes.OrangeRed;
                     }
-                    else if (flattenFired)
+                    else if (snapFlattenDone)
                     {
                         lblTradeHours.Text       = "\u25cf EOD flatten fired \u2014 done for today";
                         lblTradeHours.Foreground  = Brushes.Orange;
@@ -3014,9 +3060,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
 
                 // Strategy selector freeze (Part 3b)
-                bool tradeFrozen = Position.MarketPosition != MarketPosition.Flat;
+                bool tradeFrozen = snapMktPos != MarketPosition.Flat;
                 if (btnStratPrevConf != null) btnStratPrevConf.IsEnabled = !tradeFrozen;
                 if (btnStratNextConf != null) btnStratNextConf.IsEnabled = !tradeFrozen;
+                } // end try
+                catch { } // Silently absorb any WPF/threading exceptions
             });
         }
 
