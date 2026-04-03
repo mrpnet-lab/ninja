@@ -208,6 +208,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         private TextBlock lblQtyMax;
         private Button    btnStratPrevConf;
         private Button    btnStratNextConf;
+        private StackPanel stratPanel;
+        private TextBlock  lblStratName;
 
         // ─── Dashboard placement & drag/resize ────────────────────
         private int            bestAutoStrategy;
@@ -1558,6 +1560,167 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Draw.HorizontalLine(this, "vpPOC", pocLevel, Brushes.Gold, DashStyleHelper.Solid, 2);
                 Draw.HorizontalLine(this, "vpVAH", vahLevel, Brushes.DodgerBlue, DashStyleHelper.Dash, 1);
                 Draw.HorizontalLine(this, "vpVAL", valLevel, Brushes.DodgerBlue, DashStyleHelper.Dash, 1);
+            }
+        }
+
+        #endregion
+
+        #region Chart Annotations & Daily Reset
+
+        private void ResetDailyTracking()
+        {
+            sessionDate          = Time[0].Date;
+            dailyRealizedPnL     = 0;
+            pnlBaselineOffset    = 0;
+            dailyLimitHit        = false;
+            dailyProfitHit       = false;
+            dailyTradeCount      = 0;
+            processedTradeCount  = 0;
+            flattenFired         = false;
+            emergencyKillActive  = false;
+            consecutiveLosses    = 0;
+            lastLossTime         = DateTime.MinValue;
+            orbSet               = false;
+            orbHigh              = 0;
+            orbLow               = 0;
+            if (volumeAtPrice != null) volumeAtPrice.Clear();
+            pocLevel = 0; vahLevel = 0; valLevel = 0;
+            Print("Session reset: " + sessionDate.ToShortDateString()
+                + " MaxLoss=$" + maxDailyLossDollars + " ProfitTarget=$" + maxDailyProfitDollars
+                + " MaxTrades=" + (maxTradesPerDay > 0 ? maxTradesPerDay.ToString() : "\u221e"));
+        }
+
+        private void UpdateOrbLevels()
+        {
+            int t = ToTime(Time[0]);
+            if (t >= 93000 && t < 94500)
+            {
+                if (orbHigh == 0 && orbLow == 0)
+                {
+                    orbHigh = High[0];
+                    orbLow  = Low[0];
+                }
+                else
+                {
+                    orbHigh = Math.Max(orbHigh, High[0]);
+                    orbLow  = Math.Min(orbLow,  Low[0]);
+                }
+                orbSet = false;
+            }
+            else if (t >= 94500 && !orbSet && orbHigh > 0)
+            {
+                orbSet = true;
+                Draw.HorizontalLine(this, "orbHigh", false, orbHigh, Brushes.LimeGreen, DashStyleHelper.Dash, 2);
+                Draw.HorizontalLine(this, "orbLow",  false, orbLow,  Brushes.OrangeRed, DashStyleHelper.Dash, 2);
+            }
+        }
+
+        private void DrawChartAnnotations()
+        {
+            if (!stopsArmed || averageEntryPrice == 0) return;
+            Draw.HorizontalLine(this, "hiddenSL",     false, hiddenStopPrice,   Brushes.OrangeRed,  DashStyleHelper.DashDotDot, 2);
+            Draw.HorizontalLine(this, "hiddenTP",     false, hiddenTargetPrice,  Brushes.LimeGreen,  DashStyleHelper.DashDotDot, 2);
+            Draw.HorizontalLine(this, "avgEntryLine", false, averageEntryPrice,  Brushes.DodgerBlue, DashStyleHelper.Dot,        1);
+
+            int slTk = slPoints * 4;
+            int tpTk = tpPoints * 4;
+            double slDol = slPoints * NQ_DOLLARS_PER_POINT * totalContracts;
+            double tpDol = tpPoints * NQ_DOLLARS_PER_POINT * totalContracts;
+
+            Draw.Text(this, "slLabel",
+                "SL " + hiddenStopPrice.ToString("F2") + "  (" + slPoints + "pt | " + slTk + "tk | " + slDol.ToString("C0") + ")",
+                0, hiddenStopPrice + (openTradeDirection == 1 ? -2 * TickSize : 2 * TickSize), Brushes.OrangeRed);
+            Draw.Text(this, "tpLabel",
+                "TP " + hiddenTargetPrice.ToString("F2") + "  (" + tpPoints + "pt | " + tpTk + "tk | " + tpDol.ToString("C0") + ")",
+                0, hiddenTargetPrice + (openTradeDirection == 1 ? 2 * TickSize : -2 * TickSize), Brushes.LimeGreen);
+
+            if (trailEnabled && trailActive && trailPrice > 0)
+            {
+                Draw.HorizontalLine(this, "adaptiveTrail", false, trailPrice, Brushes.Magenta, DashStyleHelper.DashDot, 2);
+                string regimeStr = trailTrendScore > 0.6 ? "Trending" : (trailTrendScore < 0.35 ? "Choppy" : "Mixed");
+                double trailDistPts = openTradeDirection == 1
+                    ? (Close[0] - trailPrice) / (TickSize * NQ_TICKS_PER_POINT)
+                    : openTradeDirection == -1
+                        ? (trailPrice - Close[0]) / (TickSize * NQ_TICKS_PER_POINT) : 0;
+                Draw.Text(this, "trailLabel",
+                    "Trail " + trailPrice.ToString("F2") + "  (" + trailDistPts.ToString("F1") + "pt | " + regimeStr + " " + (trailTrendScore * 100).ToString("F0") + "%)",
+                    0, trailPrice + (openTradeDirection == 1 ? -6 * TickSize : 6 * TickSize), Brushes.Magenta);
+            }
+            else
+            {
+                RemoveDrawObject("adaptiveTrail");
+                RemoveDrawObject("trailLabel");
+            }
+        }
+
+        private void DrawDcaLevels()
+        {
+            if (!stopsArmed || dcaSuggestionPoints <= 0 || totalContracts >= maxContracts || averageEntryPrice == 0)
+            {
+                RemoveDrawObject("dcaSuggestion"); RemoveDrawObject("dcaSuggestionLbl");
+                return;
+            }
+
+            double distOffset = dcaSuggestionPoints * NQ_TICKS_PER_POINT * TickSize;
+            int remaining = maxContracts - totalContracts;
+            string dcaInfo = "DCA suggestion (" + remaining + " slots, qty " + contracts + ")";
+
+            if (openTradeDirection == 1)
+            {
+                double dcaBelow = averageEntryPrice - distOffset;
+                Draw.HorizontalLine(this, "dcaSuggestion", false, dcaBelow, Brushes.DeepSkyBlue, DashStyleHelper.Dot, 1);
+                Draw.Text(this, "dcaSuggestionLbl", dcaInfo, 0, dcaBelow - 4 * TickSize, Brushes.DeepSkyBlue);
+            }
+            else if (openTradeDirection == -1)
+            {
+                double dcaAbove = averageEntryPrice + distOffset;
+                Draw.HorizontalLine(this, "dcaSuggestion", false, dcaAbove, Brushes.DeepSkyBlue, DashStyleHelper.Dot, 1);
+                Draw.Text(this, "dcaSuggestionLbl", dcaInfo, 0, dcaAbove + 4 * TickSize, Brushes.DeepSkyBlue);
+            }
+        }
+
+        private void DrawVwapLine()
+        {
+            if (!showVwap || CurrentBar < BarsRequiredToTrade + 1 || vwapValue == 0) return;
+            if (IsFirstTickOfBar && prevBarVwap > 0)
+            {
+                Draw.Line(this, "vwap_" + CurrentBar, false,
+                    1, prevBarVwap, 0, vwapValue,
+                    Brushes.Yellow, DashStyleHelper.Solid, 2);
+            }
+        }
+
+        private void DrawKeyLevels()
+        {
+            if (!showKeyLevels || CurrentBar < 22) return;
+            double priorHigh = MAX(High, 20)[1];
+            double priorLow  = MIN(Low,  20)[1];
+            Draw.HorizontalLine(this, "keyResist",  false, priorHigh, Brushes.Cyan, DashStyleHelper.Dash, 1);
+            Draw.HorizontalLine(this, "keySupport", false, priorLow,  Brushes.Cyan, DashStyleHelper.Dash, 1);
+            Draw.Text(this, "keyResistLbl",  "Key Resist "  + priorHigh.ToString("F2"), 0, priorHigh + 2 * TickSize, Brushes.Cyan);
+            Draw.Text(this, "keySupportLbl", "Key Support " + priorLow.ToString("F2"),  0, priorLow  - 2 * TickSize, Brushes.Cyan);
+        }
+
+        private void DrawSweepSignals()
+        {
+            if (!showSweepSignals || CurrentBar < 12) return;
+            double swingHigh = MAX(High, 10)[1];
+            double swingLow  = MIN(Low,  10)[1];
+            Draw.HorizontalLine(this, "swingHi", false, swingHigh, Brushes.Magenta, DashStyleHelper.Dot, 1);
+            Draw.HorizontalLine(this, "swingLo", false, swingLow,  Brushes.Magenta, DashStyleHelper.Dot, 1);
+
+            double prevLow  = Low[1];
+            double prevHigh = High[1];
+            double price    = Close[0];
+            if (prevLow < swingLow && price > swingLow)
+            {
+                Draw.ArrowUp(this, "sweepUp_" + CurrentBar, false, 0, Low[0] - 8 * TickSize, Brushes.LimeGreen);
+                Draw.Text(this, "sweepUpTxt_" + CurrentBar, "Sweep\u2191", 0, Low[0] - 16 * TickSize, Brushes.LimeGreen);
+            }
+            if (prevHigh > swingHigh && price < swingHigh)
+            {
+                Draw.ArrowDown(this, "sweepDn_" + CurrentBar, false, 0, High[0] + 8 * TickSize, Brushes.OrangeRed);
+                Draw.Text(this, "sweepDnTxt_" + CurrentBar, "Sweep\u2193", 0, High[0] + 16 * TickSize, Brushes.OrangeRed);
             }
         }
 
