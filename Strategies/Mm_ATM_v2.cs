@@ -134,6 +134,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool     pendingRearm;
         private bool     pendingExit;
         private bool     pendingLimitFlatten;
+        private bool     pendingEmergencyKill;
         private int      pendingExitTicks;
         private int      flatSyncGraceTicks;
         private DateTime lastEntryWallTime;
@@ -144,6 +145,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         // ─── Dashboard build retry ────────────────────────────────
         private int  dashBuildRetryCount;
         private int  dashBuildTickCounter;
+        private int  dashUpdateTickCounter;
 
         // ─── ORB state ────────────────────────────────────────────
         private double orbHigh;
@@ -369,6 +371,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 pendingSellBid         = false;
                 pendingFlatten         = false;
                 pendingCloseTrade      = false;
+                pendingEmergencyKill   = false;
                 pendingCloseOne        = false;
                 pendingJumpSL          = false;
                 pendingRearm           = false;
@@ -457,6 +460,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (CurrentBar < BarsRequiredToTrade) return;
 
             // ═════ CRITICAL PATH ══════════════════════════════════
+            if (State == State.Realtime && pendingEmergencyKill)
+            {
+                pendingEmergencyKill = false;
+                ExecuteEmergencyKill();
+            }
             if (State == State.Realtime && pendingCloseTrade)
             {
                 pendingCloseTrade = false;
@@ -550,14 +558,19 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (IsFirstTickOfBar)
                 UpdateVolumeProfile();
 
-            // Dashboard build with retry
+            // Dashboard build with retry — attempt immediately, then every 2 ticks
             if (State == State.Realtime && !dashboardAttached && dashBuildRetryCount < 10)
             {
-                dashBuildTickCounter++;
-                if (dashBuildTickCounter >= 5)
-                {
-                    dashBuildTickCounter = 0;
+                if (dashBuildRetryCount == 0)
                     BuildDashboard();
+                else
+                {
+                    dashBuildTickCounter++;
+                    if (dashBuildTickCounter >= 2)
+                    {
+                        dashBuildTickCounter = 0;
+                        BuildDashboard();
+                    }
                 }
             }
 
@@ -641,7 +654,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             // Chart & dashboard (gate draws to first tick of bar when possible)
-            UpdateOrbLevels();
+            if (IsFirstTickOfBar)
+                UpdateOrbLevels();
             if (IsFirstTickOfBar || stopsArmed)
             {
                 DrawChartAnnotations();
@@ -650,8 +664,17 @@ namespace NinjaTrader.NinjaScript.Strategies
                 DrawSweepSignals();
                 DrawVolumeProfileLines();
             }
-            DrawVwapLine();
-            UpdateDashboard();
+            if (IsFirstTickOfBar)
+                DrawVwapLine();
+
+            // Throttle dashboard: every tick in trade, every 3rd tick when flat
+            bool inPosition = Position.MarketPosition != MarketPosition.Flat;
+            dashUpdateTickCounter++;
+            if (inPosition || stopsArmed || pendingExit || IsFirstTickOfBar || dashUpdateTickCounter >= 3)
+            {
+                dashUpdateTickCounter = 0;
+                UpdateDashboard();
+            }
         }
 
         // Consolidated position state sync \u2014 called once per tick
@@ -1083,7 +1106,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             { tradeSequence++; dailyTradeCount++; }
             openDcaCount++;
             lastAutoStrategyUsed = StrategyNames[autoStrategy == 4 ? bestAutoStrategy : autoStrategy];
-            string signalName = " ";
+            string signalName = "Entry_" + openDcaCount;
             EnterLong(contracts, signalName);
             activeEntrySignals.Add(signalName);
             openTradeDirection = 1;
@@ -1120,7 +1143,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             { tradeSequence++; dailyTradeCount++; }
             openDcaCount++;
             lastAutoStrategyUsed = StrategyNames[autoStrategy == 4 ? bestAutoStrategy : autoStrategy];
-            string signalName = " ";
+            string signalName = "Entry_" + openDcaCount;
             EnterShort(contracts, signalName);
             activeEntrySignals.Add(signalName);
             openTradeDirection = -1;
@@ -1148,7 +1171,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             { tradeSequence++; dailyTradeCount++; }
             openDcaCount++;
             lastAutoStrategyUsed = StrategyNames[autoStrategy == 4 ? bestAutoStrategy : autoStrategy];
-            string signalName = " ";
+            string signalName = "Entry_" + openDcaCount;
             EnterLongLimit(contracts, limitPrice, signalName);
             activeEntrySignals.Add(signalName);
             openTradeDirection = 1;
@@ -1170,7 +1193,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             { tradeSequence++; dailyTradeCount++; }
             openDcaCount++;
             lastAutoStrategyUsed = StrategyNames[autoStrategy == 4 ? bestAutoStrategy : autoStrategy];
-            string signalName = " ";
+            string signalName = "Entry_" + openDcaCount;
             EnterShortLimit(contracts, limitPrice, signalName);
             activeEntrySignals.Add(signalName);
             openTradeDirection = -1;
@@ -1192,7 +1215,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             { tradeSequence++; dailyTradeCount++; }
             openDcaCount++;
             lastAutoStrategyUsed = StrategyNames[autoStrategy == 4 ? bestAutoStrategy : autoStrategy];
-            string signalName = " ";
+            string signalName = "Entry_" + openDcaCount;
             EnterLongLimit(contracts, limitPrice, signalName);
             activeEntrySignals.Add(signalName);
             openTradeDirection = 1;
@@ -1215,7 +1238,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             { tradeSequence++; dailyTradeCount++; }
             openDcaCount++;
             lastAutoStrategyUsed = StrategyNames[autoStrategy == 4 ? bestAutoStrategy : autoStrategy];
-            string signalName = " ";
+            string signalName = "Entry_" + openDcaCount;
             EnterShortLimit(contracts, limitPrice, signalName);
             activeEntrySignals.Add(signalName);
             openTradeDirection = -1;
@@ -2155,7 +2178,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // Qty row (maxContracts replaces dcaMaxPositions)
                 var qtyRow = MakeAdjustRow("Qty:", contracts.ToString(),
                     (s, e) => { contracts = Math.Max(1, contracts - 1); UpdateAdjustLabels(); },
-                    (s, e) => { contracts = Math.Min(10, contracts + 1); UpdateAdjustLabels(); },
+                    (s, e) => { contracts = Math.Min(maxContracts, contracts + 1); UpdateAdjustLabels(); },
                     "");
                 lblQtyVal = (TextBlock)((StackPanel)qtyRow).Children[3];
                 stack.Children.Add(qtyRow);
@@ -2492,7 +2515,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                                     else if (btn == btnCloseOne)    { pendingCloseOne = true; if (lblStatus != null) { lblStatus.Text = "\u25cf CLOSE 1 queued..."; lblStatus.Foreground = Brushes.Yellow; } }
                                     else if (btn == btnCloseTrade)  { pendingCloseTrade = true; if (lblStatus != null) { lblStatus.Text = "\u25cf CLOSE queued..."; lblStatus.Foreground = Brushes.Yellow; } }
                                     else if (btn == btnJumpSL)      { pendingJumpSL = true; if (lblStatus != null) { lblStatus.Text = "\u25cf JUMP SL queued..."; lblStatus.Foreground = Brushes.Yellow; } }
-                                    else if (btn == btnExit)        { pendingFlatten = true; if (lblStatus != null) { lblStatus.Text = "\u26a0 KILL queued..."; lblStatus.Foreground = Brushes.OrangeRed; } }
+                                    else if (btn == btnExit)        { pendingEmergencyKill = true; if (lblStatus != null) { lblStatus.Text = "\u26a0 EMERGENCY KILL executing..."; lblStatus.Foreground = Brushes.OrangeRed; } }
                                     else if (btn == btnModeManual)  { autoMode = false; UpdateModeButtons(); }
                                     else if (btn == btnModeAuto)    { autoMode = true;  UpdateModeButtons(); }
                                     else if (btn == btnStratPrevConf)

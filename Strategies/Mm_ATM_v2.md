@@ -45,6 +45,7 @@
 | Opposite direction button | Could trigger reverse entry | **Close only** — never reverses |
 | Confidence colors | Gray when below threshold | Always green/red with opacity dimming |
 | DCA | `dcaEnabled` + `dcaMaxPositions` + distance guard | `maxContracts` cap + visual suggestion line only |
+| Entry signal names | All entries used `" "` (space) — NinjaTrader rejected duplicates | Unique `Entry_N` per add — fixes multi-contract and strategy disable |
 | Strategy selector | Any time | **Frozen while in trade** |
 | HTF trend filter | ❌ | ✅ EMA-45 trend check |
 | Volume Profile | ❌ | ✅ Real-time POC / VAH / VAL |
@@ -614,11 +615,12 @@ unrealizedPnL = priceDiff × $20/pt × quantity
 This avoids the `Position.GetUnrealizedProfitLoss()` call that was inaccurate for multi-add positions in v1.
 
 ### Emergency Kill
-- Immediately flattens all positions
+- Immediately flattens all positions via `Account.Flatten`
 - Sets `emergencyKillActive = true` AND `dailyLimitHit = true`
 - Blocks all further entries for the session
 - Prints a warning to the Output window
 - Cannot be undone without restarting the strategy
+- Uses its own `pendingEmergencyKill` flag — NOT `pendingFlatten` — to ensure the kill executes `ExecuteEmergencyKill()` (not the regular flatten)
 
 ### Max Trades Per Day
 When `dailyTradeCount >= maxTradesPerDay` (and position is flat), all new entries are blocked.  
@@ -899,6 +901,12 @@ These constants are hard-coded for the NQ/MNQ contract specification:
 | **Bug 2 — O(n) P&L scan** | Iterated all trades in `SystemPerformance` every tick | `processedTradeCount` pointer — only new trades scanned |
 | **Bug 3 — Reverse pending** | Clicking opposite direction button triggered a reversal | Clicking opposite direction now closes ONLY — no reverse |
 | **Bug 4 — Confidence colors** | Below-threshold confidence was shown in gray | Always green (bull) or red (bear) with proportional opacity |
+| **Bug 5 — Emergency Kill wired wrong** | Kill button set `pendingFlatten` → called `ExecuteFlatten()` (regular close, no halt) | Kill button now sets `pendingEmergencyKill` → calls `ExecuteEmergencyKill()` (flatten + halt session) |
+| **Bug 6 — Signal name collision** | All entries used `signalName = " "` — NinjaTrader rejects duplicate managed signals, potentially disabling the strategy | Each entry uses `"Entry_" + openDcaCount` — unique per add, enables multi-contract adds |
+| **Bug 7 — Dashboard slow open** | Built after 5 ticks × retry cycles (8–18 s delay) | Builds immediately on first Realtime tick; retries every 2 ticks if failed |
+| **Bug 8 — Qty unlimited** | `+` button capped at hardcoded `10` regardless of maxContracts | Button now caps at `maxContracts` |
+| **Perf — Dashboard update flood** | `UpdateDashboard()` dispatched every single tick | Throttled: every tick in trade, every 3rd tick when flat |
+| **Perf — Chart draw flood** | `UpdateOrbLevels()` and `DrawVwapLine()` called every tick | Gated to `IsFirstTickOfBar` only |
 
 ---
 
@@ -950,6 +958,15 @@ Volume Profile Filters: ON
 - **Watch the mid-range penalty** — if Bull and Bear are both dimmed and price is near the POC, the market lacks conviction
 - **Use CLOSE 1** not CLOSE ALL when scaling out of a winner to retain exposure
 
+### Dashboard Qty Explained
+The **Qty** on the dashboard controls how many contracts are submitted **per entry click**. It does NOT show your current position size.
+
+- **Range:** 1 to `maxContracts` (capped by the +/- buttons)
+- Pressing BUY MKT with Qty=2 submits a 2-contract long order
+- Pressing BUY MKT again (if `totalContracts + contracts ≤ maxContracts`) adds 2 more
+- The **Pos:** line below the status shows your actual position: `Pos: 2/4` = 2 contracts open, max 4 allowed
+- If adding `contracts` would exceed `maxContracts`, the entry is blocked with a dashboard warning
+
 ### Understanding the Trail Tiers
 The tier display on the dashboard tells you how much protection you have:
 - No tier shown + **Waiting**: still building to activation point
@@ -960,4 +977,4 @@ The tier display on the dashboard tells you how much protection you have:
 
 ---
 
-*Documentation version: April 2026 — matches Mm_ATM_v2.cs commit d76da60*
+*Documentation version: April 2026 — matches Mm_ATM_v2.cs (bugs 5-8 + perf fixes)*
