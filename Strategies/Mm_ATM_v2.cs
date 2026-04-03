@@ -1662,7 +1662,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             double distOffset = dcaSuggestionPoints * NQ_TICKS_PER_POINT * TickSize;
-            int remaining = maxContracts - totalContracts;
+            int remaining = (int)(maxContracts - totalContracts);
             string dcaInfo = "DCA suggestion (" + remaining + " slots, qty " + contracts + ")";
 
             if (openTradeDirection == 1)
