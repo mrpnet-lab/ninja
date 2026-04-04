@@ -1433,8 +1433,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             // C) Loosen on high-confidence entry (once per trade, if BE not yet locked)
+            // Threshold lowered from +15 to +8 so this actually triggers near minSignalConfidence+8
+            // (e.g., if minConf=55, loosens at entry confidence >= 63)
             double atr = indAtr[0];
-            if (!smartSlBreakevenDone && !smartSlLoosened && smartSlEntryConfidence >= minSignalConfidence + 15)
+            if (!smartSlBreakevenDone && !smartSlLoosened && smartSlEntryConfidence >= minSignalConfidence + 8)
             {
                 double adverseMove = openTradeDirection == 1
                     ? (averageEntryPrice - price) / tickPt
@@ -2443,6 +2445,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             emergencyKillActive  = false;
             consecutiveLosses    = 0;
             lastLossTime         = DateTime.MinValue;
+            lastLossDirection    = 0;  // BUG FIX: prevent yesterday's loss direction from penalizing today's first trade
             autoStratConsecutiveBars = 0;
             lastBestAutoStrategy = -1;
             lastBullConfidence   = 0;
@@ -2829,11 +2832,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             { lastBullConfidence *= 0.7; lastBearConfidence *= 0.7; }
 
             // 3. Momentum Exhaustion
+            // RSI>80 / <20 almost never occurs on a 1-min NQ chart: threshold lowered to 70/30
+            // which still catches genuine overextension while actually activating during sessions.
             if (atr > 0)
             {
                 double move = Math.Abs(Close[0] - Close[1]) / atr;
-                if (move > 1.5 && indRsi[0] > 80) lastBullConfidence *= 0.6;
-                if (move > 1.5 && indRsi[0] < 20) lastBearConfidence *= 0.6;
+                if (move > 1.5 && indRsi[0] > 70) lastBullConfidence *= 0.6;
+                if (move > 1.5 && indRsi[0] < 30) lastBearConfidence *= 0.6;
             }
 
             // 4. Bar Quality (Wick Rejection  - threshold lowered to 0.15 for less false triggers)
