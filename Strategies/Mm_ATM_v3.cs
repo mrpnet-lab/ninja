@@ -179,8 +179,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int    lastBestAutoStrategy;
         private string lastAutoStrategyUsed;
 
-        // --- Consecutive loss cooldown ---
+        // --- Consecutive loss tracking ---
         private int      consecutiveLosses;
+        private int      lastLossDirection;   // 1=last loss was long, -1=short, 0=none
         private DateTime lastLossTime;
 
         // --- On-chart dashboard elements ---
@@ -375,7 +376,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 smartTrailEnabled     = true;
                 smartTrailMaxPauseBars = 8;
-                smartSlEnabled        = false;
+                smartSlEnabled        = true;
                 smartSlBePct          = 40;
             }
             else if (State == State.Configure)
@@ -452,6 +453,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 lastBestAutoStrategy   = -1;
                 lastAutoStrategyUsed   = "";
                 consecutiveLosses      = 0;
+                lastLossDirection      = 0;
                 lastLossTime           = DateTime.MinValue;
                 pocLevel               = 0;
                 vahLevel               = 0;
@@ -543,6 +545,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 lastAutoStrategyUsed   = "";
 
                 consecutiveLosses      = 0;
+                lastLossDirection      = 0;
                 lastLossTime           = DateTime.MinValue;
 
                 volumeAtPrice          = new SortedDictionary<double, double>();
@@ -1352,7 +1355,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             // B) Tighten on high trap score (if still in profit and not yet at BE)
-            if (!smartSlTightened && trapDetected && trapScore >= 65 && profitPts > 0)
+            // Mode B: tighten stop when trap detected, even if in a loss — cuts the loss short
+            if (!smartSlTightened && trapDetected && trapScore >= 45)
             {
                 double originalSlDist = slPoints * tickPt;
                 if (openTradeDirection == 1)
@@ -1454,6 +1458,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             double atrDist = atr * trailAtrMultiplier / (TickSize * NQ_TICKS_PER_POINT);
             double regimeDist = LerpD(trailMinPoints, trailMaxPoints, trailTrendScore);
             double finalDist = (regimeDist * 0.6 + atrDist * 0.4) * chopMultiplier * spikeMult;
+            // EMA-awareness: when position fights the EMA trend, tighten trail by 25%.
+            // This exits counter-trend trades sooner to minimize losses.
+            if (openTradeDirection == 1 && indEmaFast[0] < indEmaSlow[0]) finalDist *= 0.75;
+            else if (openTradeDirection == -1 && indEmaFast[0] > indEmaSlow[0]) finalDist *= 0.75;
             return Math.Max(trailMinPoints, Math.Min(trailMaxPoints, finalDist));
         }
 
@@ -1500,8 +1508,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             double atrPts = atr / (TickSize * NQ_TICKS_PER_POINT);
             if (atrPts > 0 && adverseMove > 0)
             {
-                double moveRatio = adverseMove / atrPts;
+                // Normalize ATR with a 10pt minimum so high-ATR sessions don't mask adverse moves
+                double atrPtsNorm = Math.Max(atrPts, 10.0);
+                double moveRatio = adverseMove / atrPtsNorm;
                 if (moveRatio > 0.5) newTrapScore += moveRatio * 30;
+                // Absolute adverse move bonus: any move > 6pts is always meaningful regardless of ATR
+                if (adverseMove > 6.0) newTrapScore += Math.Min(15.0, (adverseMove - 6.0) * 1.0);
             }
 
             if (openTradeDirection == 1 && indEmaFast[0] < indEmaSlow[0]) newTrapScore += 20;
@@ -2226,10 +2238,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                         {
                             consecutiveLosses++;
                             lastLossTime = State == State.Realtime ? DateTime.Now : time;
+                            lastLossDirection = lastTrade.Entry.MarketPosition == MarketPosition.Long ? 1 : -1;
                         }
                         else
                         {
                             consecutiveLosses = 0;
+                            lastLossDirection = 0;
                         }
                     }
                 }
@@ -2611,10 +2625,10 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             double emaF  = indEmaFast[0], emaS = indEmaSlow[0], rsi = indRsi[0];
 
-            // EMA alignment + slope: fast EMA must be actively moving in the expected direction
+            // EMA alignment + slope: 1-bar slope for faster detection of EMA direction changes
             // Prevents stale overnight EMA alignment from generating false signals at open
-            bool emaFastRising  = CurrentBar > 2 && indEmaFast[0] > indEmaFast[2];
-            bool emaFastFalling = CurrentBar > 2 && indEmaFast[0] < indEmaFast[2];
+            bool emaFastRising  = CurrentBar > 1 && indEmaFast[0] > indEmaFast[1];
+            bool emaFastFalling = CurrentBar > 1 && indEmaFast[0] < indEmaFast[1];
             if (emaF > emaS && emaFastRising)  bull += 30;
             if (emaF < emaS && emaFastFalling) bear += 30;
 
@@ -2626,12 +2640,19 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (CrossBelow(Close, vwapValue, 1))         bear += 35;
             else if (Close[0] < vwapValue && vwapMature) bear += 20;
 
-            if (rsi > 50 && rsi < 75) bull += 20;
-            if (rsi < 50 && rsi > 25) bear += 20;
+            // RSI: require directional momentum, not just zone membership
+            // Prevents a declining RSI (e.g., 58→52) from adding bull confidence
+            if (rsi > 55 && CurrentBar > 2 && indRsi[0] > indRsi[2]) bull += 20;
+            if (rsi < 45 && CurrentBar > 2 && indRsi[0] < indRsi[2]) bear += 20;
             if (Close[0] > High[1]) bull += 15;
             if (Close[0] < Low[1]) bear += 15;
             if (CrossAbove(Close, vwapValue, 1) && Close[0] > Open[0]) bull += 10;
             if (CrossBelow(Close, vwapValue, 1) && Close[0] < Open[0]) bear += 10;
+
+            // Counter-trend EMA penalty: bearish EMA structure discounts bull and vice versa.
+            // Key fix: prevents bull signals when fast EMA is already below slow EMA.
+            if (emaF < emaS) bull = Math.Max(0, bull - 20);
+            if (emaF > emaS) bear = Math.Max(0, bear - 20);
         }
 
         // --- Strategy 1: Key Level Breakout ---
@@ -2839,14 +2860,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (CurrentBar >= 6 && atr > 0)
             {
                 double slope5 = (Close[0] - Close[5]) / atr;  // net move in ATR units over 5 bars
-                if (slope5 < -0.8)  // declining > 0.8 ATR over 5 bars: suppress longs
+                if (slope5 < -0.4)  // declining > 0.4 ATR over 5 bars: suppress longs
                 {
-                    double pen = Math.Max(0.5, 1.0 - (Math.Abs(slope5) - 0.8) * 0.3);
+                    double pen = Math.Max(0.5, 1.0 - (Math.Abs(slope5) - 0.4) * 0.3);
                     lastBullConfidence *= pen;
                 }
-                else if (slope5 > 0.8)  // rising > 0.8 ATR over 5 bars: suppress shorts
+                else if (slope5 > 0.4)  // rising > 0.4 ATR over 5 bars: suppress shorts
                 {
-                    double pen = Math.Max(0.5, 1.0 - (slope5 - 0.8) * 0.3);
+                    double pen = Math.Max(0.5, 1.0 - (slope5 - 0.4) * 0.3);
                     lastBearConfidence *= pen;
                 }
             }
@@ -2854,6 +2875,25 @@ namespace NinjaTrader.NinjaScript.Strategies
             // 14. Lunch Doldrums (11:30-14:00 ET)
             if (ct >= 113000 && ct < 140000)
             { lastBullConfidence *= 0.85; lastBearConfidence *= 0.85; }
+
+            // 15. EMA Cross Direction: fundamental market structure trump card.
+            // When fast EMA is below slow EMA (bearish alignment), suppress bull by 35%.
+            // This filter fires on every bar, not just at the crossover, maintaining pressure.
+            if (CurrentBar > emaPeriodSlow + 5)
+            {
+                if (indEmaFast[0] < indEmaSlow[0]) lastBullConfidence *= 0.65;
+                if (indEmaFast[0] > indEmaSlow[0]) lastBearConfidence *= 0.65;
+            }
+
+            // 16. Consecutive Same-Direction Loss Suppression
+            // After 2+ losses in same direction, reduce that direction's confidence.
+            // Prevents the strategy from repeatedly entering the same losing side.
+            if (consecutiveLosses >= 2 && lastLossDirection != 0)
+            {
+                double lossPen = Math.Max(0.6, 1.0 - (consecutiveLosses - 1) * 0.12);
+                if (lastLossDirection ==  1) lastBullConfidence *= lossPen;
+                else if (lastLossDirection == -1) lastBearConfidence *= lossPen;
+            }
 
             // Penalty floor: never reduce below 50% of raw score
             double totalPenaltyFloor = 0.50;
