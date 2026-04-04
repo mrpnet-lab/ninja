@@ -1,0 +1,573 @@
+================================================================================
+  Mm_ATM AUTO STRATEGY COMPARISON: Mm_ATM.cs (v1) vs Mm_ATM_v3.cs
+  Analysis Date: 2025-07
+  Focus: Why v1 trades more and performs better; S-TRAIL / SMART-SL review;
+         Confidence calculation; Recommendations for v3 improvements
+================================================================================
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. CORE DEFAULTS COMPARISON
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Property                 Mm_ATM.cs (v1)      Mm_ATM_v3.cs
+  ─────────────────────── ─────────────────── ────────────────────────────────
+  autoStrategy             0 (Momentum+VWAP)   4 (Auto Select)  <-- KEY DIFF
+  minSignalConfidence      68.0                55.0
+  entryDelaySeconds        5                   1
+  trailActivationPoints    8                   8 (but + dynamic ATR offset)
+  trailMinPoints           3                   3
+  trailMaxPoints           25                  25
+  trailAtrMultiplier       1.5                 1.5
+  # of Smart Filters       4                   14
+  HTF EMA Filter           NO                  YES
+  Volume Profile Filter    NO                  YES
+  Smart Trail Pause        NO                  YES
+  Smart SL                 NO                  YES
+  Session Strategy Override NO                 YES (open=LSR, lunch=Momentum)
+  Auto-select Stability    NO                  YES (3-bar lock)
+  Loss Cooldown Guard      NO                  YES
+  Emergency Kill           NO                  YES
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. WHY Mm_ATM.cs TRADES MORE (Root Cause Analysis)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+2A. FILTER STACKING IN v3 — THE PRIMARY CAUSE
+─────────────────────────────────────────────
+  v1 has 4 filters. v3 has 14. Each filter is a MULTIPLICATIVE penalty.
+  Most penalties do not have individual floors — they stack freely until the
+  final 45%-of-raw floor at the end.
+
+  EXAMPLE: MomentumVWAP raw score = 80 (strong signal)
+
+  v3 filter passes (worst case, lunch + HTF + VP layers all active):
+    After Filter  1 (Volume OK):            80.0  (no penalty)
+    After Filter  2 (Conflict OK):          80.0
+    After Filter  3 (Momentum Exhaust OK):  80.0
+    After Filter  4 (Bar Quality OK):       80.0
+    After Filter  5 (Night OK):             80.0
+    After Filter  6 (HTF bearish -40%):     48.0  **** biggest single killer
+    After Filter  7 (VWAP dist 2.5x ATR):   44.4  (penalty 0.925)
+    After Filter  8 (Swing bearish -30%):   31.1
+    After Filter  9 (Mid-range VP -20%):    24.9
+    After Filter 10 (Near POC -15%):        21.1
+    After Filter 13 (POC Magnetic -25%):    15.8
+    After ApplySmartFilters lunch -15%:     13.4  (0.85x)
+    After CalculateSignals -10 pts lunch:    3.4  <-- DOUBLE LUNCH PENALTY
+    Floor check: max(3.4, 80*0.45) = 36.0  <- floor saves it
+
+    BUT: the 45% floor is applied inside ApplySmartFilters, BEFORE the -10
+    in CalculateSignals. So:
+      Floor applied IN ApplySmartFilters: max(13.4, 80*0.45) = 36.0
+      Then CalculateSignals subtracts 10:  26.0  <-- BELOW 55 threshold!
+
+  RESULT: An 80-point raw Momentum signal fires in v1 (raw 80 >= threshold 68)
+  but may be reduced to 26 in v3 — BELOW the 55 threshold.
+
+2B. AUTO-SELECT STRATEGY vs FIXED STRATEGY
+───────────────────────────────────────────
+  v1 default = Strategy 0 (Momentum+VWAP). This is the broadest, most
+  frequently-triggering strategy. It signals every bar that price crosses
+  or holds above/below VWAP with EMA alignment.
+
+  v3 default = Auto Select (Strategy 4). Auto Select:
+    (a) Requires 3 consecutive bars identifying the same "best" strategy
+        before allowing a switch. If NQ flips conditions (common), the
+        strategy lags behind reality and misses entries.
+    (b) Applies session overrides:
+        - 9:30-10:00 AM: forces Strategy 2 (Liquidity Sweep Reversal).
+          LSR requires a PRIOR sweep spike + snap-back. In a trending
+          morning open this rarely fires. Hours lost.
+        - 11:30-14:00 PM: forces Strategy 0 (Momentum+VWAP).
+          But then DOUBLE penalizes scores by -10 (lunch).
+
+2C. HTF EMA FILTER — BIGGEST OVER-FILTER
+──────────────────────────────────────────
+  Filter 6: if price is 0.5 ATR above/below the HTF EMA, the opposing
+  direction gets 0.6x (40% penalty). NQ intraday moves are often 2-4x ATR
+  from the daily EMA. This filter fires CONSTANTLY during trending days,
+  suppressing all counter-trend signals.
+
+  PROBLEM: The HTF EMA threshold (0.5 ATR) is too tight. A $50-point
+  intraday NQ trend will always have price >0.5 ATR from a 200-period HTF EMA.
+  This means the BEST intraday trend-following signals (Momentum+VWAP in a
+  strong trend) get killed by the HTF filter because price is extended.
+
+2D. DOUBLE LUNCH PENALTY
+─────────────────────────
+  v3 applies lunch penalty TWICE:
+    1. ApplySmartFilters Filter 14: multiply by 0.85 (15% cut)
+    2. CalculateSignals: subtract 10 points
+  These are not additive — they stack, effectively crushing scores.
+  After the 45% floor (in ApplySmartFilters), the final -10 can push
+  scores below the threshold that the floor was supposed to protect.
+
+  FIX: Remove the -10 subtraction in CalculateSignals (lines 2591-2597).
+  The 0.85x in ApplySmartFilters is sufficient and correct.
+
+2E. POC MAGNETIC FILTER — DOUBLE VP PENALTY
+─────────────────────────────────────────────
+  Filter 10 (near POC: 0.85x) and Filter 13 (POC Magnetic: 0.75x) BOTH
+  apply when price is near the POC level. Combined: 0.75 x 0.85 = 0.64.
+  This 36% combined cut near POC means the most commonly traded price zone
+  (value area) consistently blocks entries.
+
+  FIX: Remove Filter 13 (POC Magnetic) or merge it with Filter 10.
+  The two filters represent the same condition.
+
+2F. ENTRY DELAY DIFFERENCE (MINOR)
+────────────────────────────────────
+  v1: 5 second cooldown. v3: 1 second. v3 is MORE aggressive on re-entry,
+  not less. This difference does NOT explain under-trading — it is benign.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. CONFIDENCE SCORE CALCULATION — DETAILED BREAKDOWN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Both versions share the same 4 base strategies with identical raw scoring:
+
+  STRATEGY 0: Momentum + VWAP (max raw score ~110)
+  ──────────────────────────────────────────────────
+    +30  EMA fast > EMA slow (trend aligned)
+    +35  Price crosses above VWAP this bar (primary signal)
+    +20  Price above VWAP (continuation — if no cross)
+    +20  RSI 50-75 (momentum confirmed, not overbought)
+    +15  Price breaks above prior bar's High (momentum bar)
+    +10  VWAP cross + bullish bar (conviction bonus)
+    ─────────────────────────────────────────────────────
+    MAX: 110 (cross + conviction + all conditions met)
+    TYPICAL: 65-85 when conditions partially met
+
+  STRATEGY 1: Key Level Breakout (max raw score ~100)
+  ─────────────────────────────────────────────────────
+    +50  Price crosses above 20-bar high with bullish close
+    +25  Price crosses above 20-bar high (weak conviction)
+    +25  Price above 20-bar high (continuation)
+    +30  ATR-confirmed extension (price moved >15% of ATR above breakout)
+    +20  EMA aligned
+    ─────────────────────────────────────────────────────
+    MAX: 100 (conviction cross + ATR confirm + EMA)
+    NOTE: +50 requires bullish bar (BOTH cross + close>open). Missing one
+    drops to +25, losing 25 raw points immediately.
+
+  STRATEGY 2: Liquidity Sweep Reversal (max raw score ~110)
+  ───────────────────────────────────────────────────────────
+    +45  Prior bar swept swing low + current bar snapped back
+    +25  Recent sweep (within 5 bars) during continuation
+    +30  RSI < 40 (oversold reversal confirmation)
+    +25  Snap-back move >30% of ATR
+    +10  Volume spike confirms liquidity grab
+    ─────────────────────────────────────────────────────
+    MAX: 110 (fresh sweep + RSI + snap + volume)
+    NOTE: Very setup-specific. Raw score is often 0 or 45+25=70.
+
+  STRATEGY 3: Opening Range Breakout (max raw score ~100)
+  ─────────────────────────────────────────────────────────
+    +55  ORB high cross with bullish close (conviction breakout)
+    +30  ORB high cross (no conviction bonus)
+    +30  Price above ORB high (continuation)
+    +25  EMA aligned
+    +20  ORB quality bonus (ATR/ORB range — scales by ORB tightness)
+    ─────────────────────────────────────────────────────
+    MAX: 100 (conviction + EMA + quality)
+    NOTE: Only active 9:45 AM - 11:30 AM ET. First signal of day only.
+
+  SMART FILTERS IMPACT ON SCORES:
+
+    v1 (4 filters) — Applied once per strategy call:
+      Filter 1: Volume         0.65x - 1.10x  (range: thin to strong)
+      Filter 2: Conflict       0.56x - 0.99x  (ratio > 0.65 triggers)
+      Filter 3: Exhaustion     up to -45% penalty (near 20-bar extreme + extended)
+      Filter 4: Bar Quality    variable (wick % of bar range)
+      Max cumulative reduction:  ~37% of raw (typical)
+      Max cumulative reduction:  ~60% (worst case)
+
+    v3 (14 filters) — Applied once per CalculateSignals call:
+      Filters 1-4:  Same as v1 (slightly recalibrated thresholds)
+      Filter  5:  Night Penalty          0.70x (outside 8 AM - 6 PM)
+      Filter  6:  HTF Trend              0.60x (vs HTF EMA)  *** most impactful
+      Filter  7:  VWAP Distance          0.50x-1.0x (extended from VWAP)
+      Filter  8:  Swing Structure        0.70x (HH/HL count bearish)
+      Filter  9:  VP Key Level Mid       0.80x (price in mid value area)
+      Filter 10:  Near POC               0.85x
+      Filter 11:  RSI/Price Divergence   +10 pts bonus (mild)
+      Filter 12:  VWAP Slope             +10/-5 pts (mild)
+      Filter 13:  POC Magnetic           0.75x (within 1 ATR of POC)
+      Filter 14:  Lunch Doldrums         0.85x (11:30-14:00)
+      Plus: -10 pts in CalculateSignals during lunch
+
+      Max cumulative reduction: can reach 85%+ of raw score in bad combos
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. TRAIL MECHANICS COMPARISON
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+4A. TRAIL DISTANCE FORMULA (SHARED BASE — IDENTICAL IN BOTH)
+──────────────────────────────────────────────────────────────
+  Both versions use the EXACT same 5-factor trend score:
+
+    Factor 1 (ATR Expansion)    weight 25%  — expanding ATR = trending
+    Factor 2 (EMA Spread)       weight 25%  — wider EMA gap = stronger trend
+    Factor 3 (Directional Bars) weight 25%  — consecutive bars in trade dir
+    Factor 4 (RSI Extremity)    weight 10%  — RSI away from 50 = directional
+    Factor 5 (Range Compression) weight 15% — bar range vs ATR
+
+    trailTrendScore in [0.0, 1.0]
+    finalDist = lerp(trailMin, trailMax, score) * 0.6 + atrDist * 0.4
+    chopMultiplier: score < 0.5 -> 0.5 + score (ramps from 0.5 to 1.0)
+
+  net distance: trailMinPoints (chop) to trailMaxPoints (trend), ATR-scaled
+
+4B. KEY TRAIL DIFFERENCES: v3 ADDS/CHANGES
+────────────────────────────────────────────
+
+  CHANGE 1: Dynamic Activation (v3 only)
+    v1: trailActive fires at profitPoints >= trailActivationPoints (fixed 8 pts)
+    v3: dynamicActivation = max(trailActivationPoints, atrPts * 0.40)
+
+    IMPACT: In a high-ATR environment (ATR=25pts typical for NQ), atrPts = 25.
+    dynamicActivation = max(8, 10) = 10 pts. Tier thresholds:
+      T1-BE:     1.5x * 10 = 15 pts (v1 needed 2×8 = 16 — similar)
+      T2-Strong: 2.5x * 10 = 25 pts (v1 needed 2.5×8 = 20 — HARDER to reach)
+      T3-Runner: 4.0x * 10 = 40 pts (v1 needed 4×8 = 32 — MUCH HARDER)
+
+    PROBLEM: With higher ATR, v3 requires more profit to engage each tier.
+    T3 at 40 pts is rarely reached intraday. This means fewer "runner" exits
+    and more trades stopping out at T1 or T2 level.
+
+  CHANGE 2: Volatility Spike Guard (v3 only)
+    if (volatilitySpikeGuardBars > 0 && barRange > atr * 3.0) return;
+
+    IMPACT: During a volatile gap or spike, MonitorAdaptiveTrail returns
+    EARLY — the trail does NOT update. If price spikes against the position,
+    the trail (and hiddenSL) are both frozen. This can cause large losses
+    during gap/spike scenarios. The guard is well-intentioned but removes
+    the adaptive trail's ability to protect during the most dangerous bars.
+
+  CHANGE 3: Volatility Spike Widening (v3 CalculateTrailDistance)
+    if (atr > atrAvg * TRAIL_SPIKE_MULT) spikeMult = 1.5
+
+    IMPACT: During volatility spikes (ATR expanding), the trail WIDENS by 50%.
+    Combined with Change 2 (trail frozen during spike), this means: when the
+    spike subsides and trail resumes, it starts from a 1.5x wider position.
+    This gives up MORE profit than necessary after a volatile bar, opposite
+    of the desired behavior.
+
+    FIX: Remove or reverse spikeMult. During spikes, trail should be TIGHTER
+    (use spikeMult = 0.8) to lock in gains before the next counter-move.
+
+  CHANGE 4: Profit Tier Floors (v3 slightly loosened)
+    Tier       v1 floor   v3 floor   v3 activation req
+    ─────────────────────────────────────────────────
+    T1-BE      2.0x       1.5x       at BE earlier (improvement)
+    T2-Strong  45%        40%        2.5x (same but -5% floor: slightly worse)
+    T3-Runner  55%        50-55%     4x (same, conditional on trend score)
+
+    NOTE: v3 T2 floor of 40% gives back slightly more than v1's 45%.
+
+  CHANGE 5: Structural Trail Snap (v3 only)
+    Scans 5 prior bars for nearest low (long) or high (short). If that
+    structural level is tighter than the calculated trail AND still >= trailMin,
+    uses structural level instead.
+
+    VERDICT: GOOD addition. Trails structures naturally without arbitrary formula.
+
+  CHANGE 6: Bid/Ask for Trail Trigger (v3 only)
+    v3: uses GetCurrentBid()/GetCurrentAsk() in Realtime for trail triggers.
+    v1: uses Close[0] always.
+
+    VERDICT: GOOD improvement. Reduces slippage on trail exits.
+
+  CHANGE 7: Trap Tightening of Trail (v3 only)
+    if (trapDetected && trapSuspendBarsLeft <= 0) trailDist *= 0.60
+
+    VERDICT: GOOD. Post-entry trap detection tightens trail to protect gains.
+
+4C. SMART TRAIL PAUSE (S-TRAIL) — REVIEW
+──────────────────────────────────────────
+
+  PURPOSE: Pauses trail advancement when a MM stop-hunt pullback is
+  detected (price pulls back on low volume, EMA still intact) so the
+  trail doesn't prematurely exit a winning trade.
+
+  IMPLEMENTATION REVIEW:
+
+    Pause Conditions (ALL must be true):
+      1. trailMaxProfitPts >= dynamicActivation * 2 (need 2x activation in profit)
+      2. CurrentBar >= 3
+      3. Pullback: (High[1] - Close[0]) > atr * 0.3 AND Close[0] < High[1]
+      4. EMA still aligned with trade direction
+      5. Volume[0] <= avgVol * 1.5 (low volume pullback)
+      6. NOT near major S/R (within 1 ATR of 20-bar swing)
+
+    Resume Conditions (any one):
+      1. smartTrailPauseBars >= smartTrailMaxPauseBars (timeout)
+      2. Price making new HH/LL for 2 consecutive bars (momentum resumes)
+      3. Reversal bar after sweep (price recovers from the hunt)
+
+  BUG IDENTIFIED - Resume log:
+    The Print statement logs smartTrailPauseBars AFTER resetting it to 0:
+      smartTrailPaused = false;
+      smartTrailPauseBars = 0;               // <-- reset here
+      trailPrice = smartTrailFrozenPrice;
+      Print("... after " + smartTrailPauseBars + " bars");  // prints 0 always!
+
+    FIX: Save bars count before reset:
+      int pausedFor = smartTrailPauseBars;
+      smartTrailPaused = false;
+      smartTrailPauseBars = 0;
+      trailPrice = smartTrailFrozenPrice;
+      Print("... after " + pausedFor + " bars");
+
+  BUG IDENTIFIED - Trail restore on resume:
+    On resume, trailPrice is set to smartTrailFrozenPrice (the frozen value).
+    If price has MOVED AWAY from the trail while paused (trade in profit),
+    restoring the frozen value may set trail LOWER than it should be.
+    The existing ratchet logic then catches up on the next tick. This is
+    mostly fine, but can cause a 1-tick window where trail is stale.
+
+  POSSIBLE REASON NOT WORKING:
+    Condition 1 requires trailMaxProfitPts >= dynamicActivation * 2.
+    With dynamic activation = max(8, atrPts * 0.4):
+      - NQ ATR = 25 pts typical -> atrPts = 25 -> dynActivation = 10
+      - Need: maxProfit >= 20 pts to even EVALUATE for pause
+    Most small trades never reach 20 pts profit, so the pause never fires.
+
+    RECOMMENDATION: Change condition to >= dynamicActivation * 1.5 (same
+    as T1-BE threshold), allowing pause after breakeven is secured.
+
+  NOT WORKING LIKELY REASON:
+    For S-TRAIL to visibly pause the trail, all 6 conditions must align.
+    In NQ's fast market, by the time conditions 1-6 all agree, the pullback
+    is often already over. The trail guard effectively never fires.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. SMART SL (SMART STOP LOSS) REVIEW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  MonitorSmartSL() has 3 modes:
+
+  MODE A: Break-Even Lock
+  ──────────────────────
+    Trigger: profitPts >= tpPoints * (smartSlBePct / 100.0)
+    Action:  Move SL to entry + 1 tick
+    STATUS:  OK — this works correctly.
+
+  MODE B: Tighten on Trap
+  ───────────────────────
+    Trigger: !smartSlTightened && trapDetected && trapScore >= 65 && profitPts > 0
+    Action:  Move SL to entry - (originalSlDist * 0.75)
+    STATUS:  GOOD logic, but trapScore threshold of 65 is high. In practice
+    TrapDetector rarely reaches 65 without an extreme adverse move. Consider
+    lowering to 50.
+
+  MODE C: LOOSEN on High Confidence
+  ───────────────────────────────────
+    Trigger: !smartSlBreakevenDone && !smartSlLoosened
+             && smartSlEntryConfidence >= minSignalConfidence + 15
+    Action:  Extend SL by extendPts
+    BUG:     extendPts = Math.Min(10, slPoints + 30 - slPoints)
+             = Math.Min(10, 30) = 10 regardless of slPoints.
+             The subtraction cancels: slPoints + 30 - slPoints = 30.
+             Developer likely intended: Math.Min(10, slPoints * 0.3) or
+             something proportional. Always extends by exactly 10 pts.
+
+    FIX:     double extendPts = Math.Min(slPoints * 0.3, 15);
+             // Extend by up to 30% of current SL distance, max 15 pts
+
+  NOT WORKING LIKELY REASON:
+    smartSlEntryConfidence is only assigned during ExecuteLongEntry /
+    ExecuteShortEntry (lines 1793, 1846). If a trade is entered and
+    confidence was already penalized to near-threshold, the +15 requirement
+    means Mode C almost never triggers. Additionally, since v3 rarely fires
+    auto entries (due to over-filtering), Smart SL has fewer chances to run.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. AUTO-SELECT STRATEGY (Strategy 4) ANALYSIS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  v1 AUTO SELECT — The Simpler, Better Version
+  ─────────────────────────────────────────────
+    Logic: Run all 4 strategies each bar. Apply ApplySmartFilters() after
+    EACH strategy individually. Pick the one with highest confidence.
+    No session override, no stability filter.
+
+    STRENGTH: Each strategy gets filtered independently. If MomentumVWAP
+    scores 70 and KLB scores 30 after filtering, picks Momentum. Clean.
+
+  v3 AUTO SELECT — Adds Complexity, Reduces Signals
+  ───────────────────────────────────────────────────
+    Logic: Run all 4 strategies. Pick best raw score. Apply stability filter
+    (require 3 consistent bars). Apply session override (hard-coded).
+    Apply ApplySmartFilters() ONCE on the winner. Apply lunch -10.
+
+    WEAKNESS 1: Stability filter lags. If MomentumVWAP is best today but
+    the 3-bar check hasn't confirmed, bestAutoStrategy might be stuck on
+    a stale strategy from yesterday. Result: wrong strategy used.
+
+    WEAKNESS 2: Session override ignores actual market conditions.
+    "Force LSR at open" means: if open is a gap-and-go trend day, LSR
+    scores low (needs an actual sweep), so no entry is generated despite
+    obvious trend momentum.
+
+    WEAKNESS 3: ApplySmartFilters runs ONCE on winner, not per-strategy.
+    v1 applied filters per strategy which gave a more accurate "filtered
+    best" selection. v3 picks winner on raw score, then filters once.
+    The winner on raw score may not be the winner after filtering.
+
+  v1 vs v3 AUTO-SELECT EXAMPLE:
+    Raw scores bar X:  MomentumVWAP=80, KeyLevel=50, LSR=30, ORB=0
+    v1: Applies filters to each -> filtered: Momentum=65, KL=35, LSR=25, ORB=0
+        Picks Momentum=65. Fires if >= 68. -> ENTERS
+    v3: Picks Momentum on raw (80). Stability requires 3 bars with Momentum best.
+        If last 2 bars had different best, no entry this bar. -> NO ENTRY
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. RECOMMENDATIONS FOR v3 IMPROVEMENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PRIORITY 1 — SIGNAL GENERATION (Most Impact on Trade Frequency)
+────────────────────────────────────────────────────────────────
+
+  R1.1: FIX DOUBLE LUNCH PENALTY
+    Remove the -10 pts subtraction in CalculateSignals (lines ~2591-2597).
+    The 0.85x in ApplySmartFilters Filter 14 is sufficient.
+
+  R1.2: FIX HTF FILTER THRESHOLD
+    Change: dist > 0.5 -> dist > 1.5 (require 1.5 ATR from HTF EMA)
+    Currently 0.5 ATR fires constantly during any intraday trend.
+    A threshold of 1.5 ATR is more meaningful for HTF structural conflict.
+
+  R1.3: MERGE DUPLICATE POC FILTERS
+    Filters 10 and 13 both suppress near-POC signals. Combined 0.64x.
+    Remove Filter 13 (POC Magnetic). Filter 10 handles the same condition.
+
+  R1.4: FIX AUTO-SELECT TO USE PER-STRATEGY FILTERING (v1 approach)
+    In CalculateSignals when autoStrategy == 4:
+    - Run each strategy, apply ApplySmartFilters after each, pick best filtered.
+    - Remove the stability (3-bar lock) filter — it delays valid entries.
+    - Keep session overrides but allow override to be disabled by parameter.
+
+  R1.5: RELAX SESSION OVERRIDE OR ADD PARAMETER
+    Add: bool enableSessionOverride = true (default) / false
+    The forced LSR at open blocks momentum-day entries at the most
+    profitable time of day. Make it optional.
+
+  R1.6: CHANGE DEFAULT autoStrategy TO 0
+    While developing/testing, default to Strategy 0 (Momentum+VWAP).
+    This matches v1 and gives predictable, well-understood behavior.
+    Auto Select can be enabled explicitly when ready.
+
+PRIORITY 2 — TRAIL IMPROVEMENTS
+──────────────────────────────────
+
+  R2.1: REMOVE VOLATILITY SPIKE WIDENING (OR REVERSE IT)
+    Change: if (atr > atrAvg * TRAIL_SPIKE_MULT) spikeMult = 1.5
+    To:     if (atr > atrAvg * TRAIL_SPIKE_MULT) spikeMult = 0.85
+    During volatility spikes, TIGHTEN trail to lock gains.
+
+  R2.2: VOLATILITY SPIKE GUARD — ALLOW TRAIL TO TIGHTEN, NOT FREEZE
+    Instead of returning early when barRange > atr*3, allow trail to
+    move to tightest safe position (min distance). Don't freeze entirely.
+
+  R2.3: SMART TRAIL PAUSE THRESHOLD
+    Change pause condition: trailMaxProfitPts >= dynamicActivation * 2
+    To:                     trailMaxProfitPts >= dynamicActivation * 1.5
+    This allows pause to protect T1-BE trades, not just T2+.
+
+  R2.4: FIX S-TRAIL RESUME LOG BUG
+    Save pausedFor before resetting smartTrailPauseBars, then print it.
+
+PRIORITY 3 — SMART SL FIXES
+──────────────────────────────
+
+  R3.1: FIX SMART SL MODE C EXTENSION FORMULA
+    Change: double extendPts = Math.Min(10, slPoints + 30 - slPoints);
+    To:     double extendPts = Math.Min(15.0, slPoints * 0.30);
+    This makes extension proportional to the trade's SL distance.
+
+  R3.2: LOWER TRAP TIGHTEN THRESHOLD
+    Change: trapScore >= 65
+    To:     trapScore >= 50
+    65 is rarely reached until the position is already significantly
+    adverse. 50 triggers earlier while the trade still has room.
+
+  R3.3: VERIFY smartSlEvalBars IS NEEDED
+    The field increments each tick but is not used in any condition.
+    If intended for "evaluate after N bars" logic, add the check.
+    If unused, remove to reduce confusion.
+
+PRIORITY 4 — GENERAL QUALITY
+──────────────────────────────
+
+  R4.1: ADD DIAGNOSTIC LOGGING FOR FILTER PASSES/FAILS
+    Log which filters triggered and their multipliers when autoMode && bar%50==0.
+    This enables tuning without live-trading guesses.
+
+  R4.2: EXPOSE FILTER WEIGHTS AS PARAMETERS
+    HTF threshold, VWAP distance penalty start, conflict ratio, exhaustion
+    threshold — all hard-coded. Making them parameters allows backtesting
+    different calibrations without code changes.
+
+  R4.3: DEFAULT autoStrategy BACK TO 0 FOR TESTING
+    Set default to 0, not 4. Auto Select (4) is too complex to debug.
+    Test each strategy independently, confirm they fire, then enable Auto.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. SUMMARY: WHY Mm_ATM.cs OUTPERFORMS Mm_ATM_v3.cs
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  1. FEWER FILTERS: v1 has 4 focused filters vs v3's 14 stacking filters.
+     The 10 additional filters in v3 have compounding multiplicative effect
+     that crushes signals below threshold even when the market is clearly
+     trending.
+
+  2. SIMPLER DEFAULT CONFIG: v1 default = strategy 0 (constant signals),
+     v3 default = auto-select (complex, delayed, session-overridden).
+
+  3. CLEAN LUNCH HANDLING: v1 has no lunch penalty. v3 double-penalizes lunch.
+
+  4. BETTER TRAIL BEHAVIOR: v1 trail is clean — no spike guard, no spike
+     widening. v3 freezes trail during exactly the bars it most needs updating.
+
+  5. SIGNAL THRESHOLD CALIBRATED TO FILTER SET: v1 uses 68% threshold with
+     4 filters (appropriate). v3 uses 55% threshold after 14 filters
+     (threshold was lowered to compensate for over-filtering, but 55% after
+     14 stacked filters still produces fewer entries than 68% after 4 filters).
+
+  THE CORE INSIGHT:
+  ─────────────────
+  v3 was designed to "only take the best trades" but the filter stack is
+  so aggressive that it eliminates most good trades along with bad ones.
+  v1's simpler filter set allows more signal through at a higher threshold,
+  producing more trades with comparable quality.
+
+  The v3 features (Smart Trail, Smart SL, HTF filter, VP filter) are
+  individually sound ideas, but their combined effect reduces the strategy
+  to near-zero entries. The path forward is to:
+    (a) Remove duplicate/overlapping filters (POC Magnetic overlaps Near POC)
+    (b) Relax the HTF threshold from 0.5 to 1.5 ATR
+    (c) Fix the double lunch penalty
+    (d) Return Auto Select to the v1 per-strategy filtering approach
+    (e) Keep the good v3 trail additions (structural snap, bid/ask triggers,
+        trap tightening) but remove spike widening and fix spike guard
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+9. FIXES APPLIED TO Mm_ATM_v3.cs IN THIS SESSION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  - [Range(50, 100)] changed to [Range(10, 100)] for MinSignalConfidence
+    property (Group 3). Now allows testing down to 10% confidence threshold.
+
+================================================================================
+  End of Analysis
+================================================================================

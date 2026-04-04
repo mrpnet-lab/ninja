@@ -173,16 +173,93 @@ if (isFlat && IsFirstTickOfBar)
 `DrawChartAnnotations()`, `DrawDcaLevels()`, `DrawKeyLevels()`, `DrawSweepSignals()`, `DrawVolumeProfileLines()` were running every tick when `stopsArmed` (i.e., during every trade). Changed to `IsFirstTickOfBar` only — chart annotations don't need tick-level updates.
 
 ### 4. Dashboard Update Throttled
-Changed from every-tick-in-trade to every-2nd-tick-in-trade and every-5th-tick-when-flat (was every-3rd):
-```csharp
-int dashInterval = (inPosition || stopsArmed || pendingExit) ? 2 : 5;
-if (IsFirstTickOfBar || dashUpdateTickCounter >= dashInterval)
-```
+Changed from tick-counting to time-based throttle: max ~3 updates/sec (333ms interval).
 
 ---
 
+## Round 3: Performance Crisis Fixes (Session: Current)
+
+### Reported Symptoms
+- SL, Jump SL, TP lines take ~30 seconds to move on chart
+- Order entry takes 1-3 seconds
+- Closing a position: "exit pending" for ~1 minute, then strategy disables
+- Chart scrolling very slow (several seconds lag)
+
+---
+
+## Bug 15 — WPF Dispatcher Queue Flood (CRITICAL)
+
+### Root Cause
+Dashboard `UpdateDashboard()` fired every 3 ticks in-trade (8 flat). On NQ at 200+ ticks/sec, that's **66+ `InvokeAsync` dispatches per second**, each with a massive lambda updating 20+ WPF labels with string formatting. This **starved the WPF thread**, preventing:
+- Chart line rendering (SL/TP lines appeared to take 30 seconds)
+- Chart scrolling (WPF can't repaint)
+- Button feedback (click registered but visual confirmation delayed)
+
+Additionally, `Account.Get()` calls were inside `InvokeAsync` on the WPF thread — slow and potentially blocking.
+
+### Fix Applied
+1. Changed dashboard throttle from tick-count to **time-based**: max 3 updates/sec (333ms interval) using `DateTime.Now` comparison
+2. Moved `Account.Get(RealizedProfitLoss)`, `Account.Get(UnrealizedProfitLoss)`, `Account.Get(CashValue)` to data thread snapshot (before `InvokeAsync`)
+3. Removed per-blocked-button `UpdateDashboardStatus` calls in the pendingExit block (each fired its own `InvokeAsync`)
+
+## Bug 16 — Unbounded Draw Object Accumulation
+
+### Root Cause
+`DrawVwapLine()` created `"vwap_" + CurrentBar` — a new draw object every bar, never removed. Over a trading session, thousands of VWAP line segments accumulated. `DrawSweepSignals()` created `"sweepUp_" + CurrentBar` and `"sweepDn_" + CurrentBar` — same accumulation. These overwhelmed chart rendering.
+
+### Fix Applied
+- VWAP: remove segments older than 200 bars (`RemoveDrawObject("vwap_" + (CurrentBar - 200))`)
+- Sweep signals: remove objects older than 50 bars
+
+## Bug 17 — Per-Tick List Allocation via .ToList()
+
+### Root Cause
+`MonitorHiddenStops()` and `MonitorAdaptiveTrail()` both called `activeEntrySignals.ToList()` every tick — allocating a new `List<string>` ~200+ times/sec. This created GC pressure and unnecessary heap allocations.
+
+### Fix Applied
+Replaced all `.ToList()` + `foreach` with direct indexed `for` loops on the original list. Safe because list modifications only occur on the same NinjaTrader strategy thread — no concurrent access.
+
+## Bug 18 — CalculateTrailDistance() Heavyweight Loops Every Tick
+
+### Root Cause
+`MonitorAdaptiveTrail()` called `CalculateTrailDistance()` every tick, which ran 10-iteration ATR averaging + 8-iteration direction scoring loops. At 200+ ticks/sec, that's 3600+ loop iterations/sec for values that only change once per bar.
+
+### Fix Applied
+Added `GetCachedTrailDistance()` — caches the result per bar using `cachedTrailBar` / `cachedTrailDistance`. Recalculates only on first call per new bar.
+
+## Bug 19 — OnPositionUpdate Duplicate ResetPositionState
+
+### Root Cause
+`OnPositionUpdate` directly called `ResetPositionState()` when flat, which dispatched `UpdateAdjustLabels` via `InvokeAsync`. Then `SyncPositionState()` in the next `OnBarUpdate` also called `ResetPositionState()` → duplicate WPF dispatches and draw removals.
+
+### Fix Applied
+`OnPositionUpdate` now sets `pendingPositionFlat = true` flag. `SyncPositionState()` checks this flag first, ensuring a single Reset path and reducing WPF dispatch overhead.
+
+## Bug 20 — Stale Exit Safety Floods Broker
+
+### Root Cause
+With `STALE_EXIT_TICKS = 50` and NQ at 200+ ticks/sec, the safety net called `Account.Flatten` every 0.25 seconds if the exit didn't clear. This flooded the broker with flatten requests, possibly triggering risk management.
+
+### Fix Applied
+1. Increased `STALE_EXIT_TICKS` from 50 to 250 (~1.25 sec on NQ) — gives exit orders more time to fill
+2. After each flatten attempt, sets `pendingExitTicks = STALE_EXIT_TICKS / 2` (backoff) — waits ~0.6 sec before retry instead of immediately re-triggering
+
+---
+
+## Performance Summary (Round 3)
+
+| Metric | Before | After |
+|--------|--------|-------|
+| Dashboard dispatches/sec | ~66 (in-trade) | ~3 (time-based) |
+| Account.Get() thread | WPF (wrong) | Data (correct) |
+| .ToList() allocations/sec | ~400+ | 0 |
+| Trail distance calcs/sec | ~200+ | ~1/bar |
+| VWAP draw objects | Unbounded | Capped 200 |
+| Sweep draw objects | Unbounded | Capped 50 |
+| Stale exit flatten interval | 0.25 sec | 1.25 sec + backoff |
+
 ## Files Modified
-- `Mm_ATM_v2.cs` — All fixes above (3319 lines, braces balanced 531/531, 0 VS Code errors)
+- `Mm_ATM_v2.cs` — All fixes above (braces balanced 540/540, 0 VS Code errors)
 
 ## Previous Bug Fixes (commit 461b53b)
 - Bug 5: Emergency Kill — `pendingEmergencyKill` flag + `ExecuteEmergencyKill()`

@@ -1,0 +1,617 @@
+================================================================================
+  EXPERT PROMPT — Mm_ATM_v2.cs NinjaTrader 8.1 Strategy Deep Review & Enhancement
+  Target model: Claude Opus
+  File: c:\Github\mrpnet-lab\Strategies\Mm_ATM_v2.cs  (~3580 lines)
+================================================================================
+
+ROLE & EXPERTISE
+----------------
+You are a senior C# software engineer with 15+ years in algorithmic trading systems,
+specializing in NinjaTrader 8.1 (NT8) managed strategies. You are simultaneously an
+expert NQ (E-mini NASDAQ-100) futures trader with deep institutional knowledge of how
+Market Makers (MMs) and HFT bots operate on the NQ — including stop hunts, liquidity
+sweeps, false breakouts, iceberg orders, spread widening traps, trap-and-reverse setups,
+news-driven fake moves, and the systematic targeting of visible stop clusters.
+
+You know that:
+- NQ moves in $20/point increments, 4 ticks/point ($5/tick)
+- The default SL=67pts (~$1340/contract), TP=50pts (~$1000/contract)
+- MMs specifically target round numbers, prior swing highs/lows, and pre-market highs/lows
+- The opening 30 min (9:30–10:00 ET) and news windows are highest-manipulation periods
+- VWAP reclaim/rejection is THE institutional reference for intraday direction
+- Volume imbalances, absorption patterns, and delta divergence are early MM signs
+- The strategy runs on: Calculate=OnEachTick, EntriesPerDirection=4, maxContracts=4
+
+CONTEXT — CURRENT CODEBASE STATE
+----------------------------------
+The file Mm_ATM_v2.cs is a complete NQ trading strategy with:
+- WPF dashboard (draggable, with Buy/Sell MKT/LMT/ASK/BID, SL/TP adjust, Trail toggle,
+  Trap toggle, DCA logic, Jump SL, Emergency Kill, flatten, close buttons)
+- 4 signal strategies: (0) Momentum+VWAP, (1) Key Level Breakout,
+  (2) Liquidity Sweep Reversal, (3) Opening Range Breakout, (4) ★ Auto Select
+- Auto-Select: scores all 4 strategies each bar, uses stability filter
+  (requires bestIdx == lastBestAutoStrategy for autoSelectStabilityBars consecutive bars)
+- SmartFilters (ApplySmartFilters): 10 filters including Volume, Conflict, Momentum
+  Exhaustion, Bar Quality, Night Session, HTF EMA, VWAP Distance, Swing Structure,
+  Key Level Mid-Range Penalty, Volume Profile (POC/VAH/VAL)
+- Pre-entry trap detector (CalcPreEntryTrapScore): blocks auto entries when score >= 60
+- Post-entry trap detector (MonitorPostEntryTrap): tightens trail 40% when trapScore >= 50
+- Adaptive trailing stop (MonitorAdaptiveTrail): multi-tier (T1-BE, T2-Strong, T3-Runner)
+  with ATR-weighted dynamic distance, trend scoring, volatility spike widening
+- Hidden SL/TP: no broker-visible stops, all monitored in OnBarUpdate via Close[0]
+- Daily P&L limit: checked live every tick (realized + unrealized), calls ExecuteFlatten()
+  when hit — strategy stays OPEN but trading locked via dailyLimitHit/dailyProfitHit flags
+- State machine: pendingLong, pendingShort, pendingFlatten, pendingCloseTrade, etc.
+  all set from WPF thread and consumed in OnBarUpdate (thread-safe)
+- SyncPositionState: comprehensive position recovery running BEFORE pendingExit block
+- ExecutePartialClose(int qty): Chart Trader behavior — opposing direction button = partial
+  close by qty, not a reverse. Full close only if qty >= Position.Quantity
+
+KEY STATE FLAGS:
+  dailyLimitHit, dailyProfitHit  → blocks all entries, strategy STAYS RUNNING
+  emergencyKillActive            → hard halt
+  trailEnabled / trailActive     → adaptive trail state
+  trapDetectorEnabled / trapDetected → post-entry trap state
+  bestAutoStrategy               → 0-3, the currently selected strategy in Auto Select mode
+  autoStrategy = 4               → Auto Select is active
+
+KNOWN ISSUES TO FIX (items 1 and 2 have been partially addressed but need deep review)
+---------------------------------------------------------------------------------------
+
+=== ISSUE 1 — DAILY LIMIT CAUSES STRATEGY STOP IN PLAYBACK ===
+
+SYMPTOM: When daily loss or profit limit is hit during Playback mode, the strategy
+appears to stop processing — no more dashboard updates, no auto trades even on a new day.
+
+ROOT CAUSE ANALYSIS YOU MUST DO:
+A) The `ResetDailyTracking()` method is called in OnBarUpdate when `Time[0].Date != sessionDate`.
+   Verify it correctly resets dailyLimitHit=false, dailyProfitHit=false AND also resets
+   emergencyKillActive=false (it currently does NOT reset emergencyKillActive in this path —
+   check the existing code carefully).
+
+B) In Playback mode, State == State.Realtime. The daily limit check runs only when
+   `!dailyLimitHit && !dailyProfitHit`. After a new day is detected and ResetDailyTracking()
+   runs, these flags must be cleared BEFORE the daily P&L check runs on the same tick.
+   Currently, ResetDailyTracking() is called, then the existing P&L check block that
+   already ran earlier in that same tick may have already returned (it checks position).
+   But the auto entry logic that checks `!dailyLimitHit && !dailyProfitHit` runs AFTER
+   the housekeeping block — so the order should be OK. HOWEVER:
+
+C) CRITICAL: The auto entry block has this check:
+      if (autoMode && !dailyLimitHit && !dailyProfitHit && ...
+   And CalculateSignals() is also gated:
+      if (isFlat && IsFirstTickOfBar)  → CalculateSignals()
+   But CalculateSignals only runs IsFirstTickOfBar. In playback with Calculate=OnEachTick,
+   IsFirstTickOfBar is true only once. Verify this is NOT the issue — confirm that signals
+   ARE being calculated in playback (printing lastBullConfidence/lastBearConfidence to output).
+
+D) FIX NEEDED: After daily limit/profit is hit and a new day starts:
+   - Ensure ResetDailyTracking() also resets flattenFired=false (it does), 
+     but also ensure pnlBaselineOffset=0 AND processedTradeCount is reset so that
+     realized P&L doesn't bleed across days in playback where SystemPerformance accumulates.
+
+E) The `autoSelectStabilityBars` variable (default=2, type int) — in playback, if the 
+   strategy runs through many days, the auto-select stability counter `autoStratConsecutiveBars`
+   and `lastBestAutoStrategy` are NEVER reset between days. Add reset of these two fields
+   in ResetDailyTracking() so each new day starts with a fresh strategy selection.
+
+FIX IMPLEMENTATION:
+- In ResetDailyTracking(): add reset of autoStratConsecutiveBars=0, lastBestAutoStrategy=-1,
+  lastBullConfidence=0, lastBearConfidence=0
+- In ResetDailyTracking(): do NOT reset emergencyKillActive unless you want it auto-cleared
+  daily (user preference — add a parameter `clearEmergencyKillOnNewDay=true` that does this)
+- Add diagnostic Print() in CalculateSignals() for the first call each day showing which
+  strategy is selected and what the confidence scores are
+- In OnBarUpdate auto entry block — add a Print() when autoMode is true but entry was
+  skipped, logging all blocking reasons (this already exists modulo CurrentBar%100,
+  but change to IsFirstTickOfBar so it prints once per bar minimum in playback)
+
+
+=== ISSUE 2 — AUTO MODE ZERO TRADES IN PLAYBACK FOR ENTIRE DAYS ===
+
+SYMPTOM: Full trading days in Playback with autoMode=ON produce zero trades.
+
+SYSTEMATIC ANALYSIS REQUIRED:
+
+A) SIGNAL SCORING CALIBRATION — The current scores are:
+   Strategy 0 (Momentum+VWAP): max possible bull = 30+35+20+15+10 = 110
+   Strategy 1 (Key Level Breakout): max possible bull = 50+30+20 = 100
+   Strategy 2 (Liquidity Sweep Reversal): max possible bull = 45+30+25+10 = 110
+   Strategy 3 (ORB): max possible bull = 55+25+20 = 100
+   
+   But THEN ApplySmartFilters multiplies scores DOWN by up to:
+   - Night session: *0.7
+   - Volume low: *0.7
+   - Bull/Bear conflict: *0.7
+   - Bar quality: *0.8
+   - HTF against: *0.6
+   - VWAP distance: up to *0.5
+   - Mid-range penalty: *0.8
+   These filters STACK multiplicatively. Example:
+   0.7 * 0.7 * 0.7 * 0.8 * 0.6 = 0.165 — so a 100% raw score becomes 16.5%!
+   
+   minSignalConfidence=68.0 means scores MUST survive all these filters above 68.
+   This is extremely aggressive filtering that will cause near-zero entries.
+
+   FIX REQUIRED:
+   (a) Change default minSignalConfidence from 68.0 to 55.0
+   (b) Review and reduce the stacking penalty — instead of multiplying all filters,
+       compute a composite penalty = product of individual penalties but cap the
+       total penalty floor at 0.45 (never reduce below 45% of raw score regardless
+       of how many filters fire). Add this cap in ApplySmartFilters():
+         double totalPenaltyFloor = 0.45;
+         // After all filter adjustments: clamp
+         double rawBull = ..., rawBear = ...;
+         lastBullConfidence = Math.Max(lastBullConfidence, rawBull * totalPenaltyFloor);
+         lastBearConfidence = Math.Max(lastBearConfidence, rawBear * totalPenaltyFloor);
+       NOTE: Track raw scores BEFORE filters are applied so you can enforce this floor.
+   (c) The bar quality filter (bodyPct < 0.25 → *0.8) triggers on nearly every doji
+       and indecision candle during consolidation. Lower the threshold to bodyPct < 0.15.
+   (d) The bull/bear conflict ratio threshold (conflict/dominant > 0.70) is too tight.
+       Raise to 0.80 so only very conflicted signals get penalized.
+
+B) PRE-ENTRY TRAP FILTER — CalcPreEntryTrapScore:
+   It penalizes based on "recentMove against direction" — but for trend entries, a
+   recent impulsive move IN your direction is normal. The current formula adds up to
+   score 40 just for a normal trend move, plus 25 for EMA conflict, plus 20 for wick.
+   On a trending day this will block many legitimate entries.
+   
+   FIX: The threshold should be CONTEXT-ADJUSTED:
+   - If HTF trend agrees with entry direction → raise block threshold from 60 to 75
+   - If autoStrategy is Liquidity Sweep Reversal (s=2) → always skip the pre-entry
+     trap filter because this strategy IS the trap reversal — it should enter INTO
+     what looks like a trap setup
+   - Cap the recentMove contribution at 30 (not 40) to reduce false blocks
+
+C) STABILITY FILTER — autoSelectStabilityBars default=2 means strategy must be best
+   for 2 consecutive bars. Since CalculateSignals only runs on IsFirstTickOfBar AND
+   only when isFlat, the counter `autoStratConsecutiveBars` only increments during
+   flat periods. This is correct. But confirm: after entering a trade, when the position
+   is closed and isFlat becomes true again, `lastBestAutoStrategy` retains its value
+   from the last flat period. This is intentional (persistence). Document this.
+
+D) TRADING HOURS IN PLAYBACK: The check is:
+     bool insideTradingHours = !tradingHoursEnabled || (ct >= tradingStartTime && ct < tradingEndTime)
+   Default: tradingStartTime=93000 (9:30 ET), tradingEndTime=160000 (4:00 PM ET)
+   Ensure playback data has bars inside this window. If testing with overnight data
+   only, no entries will fire. Add a diagnostic Print on first bar of each day showing
+   the current time and whether insideTradingHours is true.
+
+E) COOLDOWN INTERACTION: lossCooldownSeconds=120 (2 min). In playback, after any loss,
+   `lastLossTime` is stored as `time` from OnExecutionUpdate. Then in OnBarUpdate,
+   `timeNow = Time[0]` for Historical state. This should work. But verify the
+   consecutiveLosses counter doesn't persist across days (add reset in ResetDailyTracking).
+
+
+=== ISSUE 3 — STRATEGY QUALITY: SMARTER MM TRAP AVOIDANCE ===
+
+Current state analysis:
+- Pre-entry trap (CalcPreEntryTrapScore): looks at wick, EMA conflict, recent move — basic
+- Post-entry trap (MonitorPostEntryTrap): looks at adverse move, EMA flip, volume spike, wick
+- Smart filter #6 (HTF): single EMA vs price, binary +1/0/-1
+- No session timing intelligence (no separate logic for 9:30-10:00 manipulation window)
+- No detection of: stop-hunt spikes, fake breakouts followed by reversal, POC magnetic pulls
+
+ENHANCEMENTS REQUIRED:
+
+A) ENHANCED PRE-ENTRY TRAP SCORE — add to CalcPreEntryTrapScore():
+   1. PRIOR SWING TARGET PROXIMITY: If entry is within 2×ATR of a prior 20-bar swing high
+      (for long) or swing low (for short), MMs will likely sweep it. Add +25 to score.
+   2. ROUND NUMBER PROXIMITY: NQ loves to trap at round 100s and 50s (e.g., 21500, 21550).
+      Check if Close[0] is within 0.5×ATR of a round-100 or round-50 level. Add +20.
+   3. OPENING TRAP WINDOW: Between 9:30-10:00 ET (ct >= 93000 && ct < 100000), reduce trap
+      threshold (lower bar to block) — add +20 to score automatically in this window.
+   4. OVEREXTENDED FROM VWAP: If Close[0] is more than 2×ATR from vwapValue in the direction
+      of entry (going further away), add +20. This catches extended moves chasing price.
+   5. CONSECUTIVE CANDLES SAME DIRECTION: If last 3+ candles all closed in the same direction
+      as the entry (count with a loop), MMs often fake continuation. Add +15 if 3+, +25 if 4+.
+   
+   IMPLEMENTATION NOTE: The function currently returns 0-100 and blocks at 60. After adding
+   these new components, recalibrate:
+   - Block threshold remains 60 for auto entries
+   - For manual entries, show warning text on dashboard but do NOT block
+   - Add `string trapReason` output parameter to show in dashboard which trap type fired
+
+B) ENHANCED POST-ENTRY TRAP DETECTOR — add to MonitorPostEntryTrap():
+   1. STOP HUNT SPIKE DETECTION: A bar that makes a new low (for long) or new high (for short)
+      vs the prior 5 bars AND then closes back above the prior bar's low (for long) = MM stop
+      hunt that likely continues. COUNTER-TRAP: if trapScore would trigger an exit but this
+      spike pattern is present, SUSPEND the trap-tightened trail for 3-5 bars (add
+      `trapSuspendBars` counter). Display "MM STOP HUNT — trail relaxed" on dashboard.
+   2. VOLUME ABSORPTION: if a large-range bar moves adverse AND volume is > 2×avg BUT the
+      close is near the midpoint of the bar (not extreme) = absorption = MM absorbing supply
+      (for long), likely to resolve in your favor. Reduce trapScore contribution from this bar.
+   3. TIME-BASED TRAP DECAY: trapScore should decay by 15% per bar that passes without price
+      extending the adverse move. Currently trapScore is recalculated each bar — ensure it
+      can decrease not just increase (add a `prevTrapScore` that bleeds off).
+
+C) SMART FILTER ENHANCEMENTS — update ApplySmartFilters():
+   1. DELTA/MOMENTUM DIVERGENCE: If RSI is making new highs but price is making lower highs
+      (for bear entry) or vice versa, this is a divergence signal. Add +10 to bear confidence
+      if RSI divergence detected over last 5 bars. This requires comparing RSI[0] vs RSI[4]
+      against Close[0] vs Close[4].
+   2. VWAP SLOPE FILTER: Calculate vwapSlope = (vwapValue - prevBarVwap). If slope is
+      strongly positive (> ATR*0.05/bar), favor longs over shorts regardless of other signals.
+      Add ±10 asymmetric boost based on vwap slope direction.
+   3. POC MAGNETIC FILTER: If price is moving toward the POC level (within 1×ATR approaching),
+      penalize entries going INTO the POC by *0.75. Price will often stall or reverse at POC.
+   4. MARKET PROFILE TIME): Between 11:30-14:00 ET (ct >= 113000 && ct < 140000) NQ often
+      consolidates (lunch doldrums). Add *0.85 confidence penalty during this window to reduce
+      false breakout entries.
+
+D) SESSION-AWARE STRATEGY SELECTION — modify CalculateSignals() Auto Select:
+   Override bestAutoStrategy based on time of day regardless of scoring:
+   - 9:30-10:00 (ct >= 93000 && ct < 100000): Force strategy 2 (Liquidity Sweep Reversal)
+     because the open is the highest manipulation/sweep period. MMs sweep yesterday's lows
+     before the real move begins.
+   - 10:00-11:30 (ct >= 100000 && ct < 113000): Allow auto select — best directional window.
+   - 11:30-14:00 (ct >= 113000 && ct < 140000): Force strategy 0 (Momentum+VWAP) with
+     raised minSignalConfidence (+10) — slow session, higher bar to enter.
+   - 14:00-16:00 (ct >= 140000 && ct < 160000): Allow auto select — afternoon breakout/fade.
+   This session-aware override is applied AFTER the stability filter but BEFORE the entry check.
+   Add a boolean field `sessionTimeOverrideActive` and show in dashboard which regime is active.
+
+
+=== ISSUE 4 — BUTTON EXECUTION SPEED ===
+
+Current state: All buttons set a pending flag (pendingLong, pendingShort, etc.) that is
+consumed in OnBarUpdate on the NEXT tick. This adds 1 tick of latency.
+
+ANALYSIS: For NQ with Calculate=OnEachTick, ticks arrive every 50-250ms in active sessions.
+At 1 tick of latency, actual execution delay is 50-250ms. This is sub-optimal for fast moves.
+
+ENHANCEMENTS REQUIRED:
+
+A) FOR MARKET ORDERS (BUY MKT, SELL MKT, CLOSE TRADE, EXIT): These must execute on the SAME
+   tick they are requested whenever possible. Since WPF buttons run on the UI thread and
+   OnBarUpdate runs on the NinjaTrader strategy thread, you cannot call EnterLong/ExitLong
+   directly from the button handler (thread safety). The correct NT8 approach for immediate
+   execution is:
+
+   Replace the simple flag pattern with a ThreadLocal approach using NT8's
+   `TriggerCustomEvent` (if available, NT8 8.1+) or ensure the timer-based approach where
+   a high-priority boolean is checked:
+   - Keep the existing pending flag mechanism (it is thread-safe by design)
+   - BUT add `volatile` keyword to ALL pending flags to ensure zero compiler reordering:
+     `private volatile bool pendingLong;` etc. for ALL pending* booleans
+   - Add early-exit optimization: in OnBarUpdate, check the critical action flags FIRST
+     (before any other logic), which is already done — keep this pattern
+   - For BUY MKT / SELL MKT, ensure the button handlers ALSO set `ChartControl.Dispatcher
+     .InvokeAsync` is NOT used — just set the bool directly (they already do this via
+     closures, verify no extra Dispatcher wrappers are in the button click handlers)
+
+B) HIDDEN STOP MONITOR (MonitorHiddenStops): Currently uses Close[0] for SL/TP check.
+   For live trading, switch to using the REAL-TIME Ask/Bid:
+   - For LONG SL: use GetCurrentBid() instead of Close[0] (stop is triggered at bid, not close)
+   - For LONG TP: use GetCurrentAsk() — wait, TP on long = limit order, use GetCurrentBid()
+     Actually for exits: Long SL → triggered when bid falls <= hiddenStopPrice,
+     Long TP → triggered when ask rises >= hiddenTargetPrice (for limit-like TP)
+     OR use Close[0] as approximation for managed orders
+   - Use: `double exitPrice = State == State.Realtime ? GetCurrentBid(0) : Close[0];` for
+     long stops and `GetCurrentAsk(0)` for short stops
+   - This eliminates tick-delay slippage on SL triggers in fast moves
+
+C) TRAIL MONITOR (MonitorAdaptiveTrail): Same as above — use bid/ask for trigger:
+   - LONG trail: use `GetCurrentBid(0)` as the price to compare vs trailPrice
+   - SHORT trail: use `GetCurrentAsk(0)` as the price to compare vs trailPrice
+
+
+=== ISSUE 5 — TRAIL INTELLIGENCE ENHANCEMENT ===
+
+Current trail state:
+- Activation: fixed trailActivationPoints=8 pts (not ATR-relative)
+- Distance: CalculateTrailDistance() — ATR-weighted, score-based, 5 inputs
+- Tiers: T1-BE (break-even floor), T2-Strong (45% of max profit), T3-Runner (55% of max)
+- Trap tightening: -40% distance when trapDetected
+- Volatility spike: +50% distance when ATR > 2×avg (good — protects from stop hunts)
+
+WEAKNESSES:
+1. Activation threshold is FIXED at 8pts — in high-volatility sessions (ATR=25pts),
+   this activates trail immediately and it stays too tight. Should be ATR-relative.
+2. Once trail activates, it NEVER pauses — even during obvious pullbacks within trend.
+3. No consideration of market structure (support/resistance) for trail placement.
+4. T2-Strong floor is 45% of max profit — aggressive, may cut runs short.
+
+ENHANCEMENTS REQUIRED:
+
+A) ATR-RELATIVE ACTIVATION: Change trailActivationPoints to be dynamic:
+   - Compute dynamicActivation = Math.Max(trailActivationPoints, indAtr[0] / (TickSize * 4) * 0.4)
+   - This means: activate trail at the larger of user-set value OR 40% of current ATR in points
+   - Cache this per bar (add `double dynamicTrailActivation` field, compute in CalculateTrailDistance)
+
+B) SMART TRAIL PAUSE ("Smart Trail" — new feature, see Issue 6 below) — implement toggle
+
+C) STRUCTURAL TRAIL PLACEMENT: After computing the basic trail distance, apply a structural
+   adjustment:
+   - Find the nearest prior bar low (for long) or high (for short) in last 5 bars
+   - If placing trail above/below a recent structure level would give a tighter stop
+     while still making structural sense, snap trailPrice to 1 tick below that low
+     (for long) or 1 tick above that high (for short), BUT only if this results in
+     a trail that is >= trailMinPoints from current price
+   - Add field `trailStructuralSnapActive` bool to show on dashboard
+
+D) TIER REBALANCING for maximum profit capture:
+   - T1-BE: Activate floor at breakeven ONLY when profitPoints >= trailActivationPoints * 1.5
+     (require more profit before locking in BE — avoids premature BE stops on normal pullbacks)
+   - T2-Strong floor: Change from 45% to 40% of max profit (less aggressive)
+   - T3-Runner: Change from 55% to 50% of max profit, but ONLY when trailTrendScore > 0.65
+     (strong trend confirmed). In mixed/choppy conditions, keep T3 floor at 45%.
+   - Add T0-Tight tier: if profitPoints < trailActivationPoints, use extra-wide distance
+     (trailMaxPoints) to give the trade room to breathe before trail activates
+
+E) TRAIL DASHBOARD INFO: The trail label currently shows:
+   "Trail 21234.50  (12.5pt | Trending 72%)"
+   Enhance to show tier name and ATR distance:
+   "Trail 21234.50  Tier:T2 | 12.5pt | ATR×1.8 | Trending 72%"
+
+
+=== ISSUE 6 — SMART TRAIL (NEW FEATURE) ===
+
+DESCRIPTION: A new "Smart Trail" mode that automatically pauses the trail when price
+appears to be doing a MM stop-hunt pullback into a trending move, then resumes when
+momentum confirms the original direction has resumed.
+
+USER INTENT: "When Trail Smart is ON, if I am already profitable and the strategy
+detects high probability that NQ is just running stops before continuing in my direction,
+automatically behave as if Trail=OFF (freeze the trail price, don't tighten it), let price
+sweep the stops, and when momentum confirms the original direction resumes, turn Trail back ON."
+
+IMPLEMENTATION:
+
+A) Add new fields:
+   ```csharp
+   private bool   smartTrailEnabled;       // user toggle
+   private bool   smartTrailPaused;        // currently paused (MM sweep in progress)
+   private double smartTrailFrozenPrice;   // trailPrice frozen when paused
+   private int    smartTrailPauseBars;     // how long paused
+   private int    smartTrailMaxPauseBars;  // safety: auto-resume after N bars
+   private Button btnSmartTrailToggle;     // dashboard button
+   private TextBlock lblSmartTrailInfo;    // status label
+   ```
+
+B) Smart Trail PAUSE conditions (all must be true simultaneously):
+   1. trailActive == true (trail already activated, we have profit)
+   2. trailMaxProfitPts >= trailActivationPoints * 2 (we have at least 2× activation in profit)
+   3. Adverse pullback detected: for long, Close[0] < High[1] by at least 0.3×ATR
+      AND the pullback has been happening for 1-3 bars (short duration)
+   4. BUT the overall momentum (EMA fast vs slow) still agrees with trade direction
+      — for long: indEmaFast[0] > indEmaSlow[0] still
+   5. Volume on the pullback bar(s) is NOT higher than 1.5×avgVolume (low-volume pullback
+      = stop hunt, not genuine reversal)
+   6. We are NOT near a major S/R level that would indicate genuine trend change
+      (not within 1×ATR of prior 20-bar swing low for long, or swing high for short)
+   When ALL 6 conditions are true → SET smartTrailPaused=true, smartTrailFrozenPrice=trailPrice
+
+C) While smartTrailPaused=true:
+   - Do NOT move trailPrice (freeze it at smartTrailFrozenPrice)
+   - Increment smartTrailPauseBars
+   - Show on dashboard: "Smart Trail: PAUSED (MM sweep?)" in Orange
+   - If smartTrailPauseBars >= smartTrailMaxPauseBars (default=8) → auto-resume (safety)
+
+D) Smart Trail RESUME conditions (any one is sufficient):
+   1. Momentum resumes: for long, Close[0] > High[1] (price making new bar highs again)
+      AND for the last 2 bars this has been true consecutively
+   2. Stop hunt complete: Low[0] > Low[1] (for long, we stopped going lower) AND
+      Close[0] > Open[0] (bullish bar after the sweep)
+   3. Safety timeout: smartTrailPauseBars >= smartTrailMaxPauseBars
+   On resume: smartTrailPaused=false, smartTrailPauseBars=0
+   Show: "Smart Trail: RESUMED" in Green briefly
+
+E) Dashboard button "S-TRAIL" toggle (on/off) similar to Trail and Trap toggles:
+   - Place in dashboard near the Trail button
+   - When ON: Green "S-TRAIL ✓", when OFF: Gray "S-TRAIL"
+   - Show smartTrailPaused status in lblSmartTrailInfo below it
+
+F) Modify MonitorAdaptiveTrail() to check smartTrailEnabled and smartTrailPaused before
+   moving trailPrice. Insert check after the trail activation block:
+   ```csharp
+   // Smart trail pause logic
+   if (smartTrailEnabled && trailActive)
+   {
+       EvaluateSmartTrailPause(); // updates smartTrailPaused
+       if (smartTrailPaused)
+       {
+           // trail is frozen, only update chart annotation, don't move trailPrice
+           // but still check if price hit the FROZEN trail (still exit if breached)
+           ... existing trail breach check using smartTrailFrozenPrice ...
+           return; // don't move trail
+       }
+   }
+   ```
+
+
+=== ISSUE 7 — AUTO STRATEGY CONFIRMATION (ANSWER + ENHANCEMENT) ===
+
+CONFIRMED BEHAVIOR (no code change needed, just document):
+- When autoStrategy=4 (★ Auto Select): CalculateSignals() runs ALL 4 strategies every bar,
+  picks the highest-scoring one, applies stability filter, stores result in bestAutoStrategy.
+  Entries use bestAutoStrategy's signals. The dashboard shows "Active: [strategy name]".
+- When autoStrategy=0..3: Only that specific strategy is calculated. Manual selection.
+- The stability filter (autoSelectStabilityBars=2) requires the same strategy wins for
+  N consecutive flat bars before actually switching. This prevents rapid strategy flipping.
+
+ENHANCEMENT: Add a "confidence reason" display in the dashboard:
+- When in Auto Select mode, show the scores of ALL 4 strategies in the dashboard:
+  e.g., "Scores: M+V=45 KLB=72✓ LSR=38 ORB=55"
+  where ✓ marks the active strategy
+- Add field `double[] lastStrategyScores = new double[4]` (bull and bear, so 8 values)
+  populated during CalculateSignals() in auto mode
+- Show in lblActiveStrategy as multi-line or compact format
+- Make the default for Auto Strategy to be autoStrategy=4 (★ Auto Select) if it does not affect performance for auto.
+
+=== ISSUE 8 — SMART SL (NEW FEATURE) ===
+
+DESCRIPTION: A "Smart SL" mode that intelligently moves the hidden stop loss based on
+price action, trap detection, and signal confidence AFTER entering a trade.
+
+USER INTENT: "When Smart SL is ON, the strategy should:
+(a) Move SL to break-even once I am in meaningful profit
+(b) Move SL tighter if it detects I am being trapped (MM moved against me)
+(c) Move SL looser (give more room) if signal confidence is high and the move is
+    likely to continue but just had a brief shake
+
+IMPLEMENTATION:
+
+A) Add new fields:
+   ```csharp
+   private bool   smartSlEnabled;
+   private double smartSlTargetPrice;     // where Smart SL wants to move hiddenStopPrice
+   private bool   smartSlBreakevenDone;   // already moved to BE once
+   private int    smartSlEvalBars;        // bars evaluated since entry
+   private Button btnSmartSlToggle;
+   private TextBlock lblSmartSlInfo;
+   ```
+
+B) Smart SL BREAK-EVEN logic: Trigger when:
+   1. profitPoints >= tpPoints * 0.40 (40% of TP reached = break-even lock)
+   2. !smartSlBreakevenDone
+   3. Not already at or past break-even (hiddenStopPrice < averageEntryPrice for long)
+   Action: Move hiddenStopPrice to averageEntryPrice + (1 tick) for long (lock break-even)
+   Set smartSlBreakevenDone=true. Show: "Smart SL: BREAK-EVEN locked" in Green
+
+C) Smart SL TIGHTEN logic (trap scenario): Trigger when:
+   1. trapDetected == true AND trapScore >= 65 (high confidence trap)
+   2. Current profit is positive (not yet in loss)
+   3. The current SL is still at its original distance from entry
+   Action: Move hiddenStopPrice closer by 25% of original SL distance:
+   `hiddenStopPrice = averageEntryPrice - (originalSlOffset * 0.75)` for long
+   Show: "Smart SL: TIGHTENED (trap)" in Orange
+
+D) Smart SL LOOSEN logic (high-confidence continuation): Trigger when:
+   1. smartSlBreakevenDone == false (we haven't locked BE yet)
+   2. Signal confidence was >= minSignalConfidence + 15 at entry (very high confidence)
+     (store entry confidence in `double entryConfidenceScore` on ExecuteLongEntry/Short)
+   3. Adverse move < 0.5×ATR (small adverse, not a trend reversal)
+   4. EMA still agrees with direction
+   Action: Extend SL by 10 points (capped at slPoints + 30):
+   `hiddenStopPrice -= 10 * NQ_TICKS_PER_POINT * TickSize` for long (loosen for long)
+   Show: "Smart SL: EXTENDED (hi conf)" in Cyan
+   This can only fire ONCE per trade (add `smartSlLoosened` flag)
+
+E) Add Smart SL evaluation in MonitorHiddenStops() or as separate method
+   `MonitorSmartSL()` called from OnBarUpdate when in position and smartSlEnabled.
+   After computing new target, call ArmHiddenStops() with new slPoints value OR
+   directly set hiddenStopPrice (preferred — more direct, no need to recalc from scratch).
+
+F) Dashboard: Add "SMART SL" toggle button near the Jump SL button row.
+   Show current SmartSL status: "Smart SL: BE locked @ 21234.50" or "Trap tightened"
+
+
+=== ISSUE 9 — PERFORMANCE, RELIABILITY & EFFICIENCY ===
+
+CODE REVIEW FINDINGS:
+
+A) CRITICAL — DrawSweepSignals() and DrawVwapLine() create unbounded draw objects:
+   - DrawSweepSignals removes objects at CurrentBar-50, but creates 4 objects per trigger
+     (sweepUp_, sweepUpTxt_, sweepDn_, sweepDnTxt_). Over a full day's playback this
+     accumulates many objects. Reduce cleanup threshold from 50 to 20 bars.
+   - DrawVwapLine cleanup at CurrentBar-200 means 200 VWAP line segments exist at once.
+     Reduce to CurrentBar-50. NinjaTrader NQ 1-min bars: 200 bars = 3+ hours of lines.
+
+B) VOLUME PROFILE — CalculateVolumeProfileLevels() runs every 10 bars and iterates the
+   entire `volumeAtPrice` dictionary twice (once for POC, once for value area expansion).
+   Over a full day with 1-min bars (~390 bars), this is ~39 recalculations each iterating
+   potentially thousands of price levels. Optimize:
+   - Only run when volumeAtPrice count changed by more than 5 since last run
+     (add `int lastVpRecalcCount` field)
+   - Or run only every 20 bars instead of 10
+
+C) CalculateSignals() ONLY runs IsFirstTickOfBar AND isFlat. This is correct for performance.
+   BUT the `for loops` in CalcKeyLevelBreakout and CalcLiquiditySweepReversal iterate 20 bars
+   each call. Use NinjaTrader's built-in MAX(High, 20) and MIN(Low, 20) indicators which
+   are pre-computed. Already done for DrawKeyLevels — apply same pattern to signal calcs.
+   Replace:
+   ```csharp
+   double hi20 = double.MinValue;
+   for (int i = 1; i <= 20; i++) if (High[i] > hi20) hi20 = High[i];
+   ```
+   With: `double hi20 = MAX(High, 20)[1];`
+   Same for lo20 and all similar loops.
+
+D) SIGNAL FILTER VOLUME LOOP: In ApplySmartFilters() and CalcLiquiditySweepReversal(),
+   volume averages are computed with a manual for-loop. Cache the avgVolume per bar:
+   Add `private double cachedAvgVolume; private int cachedAvgVolumeBar = -1;`
+   and compute/cache once per bar. This saves 2-3 redundant 20-item iterations per tick.
+
+E) DISPATCHER SAFETY: In BuildDashboard(), all button click handlers are lambda closures
+   that directly mutate fields like `contracts`, `slPoints`, `tpPoints`, `jumpSlPercent`.
+   Since these run on the WPF UI thread and OnBarUpdate reads them on the strategy thread,
+   add `volatile` to these critical int fields to prevent CPU cache staleness:
+   `private volatile int contracts;`
+   `private volatile int slPoints;`
+   `private volatile int tpPoints;`
+   (Already done for booleans — extend to the critical numeric parameters)
+
+F) STATE.HISTORICAL P&L TRACKING: In State.Historical (backtest/Strategy Analyzer),
+   the `OnExecutionUpdate` processes trades from `SystemPerformance.AllTrades` by index.
+   In backtest with many trades, this inner loop `for (int i = processedTradeCount; i < total; i++)`
+   is O(1) per call (only processes new trades). This is efficient — no change needed.
+
+G) ArmHiddenStops() calls: Audit all call sites to ensure it's not called redundantly.
+   Current calls: ExecuteLongEntry, ExecuteShortEntry, ExecuteBuyAskEntry (only after fill
+   in OnOrderUpdate), ExecuteLongLimitEntry, ExecuteShortLimitEntry, ExecutePartialClose,
+   ExecuteJumpSL, SyncPositionState (desync recovery), OnOrderUpdate (fill confirmed),
+   ExecuteCloseOne — this last one is wrong! ExecuteCloseOne REDUCES position and then
+   calls nothing. It should: after reducing, call ArmHiddenStops() to update SL/TP for
+   the smaller remaining position. ADD ArmHiddenStops() at end of ExecuteCloseOne().
+
+
+================================================================================
+  IMPLEMENTATION INSTRUCTIONS FOR CLAUDE OPUS
+================================================================================
+
+You are about to modify c:\Github\mrpnet-lab\Strategies\Mm_ATM_v2.cs (~3580 lines).
+
+CRITICAL RULES:
+1. Read the ENTIRE file before making ANY changes.
+2. Make ONE logical change at a time. After each group of related changes, verify
+   brace count remains balanced.
+3. Do NOT change the overall architecture — strategy is managed (not unmanaged),
+   Calculate=OnEachTick, uses hidden SL/TP, WPF dashboard.
+4. Do NOT rename existing methods or fields unless explicitly instructed.
+5. All new fields go in the #region Fields section.
+6. All new dashboard elements (buttons, labels) must be: created in BuildDashboard(),
+   wired in the button click handler section, and updated in UpdateDashboard().
+7. When adding new dashboard buttons, follow the exact same pattern as btnTrailToggle
+   and btnTrapToggle — copy their visual style and state toggle logic.
+8. After all changes, run a brace balance check and report line count.
+9. Preserve all existing functionality — do NOT remove existing features.
+10. Keep changes minimal for items already working correctly.
+
+PRIORITY ORDER (implement in this order):
+  Priority 1 — CRITICAL BUGS: Issues 1 and 2 (playback/daily reset + signal calibration)
+  Priority 2 — PERFORMANCE: Issue 9 items A, B, C, D, E (efficiency fixes)
+  Priority 3 — TRADE QUALITY: Issue 3 (trap avoidance, smart filters, session aware)
+  Priority 4 — EXECUTION SPEED: Issue 4 (volatile flags, bid/ask for stops)
+  Priority 5 — TRAIL INTELLIGENCE: Issue 5 (ATR-relative activation, structural, tiers)
+  Priority 6 — NEW FEATURES: Issue 6 (Smart Trail), Issue 8 (Smart SL)
+  Priority 7 — DOCUMENTATION: Issue 7 (strategy score display in dashboard)
+
+FOR EACH CHANGE: Use replace_string_in_file with 5+ lines of context. Use
+multi_replace_string_in_file for independent simultaneous changes. After all changes,
+call get_errors to verify zero compilation errors.
+
+QUESTIONS FOR USER BEFORE IMPLEMENTING:
+(The implementing agent should ask these before proceeding with Priority 5-6)
+
+Q1 — Smart Trail default state: Should `smartTrailEnabled` default to TRUE (on) or
+     FALSE (off)? on
+
+Q2 — Smart Trail max pause duration: Suggested default is 8 bars. Is this too long or
+     too short for your typical NQ 1-min chart trading style? please decide if this default is good or perhaps you should make it customized with this default.
+
+Q3 — Smart SL break-even trigger: Currently proposed at 40% of TP reached. Would you
+     prefer a fixed point threshold (e.g., always at +15pts) rather than a percentage? 40% is good but make this customized with 40% default.
+
+Q4 — Session time overrides (Issue 3D): The 9:30-10:00 window would force Strategy 2
+     (Liquidity Sweep Reversal) for auto entries. Do you want this time override feature,
+     or prefer the strategy always be chosen purely by score? I would accept your recommendation for what would be the best and appropriate to be very profitable and smart.
+
+Q5 — For the signal calibration (Issue 2A), the proposed new default minSignalConfidence
+     is 55.0 (down from 68.0). Do you want to adjust this further up or down, or let
+     the agent use 55.0? Make 55 recommended as default but make it available to adjust up and down.
+
+Q6 — Smart Trail: Should the frozen trail still EXIT if price breaches it? (Recommended
+     YES — the freeze only stops the trail from TIGHTENING, but the floor protection
+     still applies to avoid giving back all profit.) Yes. 
+================================================================================

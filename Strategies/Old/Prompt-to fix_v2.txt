@@ -1,0 +1,770 @@
+You are an expert in ninjatrader NT8 8.1 version and you are an expert in stock market and specially in Futures trading NQ.
+I would like you to use the Mm_ATM_v1.cs module and create a new module called Mm_ATM_v2.
+
+I am going to provide a prompt below created by Claude Sonnet 4.6 with requirements for the v2 module to fix some bugs and enhance the code.
+Please create the v2 version module in disk to avoid network issues as we had before when creating v1. 
+
+Please make the code run very fast and reliable. I want the v2 version to be much more intelligent and Extremely profitable than the version v1 provided.
+Please optimize the code to run without bugs.
+Please review the code suggestion provided in the prompt but you can do it the most optimized way and come up with your solution.
+
+
+
+
+# Prompt for Claude Opus 4.6 — Generate Mm_ATM_v2.cs
+## NinjaTrader 8 Strategy Overhaul
+
+---
+
+## YOUR ROLE
+
+You are an expert NinjaTrader 8 C# strategy developer specializing in NQ futures
+(Micro/Mini NQ, TickSize = 0.25). You will rewrite Mm_ATM_v1.cs into a complete,
+fully working Mm_ATM_v2.cs. The attached v1 source is your base — preserve everything
+that works, fix all bugs listed below, implement all enhancements, and optimize the
+overall code for clarity, performance, and reliability.
+
+The final output must be a single, complete, compilable .cs file with zero placeholders,
+zero TODOs, and zero stub methods. Every method must be fully implemented.
+
+---
+
+## PLATFORM CONSTRAINTS (do not violate these)
+
+- NinjaTrader 8.1.x Managed Strategy Framework only
+- Calculate = Calculate.OnEachTick
+- IsUnmanaged = false
+- EntryHandling = EntryHandling.AllEntries, EntriesPerDirection = 4
+- All UI must run on ChartControl.Dispatcher.InvokeAsync()
+- No resting SL/TP orders on exchange — all stops are hidden (monitored in OnBarUpdate)
+- Stealth naming: all entries use signalName = " " (single space), all exits use "Close"
+- All order submissions restricted to State.Realtime only
+- NQ constants already defined — use them everywhere:
+  - NQ_TICKS_PER_POINT = 4.0
+  - NQ_DOLLARS_PER_TICK = 5.0
+  - NQ_DOLLARS_PER_POINT = 20.0
+
+---
+
+## PART 1 — BUG FIXES (mandatory, fix all)
+
+### BUG 1 — Unrealized P&L Calculation
+**File location:** `UpdateDashboard()` around line 2757
+**Current broken code:**
+```csharp
+unrealizedPnL = Position.GetUnrealizedProfitLoss(PerformanceUnit.Currency, Close[0]);
+```
+**Problem:** After DCA fills, NT8's internal `Position.AveragePrice` diverges from the
+strategy's confirmed `averageEntryPrice`, causing wildly incorrect unrealized P&L display
+(e.g. showing -$155 when actual loss is -$15).
+
+**Fix:** Replace entirely with direct manual calculation:
+```csharp
+double unrealizedPnL = 0;
+if (openTradeDirection != 0 && stopsArmed && averageEntryPrice > 0 && totalContracts > 0)
+{
+    double priceDiff = openTradeDirection == 1
+        ? Close[0] - averageEntryPrice
+        : averageEntryPrice - Close[0];
+    unrealizedPnL = (priceDiff / (TickSize * NQ_TICKS_PER_POINT))
+                    * NQ_DOLLARS_PER_POINT * totalContracts;
+}
+```
+
+---
+
+### BUG 2 — OnExecutionUpdate O(n) P&L Scan
+**File location:** `OnExecutionUpdate()` around line 1566
+**Current broken code:**
+```csharp
+dailyRealizedPnL = 0;
+foreach (Trade t in SystemPerformance.AllTrades)
+    if (t.Entry.Time.Date == sessionDate)
+        dailyRealizedPnL += t.ProfitCurrency;
+dailyRealizedPnL -= pnlBaselineOffset;
+```
+**Problem:** Scans ALL trades on every execution update — O(n) growing cost that degrades
+performance as trade count increases during a session.
+
+**Fix:** Use incremental tracking with `processedTradeCount`:
+```csharp
+if (SystemPerformance?.AllTrades != null)
+{
+    int total = SystemPerformance.AllTrades.Count;
+    for (int i = processedTradeCount; i < total; i++)
+    {
+        Trade t = SystemPerformance.AllTrades[i];
+        if (t.Entry.Time.Date == sessionDate)
+            dailyRealizedPnL += t.ProfitCurrency;
+    }
+    processedTradeCount = total;
+}
+```
+Add field: `private int processedTradeCount;`
+Reset `processedTradeCount = 0` in `ResetDailyTracking()` and `State.Realtime`.
+
+---
+
+### BUG 3 — SELL BID / BUY ASK Unintended Reverse
+**File location:** `CanEnterTrade()` lines 1061–1075
+**Problem:** After DCA with 2 contracts, pressing SELL BID closes the first contract
+(position drops to qty=1). A second SELL BID then incorrectly triggers a SHORT reverse
+entry instead of closing the last contract. Root cause: the condition
+`Position.Quantity > contracts` (both = 1) cannot distinguish between a clean
+single-contract position and a post-DCA reduced one.
+
+**Fix:** Remove ALL reverse-to-opposite-direction logic from `CanEnterTrade()`.
+Opposite direction button presses must ONLY close — never open a new position:
+```csharp
+// Replace the entire reverse block with simple close-only:
+if (direction == -1 && Position.MarketPosition == MarketPosition.Long)
+{
+    if (Position.Quantity > contracts)
+        ExecuteCloseOne();
+    else
+        ExecuteCloseTrade();
+    return false;
+}
+if (direction == 1 && Position.MarketPosition == MarketPosition.Short)
+{
+    if (Position.Quantity > contracts)
+        ExecuteCloseOne();
+    else
+        ExecuteCloseTrade();
+    return false;
+}
+```
+Also remove ALL these fields and their references entirely:
+- `pendingReverseLong`, `pendingReverseShort`
+- `pendingReverseLongLmt`, `pendingReverseShortLmt`
+- `pendingReverseLongAsk`, `pendingReverseShortBid`
+- `reversePendingTicks`
+- All reverse pending logic in `OnBarUpdate()`
+
+---
+
+### BUG 4 — Signal Confidence Colors Not Visible Enough
+**File location:** `BuildDashboard()` lines 2388–2389 and `UpdateDashboard()` lines 2961–2970
+**Problem:** Bull/Bear confidence labels use Brushes.LimeGreen / Brushes.OrangeRed at
+FontSize 11 — too small and low-contrast on the dark dashboard background at a glance.
+Additionally in `UpdateDashboard()`, when confidence is below threshold both labels
+turn Gray, losing color entirely.
+
+**Fix in BuildDashboard():**
+```csharp
+lblConfBull = MakeLabel("Bull: 0%",
+    new SolidColorBrush(Color.FromRgb(0, 255, 100)), 13, FontWeights.Bold,
+    HorizontalAlignment.Left);
+lblConfBear = MakeLabel("Bear: 0%",
+    new SolidColorBrush(Color.FromRgb(255, 70, 70)), 13, FontWeights.Bold,
+    HorizontalAlignment.Left);
+// Header label:
+MakeLabel("Signal Confidence:", Brushes.Silver, 11, FontWeights.SemiBold,
+    HorizontalAlignment.Left)
+```
+**Fix in UpdateDashboard():** Always keep Bull green and Bear red regardless of threshold.
+Only change brightness/opacity to indicate below threshold, not color:
+```csharp
+lblConfBull.Text = "Bull: " + lastBullConfidence.ToString("F0") + "%";
+lblConfBull.Foreground = new SolidColorBrush(Color.FromRgb(0, 255, 100));
+lblConfBull.Opacity = lastBullConfidence >= minSignalConfidence ? 1.0 : 0.45;
+
+lblConfBear.Text = "Bear: " + lastBearConfidence.ToString("F0") + "%";
+lblConfBear.Foreground = new SolidColorBrush(Color.FromRgb(255, 70, 70));
+lblConfBear.Opacity = lastBearConfidence >= minSignalConfidence ? 1.0 : 0.45;
+```
+
+---
+
+## PART 2 — DCA OVERHAUL (full simplification)
+
+The current DCA system is overly complex and causes bugs. Completely overhaul as follows:
+
+### Remove entirely:
+- `dcaEnabled` property and all references — remove toggle from dashboard
+- `dcaDistancePoints` as an entry-blocking guard — distance is now suggestion-only
+- All reverse-to-opposite logic (covered in Bug 3 above)
+- `openDcaCount` used in any guard or block logic
+- Keep `openDcaCount` ONLY for logging/display labeling ("LONG #2", "LONG #3" etc.)
+
+### Rename:
+- `DcaMaxPositions` → `MaxContracts` (property, display name, and all references)
+- Default value: 4
+- Dashboard display: `"Qty: X / max Y"` where X = current position quantity, Y = MaxContracts
+- Block same-direction entry when `Position.Quantity >= MaxContracts` — clean silent block
+  with dashboard message: `"⚠ Max contracts reached (Y)"`
+
+### New parameter — DCA Suggestion Line:
+Add `DcaSuggestionPoints` (int, Group 2, default = 50, range 10–200):
+- Display name: "DCA Suggestion Distance (NQ points)"
+- Description: "Visual-only suggestion line showing where to consider adding. No entry blocking."
+- In `DrawDcaLevels()`: draw a single dashed DeepSkyBlue horizontal line at
+  `averageEntryPrice - (DcaSuggestionPoints * NQ_TICKS_PER_POINT * TickSize)` for longs,
+  and above for shorts
+- Label: `"DCA zone ~{price} ({DcaSuggestionPoints}pt suggestion)"`
+- Only draw when in a position AND `Position.Quantity < MaxContracts`
+- Remove when flat or max reached
+
+### CanEnterTrade() simplification after DCA overhaul:
+Remove these checks:
+- `if (!dcaEnabled ...)` — gone
+- `if (dcaDistancePoints > 0 ...)` — gone
+- All reverse pending logic — gone
+
+Keep only:
+- `if (Position.Quantity >= MaxContracts && direction matches)` → block with message
+
+---
+
+## PART 3 — DASHBOARD OVERHAUL
+
+### 3a. Remove Strategy Selector from Top
+Remove the entire `stratPanel` StackPanel (Auto Strategy label + ◄ ► arrows + lblStratName)
+from the top section of the dashboard. This frees up significant vertical space.
+
+### 3b. New Strategy Display in Signal Confidence Section
+Add a new combined section replacing the old confidence-only area:
+
+**New layout (between separator and P&L rows):**
+```
+Strategy:  ◄  Momentum+VWAP  ►     ← when flat: live + selectable
+           [ Momentum+VWAP ]        ← when in trade: frozen, gold color
+─────────────────────────────
+Bull: 68%        Bear: 22%
+─────────────────────────────
+```
+
+**Implementation details:**
+- Add field: `private string lastAutoStrategyUsed = "";`
+- Add field: `private TextBlock lblActiveStrategy;`
+- Add field: `private Button btnStratPrevConf, btnStratNextConf;`
+- In `ExecuteLongEntry()` and `ExecuteShortEntry()`, before calling entry:
+  ```csharp
+  lastAutoStrategyUsed = StrategyNames[autoStrategy == 4 ? bestAutoStrategy : autoStrategy];
+  ```
+- In `ResetPositionState()`: `lastAutoStrategyUsed = "";`
+- In `UpdateDashboard()` strategy label logic:
+  - When **flat**: show live current strategy name, normal white color, arrows visible/enabled
+  - When **in trade**: show `lastAutoStrategyUsed`, color = Gold, arrows disabled/grayed
+  - When **Auto Select flat**: show `"★ Auto → " + StrategyNames[bestAutoStrategy]`
+  - When **Auto Select in trade**: show `"★ Auto → " + lastAutoStrategyUsed` in Gold
+
+### 3c. Auto Select Stability Counter Display
+Add small indicator next to strategy name showing consecutive bars on same strategy:
+`"Momentum+VWAP ×3"` — helps user see signal stability
+
+---
+
+## PART 4 — SIGNAL QUALITY ENHANCEMENTS
+
+### 4a. Higher-Timeframe Trend Filter
+Add a secondary EMA calculated on a synthetic higher-timeframe basis using bar aggregation.
+Since we're on 1-minute bars, approximate a 5-minute trend by using a 45-period EMA
+(9 bars × 5min = 45 1-min bars) as the HTF EMA.
+
+Add parameter `HtfEmaPeriod` (int, Group 9 "Signal Filters", default = 45, range 20–200):
+```csharp
+private EMA indEmaHtf;
+// In Configure: indEmaHtf = EMA(htfEmaPeriod);
+```
+
+In `ApplySmartFilters()`, add after existing filters:
+```csharp
+// HTF Trend Filter
+if (htfFilterEnabled)
+{
+    bool htfBullish = Close[0] > indEmaHtf[0];
+    bool htfBearish = Close[0] < indEmaHtf[0];
+    if (!htfBullish) lastBullConfidence *= 0.55;  // strong counter-trend penalty
+    if (!htfBearish) lastBearConfidence *= 0.55;
+}
+```
+Add bool parameter `HtfFilterEnabled` (default = true).
+
+### 4b. VWAP Distance Scaling
+In `ApplySmartFilters()`, after existing filters:
+```csharp
+// VWAP Distance Penalty
+if (vwapValue > 0)
+{
+    double atrPts = indAtr[0] / (TickSize * NQ_TICKS_PER_POINT);
+    double vwapDistPts = Math.Abs(Close[0] - vwapValue) / (TickSize * NQ_TICKS_PER_POINT);
+    if (atrPts > 0)
+    {
+        double vwapDistAtr = vwapDistPts / atrPts;
+        if (vwapDistAtr > 3.0)
+        {
+            // Price extremely stretched from VWAP — penalize continuation direction
+            if (Close[0] > vwapValue) lastBullConfidence *= Math.Max(0.4, 1.0 - (vwapDistAtr - 3.0) * 0.15);
+            else lastBearConfidence *= Math.Max(0.4, 1.0 - (vwapDistAtr - 3.0) * 0.15);
+        }
+    }
+}
+```
+
+### 4c. Swing Structure Detection (Lower High / Lower Low)
+Add method `CalcSwingStructure()` called inside `ApplySmartFilters()`:
+```csharp
+private void CalcSwingStructure()
+{
+    if (CurrentBar < 10) return;
+    // Detect last 2 swing highs and lows using 3-bar fractal
+    // If lower highs: bearish structure — penalize bull signals
+    // If higher lows: bullish structure — penalize bear signals
+    double sh1 = 0, sh2 = 0, sl1 = 0, sl2 = 0;
+    int found = 0;
+    for (int i = 2; i < Math.Min(CurrentBar, 30) && found < 4; i++)
+    {
+        if (High[i] > High[i-1] && High[i] > High[i+1]) { if (sh1 == 0) sh1 = High[i]; else if (sh2 == 0) { sh2 = High[i]; } }
+        if (Low[i]  < Low[i-1]  && Low[i]  < Low[i+1])  { if (sl1 == 0) sl1 = Low[i];  else if (sl2 == 0) { sl2 = Low[i];  } }
+        found++;
+    }
+    bool lowerHighs = sh1 > 0 && sh2 > 0 && sh1 < sh2;   // sh1 is more recent
+    bool higherLows = sl1 > 0 && sl2 > 0 && sl1 > sl2;
+    if (lowerHighs) lastBullConfidence *= 0.65;
+    if (higherLows) lastBearConfidence *= 0.65;
+}
+```
+
+### 4d. Key Level Mid-Range Penalty
+In `ApplySmartFilters()`, if `showKeyLevels` is true:
+```csharp
+// Key Level Mid-Range Penalty
+if (CurrentBar >= 22)
+{
+    double priorHigh = MAX(High, 20)[1];
+    double priorLow  = MIN(Low,  20)[1];
+    double range = priorHigh - priorLow;
+    double atrPts = indAtr[0];
+    if (range > 0 && atrPts > 0)
+    {
+        double posInRange = (Close[0] - priorLow) / range;
+        bool midRange = posInRange > 0.25 && posInRange < 0.75;
+        bool farFromLevels = Math.Min(Close[0] - priorLow, priorHigh - Close[0]) > atrPts * 0.5;
+        if (midRange && farFromLevels)
+        {
+            lastBullConfidence *= 0.80;
+            lastBearConfidence *= 0.80;
+        }
+    }
+}
+```
+
+### 4e. Pre-Entry Trap Filter (lightweight version of post-entry trap)
+Add method `CalcPreEntryTrapScore()` returning double 0–100:
+```csharp
+private double CalcPreEntryTrapScore(int direction)
+{
+    if (CurrentBar < 5) return 0;
+    double score = 0;
+    double atr = indAtr[0];
+    if (atr <= 0) return 0;
+
+    // Recent adverse move against intended direction
+    double recentMove = direction == 1
+        ? Close[0] - Math.Min(Low[0], Low[1])   // longs: recent drop
+        : Math.Max(High[0], High[1]) - Close[0]; // shorts: recent rise
+    double atrPts = atr / (TickSize * NQ_TICKS_PER_POINT);
+    if (atrPts > 0) score += Math.Min(40, (recentMove / (TickSize * NQ_TICKS_PER_POINT)) / atrPts * 30);
+
+    // EMA opposing direction
+    if (direction == 1  && indEmaFast[0] < indEmaSlow[0]) score += 25;
+    if (direction == -1 && indEmaFast[0] > indEmaSlow[0]) score += 25;
+
+    // Wick rejection against direction on current bar
+    double barRange = High[0] - Low[0];
+    if (barRange > 0)
+    {
+        if (direction == 1)  { double uw = (High[0] - Math.Max(Close[0], Open[0])) / barRange; if (uw > 0.45) score += 20; }
+        if (direction == -1) { double lw = (Math.Min(Close[0], Open[0]) - Low[0])  / barRange; if (lw > 0.45) score += 20; }
+    }
+    return Math.Min(100, score);
+}
+```
+
+In `ExecuteLongEntry()` and `ExecuteShortEntry()`, after `CanEnterTrade()` passes:
+```csharp
+double trapRisk = CalcPreEntryTrapScore(direction);
+if (trapRisk >= 60)
+{
+    Print(Time[0] + " | PRE-ENTRY TRAP BLOCKED: score=" + trapRisk.ToString("F0"));
+    UpdateDashboardStatus("⚠ Entry blocked: trap risk " + trapRisk.ToString("F0") + "%", Brushes.Orange);
+    return;
+}
+```
+Only apply this block for auto entries (`isManual == false`).
+For manual entries, show warning on dashboard but allow entry.
+
+### 4f. Consecutive Loss Cooldown
+Add fields:
+```csharp
+private int consecutiveLosses;
+private DateTime lastLossTime;
+```
+Add parameter `LossCooldownSeconds` (int, Group 9, default = 120, range 0–600):
+- Description: "Seconds to pause auto entries after a losing trade. 0 = disabled."
+
+In `OnExecutionUpdate()`, when a completed trade is a loss:
+```csharp
+if (lastClosedTradePnL < 0)
+{
+    consecutiveLosses++;
+    lastLossTime = DateTime.Now;
+}
+else
+{
+    consecutiveLosses = 0;
+}
+```
+
+In auto entry check in `OnBarUpdate()`:
+```csharp
+bool cooldownActive = lossCooldownSeconds > 0
+    && consecutiveLosses > 0
+    && (DateTime.Now - lastLossTime).TotalSeconds < lossCooldownSeconds;
+if (cooldownActive) { /* skip auto entry */ continue; }
+```
+
+### 4g. Auto Select Stability Filter
+Add field: `private int autoStratConsecutiveBars;`
+Add field: `private int lastBestAutoStrategy = -1;`
+Add parameter `AutoSelectStabilityBars` (int, Group 3, default = 2, range 1–5):
+
+In `CalculateSignals()` when `autoStrategy == 4`, after picking `bestAutoStrategy`:
+```csharp
+if (bestAutoStrategy == lastBestAutoStrategy)
+    autoStratConsecutiveBars++;
+else
+{
+    autoStratConsecutiveBars = 1;
+    lastBestAutoStrategy = bestAutoStrategy;
+}
+// Only allow auto entry if strategy stable for N bars
+if (autoStratConsecutiveBars < autoSelectStabilityBars)
+{
+    lastBullConfidence *= 0.5;
+    lastBearConfidence *= 0.5;
+}
+```
+Show consecutive bar count in strategy label: `"Momentum+VWAP ×3"`
+
+---
+
+## PART 5 — VOLUME PROFILE (POC / VAH / VAL)
+
+Implement a real-time intraday volume profile calculator. This is the highest-value
+signal enhancement and must be fully implemented, not stubbed.
+
+### Fields:
+```csharp
+private Dictionary<double, double> volumeAtPrice = new Dictionary<double, double>();
+private double pocLevel;
+private double vahLevel;
+private double valLevel;
+private bool   volumeProfileReady;
+private double totalSessionVolume;
+```
+
+### Session Reset:
+In `ResetDailyTracking()` and `State.Realtime`:
+```csharp
+volumeAtPrice.Clear();
+pocLevel = 0; vahLevel = 0; valLevel = 0;
+volumeProfileReady = false;
+totalSessionVolume = 0;
+```
+
+### UpdateVolumeProfile() — call from OnBarUpdate() every bar:
+```csharp
+private void UpdateVolumeProfile()
+{
+    double roundedPrice = Math.Round(Close[0] / TickSize) * TickSize;
+    double vol = Volume[0];
+    if (vol <= 0) return;
+
+    if (volumeAtPrice.ContainsKey(roundedPrice))
+        volumeAtPrice[roundedPrice] += vol;
+    else
+        volumeAtPrice[roundedPrice] = vol;
+
+    totalSessionVolume += vol;
+
+    if (volumeAtPrice.Count < 5 || totalSessionVolume <= 0) return;
+
+    // Find POC
+    pocLevel = 0;
+    double maxVol = 0;
+    foreach (var kvp in volumeAtPrice)
+        if (kvp.Value > maxVol) { maxVol = kvp.Value; pocLevel = kvp.Key; }
+
+    // Calculate VAH/VAL (70% of volume)
+    var sorted = volumeAtPrice.OrderByDescending(k => k.Value).ToList();
+    double cumVol = 0;
+    double target = totalSessionVolume * 0.70;
+    var valueAreaPrices = new List<double>();
+    foreach (var kvp in sorted)
+    {
+        cumVol += kvp.Value;
+        valueAreaPrices.Add(kvp.Key);
+        if (cumVol >= target) break;
+    }
+    if (valueAreaPrices.Count > 0)
+    {
+        vahLevel = valueAreaPrices.Max();
+        valLevel = valueAreaPrices.Min();
+        volumeProfileReady = true;
+    }
+}
+```
+
+### Chart Display:
+Draw/update every 10 bars (not every tick for performance):
+```csharp
+if (volumeProfileReady && CurrentBar % 10 == 0)
+{
+    Draw.HorizontalLine(this, "poc",  false, pocLevel,  Brushes.White,      DashStyleHelper.Solid, 2);
+    Draw.HorizontalLine(this, "vah",  false, vahLevel,  Brushes.Cyan,       DashStyleHelper.Dash,  1);
+    Draw.HorizontalLine(this, "val",  false, valLevel,  Brushes.Cyan,       DashStyleHelper.Dash,  1);
+    Draw.Text(this, "pocLbl", "POC "  + pocLevel.ToString("F2"), 0, pocLevel  + 2 * TickSize, Brushes.White);
+    Draw.Text(this, "vahLbl", "VAH "  + vahLevel.ToString("F2"), 0, vahLevel  + 2 * TickSize, Brushes.Cyan);
+    Draw.Text(this, "valLbl", "VAL "  + valLevel.ToString("F2"), 0, valLevel  - 4 * TickSize, Brushes.Cyan);
+}
+```
+
+### Signal Integration (add to ApplySmartFilters):
+```csharp
+if (volumeProfileReady)
+{
+    double atrPts = indAtr[0] > 0 ? indAtr[0] / (TickSize * NQ_TICKS_PER_POINT) : 10;
+
+    // POC proximity — chop zone
+    if (Math.Abs(Close[0] - pocLevel) < atrPts * 0.5 * TickSize * NQ_TICKS_PER_POINT)
+    {
+        lastBullConfidence *= 0.60;
+        lastBearConfidence *= 0.60;
+    }
+
+    // Inside value area — moderate penalty
+    if (Close[0] > valLevel && Close[0] < vahLevel)
+    {
+        lastBullConfidence *= 0.78;
+        lastBearConfidence *= 0.78;
+    }
+
+    // Fresh break above VAH — bull bonus
+    if (Close[0] > vahLevel && Close[1] <= vahLevel)
+        lastBullConfidence *= 1.25;
+
+    // Fresh break below VAL — bear bonus
+    if (Close[0] < valLevel && Close[1] >= valLevel)
+        lastBearConfidence *= 1.25;
+}
+```
+
+Add bool parameter `ShowVolumeProfile` (Group 5 Display, default = true).
+Add bool parameter `UseVolumeProfileFilters` (Group 9 Signal Filters, default = true).
+
+---
+
+## PART 6 — CODE OPTIMIZATION & CLEANUP
+
+### 6a. Remove dead/redundant code:
+- Remove `lastRawBull` and `lastRawBear` fields — not used anywhere in display or logic
+- Remove `sessionRealizedPnL` field — `dailyRealizedPnL` already serves this purpose
+- Remove `processedTradeCount` O(n) workaround from v1 — replace with proper incremental
+- Remove all reverse-pending fields as listed in Bug 3
+
+### 6b. Consolidate duplicate guard patterns:
+The `OnBarUpdate()` has several duplicate position-sync patterns.
+Consolidate into a single `SyncPositionState()` method called once per tick.
+
+### 6c. Extract magic numbers:
+Replace any remaining magic numbers with named constants or parameters:
+```csharp
+private const int    STALE_EXIT_TICKS     = 50;
+private const int    FLAT_SYNC_MAX_TICKS  = 30;
+private const double TRAIL_SPIKE_MULT     = 2.0;
+private const double VALUE_AREA_PCT       = 0.70;
+```
+
+### 6d. Null safety:
+Every dashboard label access must be null-guarded. Wrap all `UpdateDashboard()` content
+in a single try-catch with `Print()` on exception — prevents dashboard crashes from
+killing the strategy.
+
+### 6e. Performance:
+- Volume profile update: only recalculate VAH/VAL every `IsFirstTickOfBar`, not every tick
+- Chart annotation draws: gate with `IsFirstTickOfBar || stopsArmed` where appropriate
+- Auto-strategy scan: only run `CalculateSignals()` on `IsFirstTickOfBar` when flat
+  (tick-level precision not needed for entry detection when flat)
+
+---
+
+## PART 7 — CONFIGURATION PROPERTIES (complete list for v2)
+
+All properties must be in named groups with descriptions. Here is the complete
+property specification for v2:
+
+### Group 1 — Risk Management
+| Property | Type | Default | Range | Description |
+|---|---|---|---|---|
+| SlPoints | int | 67 | 1-500 | Hidden SL distance (NQ points) |
+| TpPoints | int | 50 | 1-500 | Hidden TP distance (NQ points) |
+| MaxDailyLossDollars | int | 2000 | 500-10000 | Hard daily loss cap |
+| MaxDailyProfitDollars | int | 4000 | 500-20000 | Daily profit target |
+| MaxTradesPerDay | int | 999 | 0-999 | Max round-trips (0=unlimited) |
+| Contracts | int | 1 | 1-10 | Contracts per entry |
+
+### Group 2 — Position Management (replaces old DCA group)
+| Property | Type | Default | Range | Description |
+|---|---|---|---|---|
+| MaxContracts | int | 4 | 1-10 | Max total contracts in position at once |
+| DcaSuggestionPoints | int | 50 | 10-200 | Visual DCA suggestion line distance (NQ points, no enforcement) |
+
+### Group 3 — Trading Mode
+| Property | Type | Default | Range | Description |
+|---|---|---|---|---|
+| AutoMode | bool | false | — | Start in auto mode |
+| AutoStrategy | int | 0 | 0-4 | 0=Momentum+VWAP 1=Key Level 2=Liq Sweep 3=ORB 4=Auto Select |
+| MinSignalConfidence | double | 68.0 | 50-100 | Auto entry threshold % |
+| EntryDelaySeconds | int | 5 | 0-120 | Cooldown between entries (seconds) |
+| AutoSelectStabilityBars | int | 2 | 1-5 | Bars same strategy must lead before Auto Select fires |
+
+### Group 4 — Indicators
+| Property | Type | Default | Range |
+|---|---|---|---|
+| EmaPeriodFast | int | 9 | 3-50 |
+| EmaPeriodSlow | int | 21 | 10-200 |
+| RsiPeriod | int | 14 | 5-30 |
+| AtrPeriod | int | 14 | 5-30 |
+
+### Group 5 — Display
+| Property | Type | Default | Description |
+|---|---|---|---|
+| SlTpAdjustStep | int | 5 | Points per +/- click |
+| JumpSlPercent | int | 50 | % of SL gap to jump |
+| ShowEma | bool | true | EMA on chart |
+| ShowRsi | bool | true | RSI panel |
+| ShowAtr | bool | true | ATR panel |
+| ShowVwap | bool | true | VWAP line |
+| ShowKeyLevels | bool | true | Key support/resistance |
+| ShowSweepSignals | bool | true | Sweep arrows |
+| ShowVolumeProfile | bool | true | POC/VAH/VAL lines |
+
+### Group 6 — Trading Hours
+| Property | Type | Default | Description |
+|---|---|---|---|
+| TradingHoursEnabled | bool | true | Enable hour-based restrictions |
+| TradingStartTime | int | 93000 | Earliest entry (HHMMSS ET) |
+| TradingEndTime | int | 160000 | Session end (HHMMSS ET) |
+| FlattenTime | int | 165000 | Auto-flatten time (HHMMSS ET) |
+
+### Group 7 — Adaptive Trail
+| Property | Type | Default | Range | Description |
+|---|---|---|---|---|
+| TrailEnabled | bool | true | — | Enable adaptive trail |
+| TrailActivationPoints | int | 8 | 1-100 | Profit threshold to activate (NQ pts) |
+| TrailMinPoints | int | 3 | 1-100 | Tightest distance (choppy market) |
+| TrailMaxPoints | int | 25 | 2-200 | Widest distance (trending market) |
+| TrailAtrMultiplier | double | 1.5 | 0.5-5.0 | ATR scale factor |
+
+### Group 8 — Trap Detector
+| Property | Type | Default | Description |
+|---|---|---|---|
+| EnablePostEntryTrapDetector | bool | true | Monitor open trades for trap conditions |
+| VolatilitySpikeGuardBars | int | 0 | Skip trail on bar range > 3×ATR. 0=disabled |
+
+### Group 9 — Signal Filters (NEW GROUP)
+| Property | Type | Default | Description |
+|---|---|---|---|
+| HtfFilterEnabled | bool | true | Block counter-trend entries vs HTF EMA |
+| HtfEmaPeriod | int | 45 | Period for HTF trend EMA (45 ≈ 5-min on 1-min chart) |
+| UseVolumeProfileFilters | bool | true | Apply POC/VAH/VAL signal adjustments |
+| LossCooldownSeconds | int | 120 | Auto entry pause after loss. 0=disabled |
+
+---
+
+## PART 8 — DASHBOARD LAYOUT (final v2 layout)
+
+Top to bottom order in the dashboard:
+
+```
+┌─────────────────────────────┐
+│  ☰  NQ  Mm-ATM  v2         │  ← title bar (drag handle)
+├─────────────────────────────┤
+│  [ MANUAL ]    [ AUTO ]     │  ← mode toggle
+├─────────────────────────────┤
+│  Qty: —   SL: —   TP: —    │  ← adjust rows
+│  ⇥ JUMP SL    [ 50% ]       │
+├─────────────────────────────┤
+│  ▲ BUY MKT    ▼ SELL MKT   │
+│  △ BUY ASK    ▽ SELL BID   │
+│  △ BUY LMT    ▽ SELL LMT   │
+│  ▣ CLOSE 1    ⏹ CLOSE ALL  │
+│  ⚠ EMERGENCY KILL           │
+├─────────────────────────────┤
+│  ● LONG ×2                  │  ← position status
+│  Qty: 2 / max 4             │  ← qty vs max
+│  Avg: 24159.00              │
+│  SL: 24092.00 (67pt)        │
+│  TP: 24209.00 (50pt)        │
+│  [TRAIL: ON]  Trail: 21345  │
+│  VWAP: 23881.65             │
+│  [TRAP: ON]   Trap: 44%     │
+├─────────────────────────────┤
+│  Strategy: ◄ Momentum+VWAP ►│  ← live when flat
+│  (or frozen gold in trade)  │
+│  Bull: 68%      Bear: 22%   │  ← always colored
+├─────────────────────────────┤
+│  Unrealized:  ($15.00)      │
+│  Daily P&L:   $2,280 [6/999]│
+│  Total P&L:   $2,265        │
+│  Account P&L: $2,505        │
+│  Balance:     $102,505      │
+├─────────────────────────────┤
+│  [HOURS: OFF] Trading allow │
+└─────────────────────────────┘
+```
+
+---
+
+## PART 9 — NAMING & VERSION
+
+- Class name: `Mm_ATM_v2`
+- File name: `Mm_ATM_v2.cs`
+- Description field: `"Mm-ATM v2.0 — Volume Profile + HTF Filter + DCA Overhaul + Full Bug Fixes"`
+- Namespace: `NinjaTrader.NinjaScript.Strategies`
+- All `Print()` statements should prefix with `"[Mm-ATM v2]"` for easy Output tab filtering
+
+---
+
+## FINAL INSTRUCTIONS
+
+1. Output the COMPLETE file — no truncation, no "// ... rest of method" shortcuts
+2. Every method fully implemented with real logic
+3. Every property declared with `[NinjaScriptProperty]`, `[Display]`, and `[Range]` where applicable
+4. Compile-ready: no missing using statements, no undefined references
+5. Test mentally for these exact scenarios before finalizing:
+   - Long 1 contract → DCA add 1 more → press SELL BID → closes 1 → press SELL BID again → closes last, NO reverse short
+   - Auto mode fires long → trade open → strategy label freezes gold → trade closes → label resets
+   - Price near POC → confidence penalized → auto entry blocked even if other signals strong
+   - Unrealized P&L shows correct dollar amount matching (price_diff × contracts × $20/pt)
+   - After loss, auto mode pauses for LossCooldownSeconds before next entry
+6. Preserve all existing working functionality not mentioned in this prompt
+7. Keep stealth naming throughout — entries " " (space), exits "Close"
+8. Strategy name in NT8 strategy list: "Mm_ATM_v2"
+
+---
+
+
+
+For clarification for Part 5 above, if you feel is too complex to add now, You can implement only Phase 1 (simpler, immediate value):
+Use the previous session's POC/VAH/VAL as static levels drawn on the chart. These are extremely relevant — overnight traders and institutions reference prior day levels heavily. Previous session values are fixed numbers you can calculate once at session open from completed bars, which is much simpler than real-time calculation.
+If you feel Phase 2 is complicated, we can do it another time, but you need to let me know:
+Phase 2 (more complex, higher value):
+Add real-time intraday volume profile calculation. This gives you live POC/VAH/VAL that update as the session progresses — the most accurate version but requires the custom dictionary-based calculator.
+I will leave the decision to you as I want a very good code, optimized and very profitable.
+
+
+
+*Attach Mm_ATM_v1.cs as your base reference when submitting this prompt to Opus 4.6.*

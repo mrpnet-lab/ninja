@@ -1,6 +1,6 @@
 ﻿// ============================================================
-//  Mm-ATM v2.0 Strategy for NinjaTrader 8
-//  Full documentation: see Mm_ATM_v2.md
+//  Mm-ATM v3.0 Strategy for NinjaTrader 8
+//  Full documentation: see Mm_ATM_v3.md
 // ============================================================
 
 #region Using declarations
@@ -25,11 +25,11 @@ using NinjaTrader.NinjaScript.Indicators;
 
 namespace NinjaTrader.NinjaScript.Strategies
 {
-    public class Mm_ATM_v2 : Strategy
+    public class Mm_ATM_v3 : Strategy
     {
         #region Fields
 
-        // â”€â”€â”€ Constants â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- Constants ---
         private const double NQ_TICKS_PER_POINT   = 4.0;
         private const double NQ_DOLLARS_PER_TICK   = 5.0;
         private const double NQ_DOLLARS_PER_POINT  = 20.0;
@@ -40,12 +40,12 @@ namespace NinjaTrader.NinjaScript.Strategies
         private const double VALUE_AREA_PCT        = 0.70;
         private const int    AGGRESSIVE_LIMIT_TIMEOUT_SEC = 3;
 
-        // â”€â”€â”€ User parameters â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        private int    slPoints;
-        private int    tpPoints;
+        // --- User parameters ---
+        private volatile int    slPoints;
+        private volatile int    tpPoints;
         private int    maxDailyLossDollars;
         private int    maxDailyProfitDollars;
-        private int    contracts;
+        private volatile int    contracts;
         private int    maxContracts;
         private int    dcaSuggestionPoints;
         private int    entryDelaySeconds;
@@ -75,20 +75,20 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool   enablePostEntryTrapDetector;
         private int    autoSelectStabilityBars;
 
-        // â”€â”€â”€ Signal filter parameters â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- Signal filter parameters ---
         private bool   htfFilterEnabled;
         private int    htfEmaPeriod;
         private bool   useVolumeProfileFilters;
         private int    lossCooldownSeconds;
 
-        // â”€â”€â”€ Indicator references â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- Indicator references ---
         private NinjaTrader.NinjaScript.Indicators.EMA indEmaFast;
         private NinjaTrader.NinjaScript.Indicators.EMA indEmaSlow;
         private NinjaTrader.NinjaScript.Indicators.EMA indEmaHtf;
         private NinjaTrader.NinjaScript.Indicators.RSI indRsi;
         private NinjaTrader.NinjaScript.Indicators.ATR indAtr;
 
-        // â”€â”€â”€ Session / daily tracking â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- Session / daily tracking ---
         private double   dailyRealizedPnL;
         private double   pnlBaselineOffset;
         private int      processedTradeCount;
@@ -96,7 +96,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool     dailyProfitHit;
         private DateTime sessionDate;
 
-        // â”€â”€â”€ Hidden SL/TP state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- Hidden SL/TP state ---
         private double hiddenStopPrice;
         private double hiddenTargetPrice;
         private bool   stopsArmed;
@@ -106,14 +106,14 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int    defaultContracts;
         private int    defaultJumpSlPercent;
 
-        // â”€â”€â”€ Position tracking â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- Position tracking ---
         private int    openDcaCount;
         private double averageEntryPrice;
         private double totalContracts;
         private int    tradeSequence;
         private readonly List<string> activeEntrySignals = new List<string>();
 
-        // â”€â”€â”€ Manual VWAP (tick-safe) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- Manual VWAP (tick-safe) ---
         private double vwapCumTPV;
         private double vwapCumVol;
         private double vwapValue;
@@ -121,47 +121,47 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double currBarTPV;
         private double currBarVol;
 
-        // â”€â”€â”€ Thread-safe button flags â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        private bool     pendingLong;
-        private bool     pendingShort;
-        private bool     pendingLongLimit;
-        private bool     pendingShortLimit;
-        private bool     pendingBuyAsk;
-        private bool     pendingSellBid;
-        private bool     pendingFlatten;
-        private bool     pendingCloseTrade;
-        private bool     pendingCloseOne;
-        private bool     pendingJumpSL;
-        private bool     pendingRearm;
-        private bool     pendingExit;
-        private bool     pendingLimitFlatten;
-        private bool     pendingEmergencyKill;
+        // --- Thread-safe button flags ---
+        private volatile bool     pendingLong;
+        private volatile bool     pendingShort;
+        private volatile bool     pendingLongLimit;
+        private volatile bool     pendingShortLimit;
+        private volatile bool     pendingBuyAsk;
+        private volatile bool     pendingSellBid;
+        private volatile bool     pendingFlatten;
+        private volatile bool     pendingCloseTrade;
+        private volatile bool     pendingCloseOne;
+        private volatile bool     pendingJumpSL;
+        private volatile bool     pendingRearm;
+        private volatile bool     pendingExit;
+        private volatile bool     pendingLimitFlatten;
+        private volatile bool     pendingEmergencyKill;
         private int      pendingExitTicks;
         private int      flatSyncGraceTicks;
         private DateTime lastEntryWallTime;
         private bool     firstBarSeen;
         private bool     emergencyKillActive;
         private DateTime aggressiveLimitSubmitTime;
-        private bool     pendingRemoveTrailDraw;
+        private volatile bool     pendingRemoveTrailDraw;
 
-        // â”€â”€â”€ Dashboard build retry â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- Dashboard build retry ---
         private int  dashBuildRetryCount;
         private int  dashBuildTickCounter;
         private DateTime lastDashboardTime = DateTime.MinValue;
 
-        // â”€â”€â”€ Trail distance cache (per bar) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- Trail distance cache (per bar) ---
         private double cachedTrailDistance;
         private int    cachedTrailBar = -1;
 
-        // â”€â”€â”€ Position-flat flag from OnPositionUpdate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        private bool pendingPositionFlat;
+        // --- Position-flat flag from OnPositionUpdate ---
+        private volatile bool pendingPositionFlat;
 
-        // â”€â”€â”€ ORB state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- ORB state ---
         private double orbHigh;
         private double orbLow;
         private bool   orbSet;
 
-        // â”€â”€â”€ Signal confidence tracking â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- Signal confidence tracking ---
         private double lastBullConfidence;
         private double lastBearConfidence;
         private static readonly string[] StrategyNames = new string[]
@@ -173,16 +173,16 @@ namespace NinjaTrader.NinjaScript.Strategies
             "\u2605 Auto Select"
         };
 
-        // â”€â”€â”€ Auto Select stability â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- Auto Select stability ---
         private int    autoStratConsecutiveBars;
         private int    lastBestAutoStrategy;
         private string lastAutoStrategyUsed;
 
-        // â”€â”€â”€ Consecutive loss cooldown â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- Consecutive loss cooldown ---
         private int      consecutiveLosses;
         private DateTime lastLossTime;
 
-        // â”€â”€â”€ On-chart dashboard elements â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- On-chart dashboard elements ---
         private Grid      dashboardPanel;
         private Button    btnBuyMkt;
         private Button    btnSellMkt;
@@ -222,7 +222,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private StackPanel stratPanel;
         private TextBlock  lblStratName;
 
-        // â”€â”€â”€ Dashboard placement & drag/resize â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- Dashboard placement & drag/resize ---
         private int            bestAutoStrategy;
         private bool           dashboardAttached;
         private Panel          dashboardHostPanel;
@@ -238,7 +238,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private Border         dashTitleBar;
         private Border         dashResizeGrip;
 
-        // â”€â”€â”€ Adaptive Trailing Stop â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- Adaptive Trailing Stop ---
         private bool      trailEnabled;
         private int       trailActivationPoints;
         private int       trailMinPoints;
@@ -253,14 +253,56 @@ namespace NinjaTrader.NinjaScript.Strategies
         private Button    btnTrailToggle;
         private int       volatilitySpikeGuardBars;
 
-        // â”€â”€â”€ Post-Entry Trap Detector â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- Post-Entry Trap Detector ---
         private bool   trapDetectorEnabled;
         private double trapScore;
         private bool   trapDetected;
         private int    trapBarsInTrade;
         private Button btnTrapToggle;
+        private double prevTrapScore;
+        private int    trapSuspendBars;
+        private int    trapSuspendBarsLeft;
 
-        // â”€â”€â”€ Volume Profile â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- Smart Trail ---
+        private bool      smartTrailEnabled;
+        private bool      smartTrailPaused;
+        private double    smartTrailFrozenPrice;
+        private int       smartTrailPauseBars;
+        private int       smartTrailMaxPauseBars;
+        private Button    btnSmartTrailToggle;
+        private TextBlock lblSmartTrailInfo;
+
+        // --- Smart SL ---
+        private bool      smartSlEnabled;
+        private bool      smartSlBreakevenDone;
+        private bool      smartSlTightenDone;
+        private bool      smartSlTightened;
+        private bool      smartSlLoosened;
+        private double    entryConfidenceScore;
+        private double    smartSlEntryConfidence;
+        private double    originalSlOffset;
+        private int       smartSlEvalBars;
+        private int       smartSlBePct;
+        private Button    btnSmartSlToggle;
+        private TextBlock lblSmartSlInfo;
+
+        // --- Session-Aware Strategy ---
+        private bool      sessionTimeOverrideActive;
+        private string    sessionRegimeName;
+
+        // --- Cached volume average ---
+        private double    cachedAvgVolume;
+        private int       cachedAvgVolumeBar = -1;
+
+        // --- Strategy score display ---
+        private double[]  lastStrategyBullScores;
+        private double[]  lastStrategyBearScores;
+        private double[]  strategyScores;
+
+        // --- Volume Profile recalc optimization ---
+        private int       lastVpRecalcCount;
+
+        // --- Volume Profile ---
         private SortedDictionary<double, double> volumeAtPrice;
         private double pocLevel;
         private double vahLevel;
@@ -276,8 +318,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (State == State.SetDefaults)
             {
-                Description  = "Mm-ATM v2.0 \u2014 Volume Profile + HTF Filter + DCA Overhaul + Full Bug Fixes";
-                Name         = "Mm_ATM_v2";
+                Description  = "Mm-ATM v3.0 \u2014 Volume Profile + HTF Filter + DCA Overhaul + Full Bug Fixes";
+                Name         = "Mm_ATM_v3";
                 Calculate    = Calculate.OnEachTick;
                 EntriesPerDirection          = 4;
                 EntryHandling                = EntryHandling.AllEntries;
@@ -295,12 +337,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 dcaSuggestionPoints   = 50;
                 entryDelaySeconds     = 1;
                 autoMode              = false;
-                autoStrategy          = 0;
+                autoStrategy          = 4;
                 emaPeriodFast         = 9;
                 emaPeriodSlow         = 21;
                 rsiPeriod             = 14;
                 atrPeriod             = 14;
-                minSignalConfidence   = 68.0;
+                minSignalConfidence   = 55.0;
                 slTpAdjustStep        = 5;
                 jumpSlPercent         = 50;
                 maxTradesPerDay       = 999;
@@ -328,6 +370,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 htfEmaPeriod          = 45;
                 useVolumeProfileFilters = true;
                 lossCooldownSeconds   = 120;
+
+                smartTrailEnabled     = true;
+                smartTrailMaxPauseBars = 8;
+                smartSlEnabled        = false;
+                smartSlBePct          = 40;
             }
             else if (State == State.Configure)
             {
@@ -363,7 +410,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 defaultContracts = contracts;
                 defaultJumpSlPercent = jumpSlPercent;
 
-                // Full state init â€” needed for backtest / Strategy Analyzer
+                // Full state init  - needed for backtest / Strategy Analyzer
                 // (these also reset in State.Realtime for live/playback transition)
                 dailyTradeCount        = 0;
                 processedTradeCount    = 0;
@@ -411,6 +458,26 @@ namespace NinjaTrader.NinjaScript.Strategies
                 totalSessionVolume     = 0;
                 firstBarSeen           = false;
                 pnlBaselineOffset      = 0;
+                smartTrailPaused       = false;
+                smartTrailFrozenPrice  = 0;
+                smartTrailPauseBars    = 0;
+                smartSlBreakevenDone   = false;
+                smartSlTightenDone     = false;
+                smartSlLoosened        = false;
+                entryConfidenceScore   = 0;
+                originalSlOffset       = 0;
+                sessionTimeOverrideActive = false;
+                sessionRegimeName      = "";
+                prevTrapScore          = 0;
+                trapSuspendBars        = 0;
+                trapSuspendBarsLeft    = 0;
+                lastVpRecalcCount      = 0;
+                smartSlTightened       = false;
+                smartSlEntryConfidence  = 0;
+                smartSlEvalBars        = 0;
+                lastStrategyBullScores = new double[4];
+                lastStrategyBearScores = new double[4];
+                strategyScores         = new double[4];
             }
             else if (State == State.Realtime)
             {
@@ -489,6 +556,27 @@ namespace NinjaTrader.NinjaScript.Strategies
                 dashBuildRetryCount    = 0;
                 dashBuildTickCounter   = 0;
 
+                smartTrailPaused       = false;
+                smartTrailFrozenPrice  = 0;
+                smartTrailPauseBars    = 0;
+                smartSlBreakevenDone   = false;
+                smartSlTightenDone     = false;
+                smartSlLoosened        = false;
+                entryConfidenceScore   = 0;
+                originalSlOffset       = 0;
+                sessionTimeOverrideActive = false;
+                sessionRegimeName      = "";
+                prevTrapScore          = 0;
+                trapSuspendBars        = 0;
+                trapSuspendBarsLeft    = 0;
+                lastVpRecalcCount      = 0;
+                smartSlTightened       = false;
+                smartSlEntryConfidence  = 0;
+                smartSlEvalBars        = 0;
+                lastStrategyBullScores = new double[4];
+                lastStrategyBearScores = new double[4];
+                strategyScores         = new double[4];
+
                 slPoints      = defaultSlPoints > 0 ? defaultSlPoints : slPoints;
                 tpPoints      = defaultTpPoints > 0 ? defaultTpPoints : tpPoints;
                 contracts     = defaultContracts > 0 ? defaultContracts : contracts;
@@ -514,12 +602,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                     activeEntrySignals.Clear();
                     for (int i = 1; i <= openDcaCount; i++) activeEntrySignals.Add("Entry_" + i);
                     ArmHiddenStops();
-                    Print("[Mm-ATM v2] State.Realtime: POSITION RECOVERY " + Position.MarketPosition
+                    Print("[Mm-ATM v3] State.Realtime: POSITION RECOVERY " + Position.MarketPosition
                         + " qty=" + totalContracts + " avgEntry=" + averageEntryPrice.ToString("F2")
                         + " SL=" + hiddenStopPrice.ToString("F2") + " TP=" + hiddenTargetPrice.ToString("F2"));
                 }
 
-                Print("[Mm-ATM v2] State.Realtime: FULL RESET \u2014 pnlBaseline=" + pnlBaselineOffset.ToString("C2")
+                Print("[Mm-ATM v3] State.Realtime: FULL RESET \u2014 pnlBaseline=" + pnlBaselineOffset.ToString("C2")
                     + " SL=" + slPoints + " TP=" + tpPoints + " contracts=" + contracts);
             }
             else if (State == State.Terminated)
@@ -536,7 +624,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (CurrentBar < BarsRequiredToTrade) return;
 
-            // â•â•â•â•â• CRITICAL PATH â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            // ===== CRITICAL PATH =====
             if ((State == State.Realtime || State == State.Historical) && pendingEmergencyKill)
             {
                 pendingEmergencyKill = false;
@@ -569,11 +657,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 pendingExitTicks++;
                 if (pendingExitTicks >= STALE_EXIT_TICKS && Position.MarketPosition != MarketPosition.Flat)
                 {
-                    Print("[Mm-ATM v2] " + Time[0] + " | STALE EXIT (" + pendingExitTicks + " ticks) â€” flatten");
+                    Print("[Mm-ATM v3] " + Time[0] + " | STALE EXIT (" + pendingExitTicks + " ticks) - flatten");
                     if (State == State.Realtime)
                     {
                         try { Account.Flatten(new[] { Instrument }); }
-                        catch (Exception ex) { Print("[Mm-ATM v2] Stale-exit flatten failed: " + ex.Message); ManagedExitAll(); }
+                        catch (Exception ex) { Print("[Mm-ATM v3] Stale-exit flatten failed: " + ex.Message); ManagedExitAll(); }
                     }
                     else
                     {
@@ -592,7 +680,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 && ((State == State.Realtime ? DateTime.Now : Time[0]) - aggressiveLimitSubmitTime).TotalSeconds >= AGGRESSIVE_LIMIT_TIMEOUT_SEC
                 && Position.MarketPosition == MarketPosition.Flat && openTradeDirection != 0)
             {
-                Print("[Mm-ATM v2] " + Time[0] + " | ASK/BID order expired \u2014 cancelling");
+                Print("[Mm-ATM v3] " + Time[0] + " | ASK/BID order expired \u2014 cancelling");
                 CancelPendingOrders();
                 ResetPositionState();
                 aggressiveLimitSubmitTime = DateTime.MinValue;
@@ -625,6 +713,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (trapDetectorEnabled && IsFirstTickOfBar && !pendingExit && Position.MarketPosition != MarketPosition.Flat)
                 MonitorPostEntryTrap();
 
+            // Smart SL monitor  - once per bar when in position
+            if (smartSlEnabled && IsFirstTickOfBar && !pendingExit && Position.MarketPosition != MarketPosition.Flat)
+                MonitorSmartSL();
+
             // Live daily P&L limit check (realized + unrealized) \u2014 every tick while in position
             if (!dailyLimitHit && !dailyProfitHit && Position.MarketPosition != MarketPosition.Flat && averageEntryPrice > 0)
             {
@@ -638,7 +730,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (livePnL <= -maxDailyLossDollars)
                 {
                     dailyLimitHit = true;
-                    Print("[Mm-ATM v2] *** LIVE DAILY LOSS LIMIT: realized=" + dailyRealizedPnL.ToString("C0")
+                    Print("[Mm-ATM v3] *** LIVE DAILY LOSS LIMIT: realized=" + dailyRealizedPnL.ToString("C0")
                         + " unrealized=" + unrealPnL.ToString("C0") + " total=" + livePnL.ToString("C0") + " ***");
                     ExecuteFlatten();
                     UpdateDashboardStatus("DAILY LOSS LIMIT \u2014 closing all (" + livePnL.ToString("C0") + ")", Brushes.OrangeRed);
@@ -646,14 +738,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                 else if (livePnL >= maxDailyProfitDollars)
                 {
                     dailyProfitHit = true;
-                    Print("[Mm-ATM v2] *** LIVE DAILY PROFIT TARGET: realized=" + dailyRealizedPnL.ToString("C0")
+                    Print("[Mm-ATM v3] *** LIVE DAILY PROFIT TARGET: realized=" + dailyRealizedPnL.ToString("C0")
                         + " unrealized=" + unrealPnL.ToString("C0") + " total=" + livePnL.ToString("C0") + " ***");
                     ExecuteFlatten();
                     UpdateDashboardStatus("DAILY PROFIT TARGET \u2014 closing all (" + livePnL.ToString("C0") + ")", Brushes.Gold);
                 }
             }
 
-            // â•â•â•â•â• SESSION HOUSEKEEPING â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            // ===== SESSION HOUSEKEEPING =====
             if (!firstBarSeen)
             {
                 firstBarSeen = true;
@@ -672,7 +764,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (IsFirstTickOfBar)
                 UpdateVolumeProfile();
 
-            // Dashboard build with retry â€” attempt when ChartControl available (Realtime or Playback)
+            // Dashboard build with retry  - attempt when ChartControl available (Realtime or Playback)
             if (ChartControl != null && !dashboardAttached && dashBuildRetryCount < 10)
             {
                 if (dashBuildRetryCount == 0)
@@ -695,20 +787,20 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (currentTime >= flattenTime && !flattenFired && Position.MarketPosition != MarketPosition.Flat)
                 {
                     flattenFired = true;
-                    Print("[Mm-ATM v2] " + Time[0] + " | AUTO-FLATTEN at " + Time[0].ToString("HH:mm:ss"));
+                    Print("[Mm-ATM v3] " + Time[0] + " | AUTO-FLATTEN at " + Time[0].ToString("HH:mm:ss"));
                     ExecuteFlatten();
                 }
 
                 if (currentTime >= 165500 && currentTime < 180000 && Position.MarketPosition != MarketPosition.Flat)
                 {
-                    Print("[Mm-ATM v2] " + Time[0] + " | CME SESSION CLOSE FLATTEN");
+                    Print("[Mm-ATM v3] " + Time[0] + " | CME SESSION CLOSE FLATTEN");
                     ExecuteFlatten();
                 }
 
                 if (pendingLimitFlatten && Position.MarketPosition != MarketPosition.Flat)
                 {
                     pendingLimitFlatten = false;
-                    Print("[Mm-ATM v2] " + Time[0] + " | DEFERRED FLATTEN from OnBarUpdate");
+                    Print("[Mm-ATM v3] " + Time[0] + " | DEFERRED FLATTEN from OnBarUpdate");
                     ExecuteFlatten();
                 }
                 else if (pendingLimitFlatten)
@@ -722,7 +814,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     UpdateDashboardStatus("DAILY PROFIT TARGET \u2014 NO TRADES", Brushes.Gold);
             }
 
-            // Calculate signals â€” only needed for entries; skip entirely when in position
+            // Calculate signals  - only needed for entries; skip entirely when in position
             bool isFlat = Position.MarketPosition == MarketPosition.Flat;
             if (isFlat && IsFirstTickOfBar)
             {
@@ -761,7 +853,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     else if (maxTradesPerDay > 0 && dailyTradeCount >= maxTradesPerDay) reason = "maxTradesPerDay";
                     else if (!insideTradingHours) reason = "outsideHours";
                     else reason = "lowConf(Bull=" + lastBullConfidence.ToString("F0") + "% Bear=" + lastBearConfidence.ToString("F0") + "%)";
-                    Print("[Mm-ATM v2] " + Time[0] + " | AUTO-SCAN: no entry \u2014 " + reason);
+                    Print("[Mm-ATM v3] " + Time[0] + " | AUTO-SCAN: no entry \u2014 " + reason);
                 }
             }
 
@@ -800,7 +892,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
-        // Consolidated position state sync â€” called once per tick
+        // Consolidated position state sync  - called once per tick
         private void SyncPositionState()
         {
             // Handle OnPositionUpdate flat notification (single reset point)
@@ -809,7 +901,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 pendingPositionFlat = false;
                 if (Position.MarketPosition == MarketPosition.Flat)
                 {
-                    Print("[Mm-ATM v2] " + Time[0] + " | Position sync: OnPositionUpdate FLAT");
+                    Print("[Mm-ATM v3] " + Time[0] + " | Position sync: OnPositionUpdate FLAT");
                     ResetPositionState();
                     flatSyncGraceTicks = 0;
                     return;
@@ -820,7 +912,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 if (pendingExit)
                 {
-                    Print("[Mm-ATM v2] " + Time[0] + " | Position sync: exit confirmed FLAT");
+                    Print("[Mm-ATM v3] " + Time[0] + " | Position sync: exit confirmed FLAT");
                     ResetPositionState();
                     flatSyncGraceTicks = 0;
                 }
@@ -829,7 +921,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     flatSyncGraceTicks++;
                     if (flatSyncGraceTicks > FLAT_SYNC_MAX_TICKS)
                     {
-                        Print("[Mm-ATM v2] " + Time[0] + " | SAFETY: flat after " + flatSyncGraceTicks + " ticks â€” resetting");
+                        Print("[Mm-ATM v3] " + Time[0] + " | SAFETY: flat after " + flatSyncGraceTicks + " ticks - resetting");
                         ResetPositionState();
                         flatSyncGraceTicks = 0;
                     }
@@ -891,7 +983,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 if (desync)
                 {
-                    Print("[Mm-ATM v2] " + Time[0] + " | SYNC RECOVERY: " + Position.MarketPosition
+                    Print("[Mm-ATM v3] " + Time[0] + " | SYNC RECOVERY: " + Position.MarketPosition
                         + " qty=" + totalContracts + " avgEntry=" + averageEntryPrice.ToString("F2")
                         + " stops=" + stopsArmed + " SL=" + hiddenStopPrice.ToString("F2"));
                 }
@@ -906,36 +998,48 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (dailyLimitHit || emergencyKillActive) return;
 
-            double price = Close[0];
+            // Use bid/ask in Realtime for more accurate stop triggers
+            double priceLong, priceShort;
+            if (State == State.Realtime)
+            {
+                priceLong = GetCurrentBid(0);   // Long SL/TP triggers at bid
+                priceShort = GetCurrentAsk(0);  // Short SL/TP triggers at ask
+            }
+            else
+            {
+                priceLong = Close[0];
+                priceShort = Close[0];
+            }
+
             int sigCount = activeEntrySignals.Count;
             if (sigCount == 0) return;
 
             if (openTradeDirection == 1)
             {
-                if (price <= hiddenStopPrice)
+                if (priceLong <= hiddenStopPrice)
                 {
-                    Print("[Mm-ATM v2] " + Time[0] + " | HIDDEN SL LONG hit @ " + price.ToString("F2"));
+                    Print("[Mm-ATM v3] " + Time[0] + " | HIDDEN SL LONG hit @ " + priceLong.ToString("F2"));
                     for (int i = 0; i < sigCount; i++) ExitLong("Close", activeEntrySignals[i]);
                     stopsArmed = false; pendingExit = true;
                 }
-                else if (price >= hiddenTargetPrice)
+                else if (priceLong >= hiddenTargetPrice)
                 {
-                    Print("[Mm-ATM v2] " + Time[0] + " | HIDDEN TP LONG hit @ " + price.ToString("F2"));
+                    Print("[Mm-ATM v3] " + Time[0] + " | HIDDEN TP LONG hit @ " + priceLong.ToString("F2"));
                     for (int i = 0; i < sigCount; i++) ExitLong("Close", activeEntrySignals[i]);
                     stopsArmed = false; pendingExit = true;
                 }
             }
             else if (openTradeDirection == -1)
             {
-                if (price >= hiddenStopPrice)
+                if (priceShort >= hiddenStopPrice)
                 {
-                    Print("[Mm-ATM v2] " + Time[0] + " | HIDDEN SL SHORT hit @ " + price.ToString("F2"));
+                    Print("[Mm-ATM v3] " + Time[0] + " | HIDDEN SL SHORT hit @ " + priceShort.ToString("F2"));
                     for (int i = 0; i < sigCount; i++) ExitShort("Close", activeEntrySignals[i]);
                     stopsArmed = false; pendingExit = true;
                 }
-                else if (price <= hiddenTargetPrice)
+                else if (priceShort <= hiddenTargetPrice)
                 {
-                    Print("[Mm-ATM v2] " + Time[0] + " | HIDDEN TP SHORT hit @ " + price.ToString("F2"));
+                    Print("[Mm-ATM v3] " + Time[0] + " | HIDDEN TP SHORT hit @ " + priceShort.ToString("F2"));
                     for (int i = 0; i < sigCount; i++) ExitShort("Close", activeEntrySignals[i]);
                     stopsArmed = false; pendingExit = true;
                 }
@@ -954,7 +1058,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                     return;
             }
 
-            double price = Close[0];
+            // Use bid/ask in Realtime for more accurate trail triggers
+            double price;
+            if (State == State.Realtime)
+                price = openTradeDirection == 1 ? GetCurrentBid(0) : GetCurrentAsk(0);
+            else
+                price = Close[0];
+
             double profitPoints = 0;
             if (openTradeDirection == 1)
                 profitPoints = (price - averageEntryPrice) / (TickSize * NQ_TICKS_PER_POINT);
@@ -964,9 +1074,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (profitPoints > trailMaxProfitPts)
                 trailMaxProfitPts = profitPoints;
 
+            // ATR-relative activation: activate at larger of user-set or 40% of ATR in points
+            double atrPtsNow = indAtr[0] / (TickSize * NQ_TICKS_PER_POINT);
+            double dynamicActivation = Math.Max(trailActivationPoints, atrPtsNow * 0.4);
+
             if (!trailActive)
             {
-                if (profitPoints >= trailActivationPoints)
+                if (profitPoints >= dynamicActivation)
                 {
                     trailActive = true;
                     trailTierName = "Active";
@@ -974,16 +1088,42 @@ namespace NinjaTrader.NinjaScript.Strategies
                     double distOff  = initDist * NQ_TICKS_PER_POINT * TickSize;
                     trailPrice = openTradeDirection == 1 ? price - distOff : price + distOff;
                     trailPrice = Math.Round(trailPrice / TickSize) * TickSize;
-                    Print("[Mm-ATM v2] " + Time[0] + " | TRAIL ACTIVATED profit=" + profitPoints.ToString("F1")
-                        + "pts dist=" + initDist.ToString("F1") + " trail=" + trailPrice.ToString("F2"));
+                    Print("[Mm-ATM v3] " + Time[0] + " | TRAIL ACTIVATED profit=" + profitPoints.ToString("F1")
+                        + "pts dist=" + initDist.ToString("F1") + " trail=" + trailPrice.ToString("F2")
+                        + " dynAct=" + dynamicActivation.ToString("F1"));
                 }
                 return;
             }
 
+            // Smart Trail pause/resume evaluation
+            if (smartTrailEnabled && trailActive)
+            {
+                EvaluateSmartTrailPause(price, profitPoints, dynamicActivation);
+                if (smartTrailPaused)
+                {
+                    // Trail is frozen  - but still check if price breached frozen trail (must exit)
+                    if (openTradeDirection == 1 && price <= smartTrailFrozenPrice)
+                    {
+                        Print("[Mm-ATM v3] " + Time[0] + " | FROZEN TRAIL BREACHED LONG @ " + price.ToString("F2"));
+                        int sc = activeEntrySignals.Count;
+                        for (int i = 0; i < sc; i++) ExitLong("Close", activeEntrySignals[i]);
+                        stopsArmed = false; pendingExit = true;
+                    }
+                    else if (openTradeDirection == -1 && price >= smartTrailFrozenPrice)
+                    {
+                        Print("[Mm-ATM v3] " + Time[0] + " | FROZEN TRAIL BREACHED SHORT @ " + price.ToString("F2"));
+                        int sc = activeEntrySignals.Count;
+                        for (int i = 0; i < sc; i++) ExitShort("Close", activeEntrySignals[i]);
+                        stopsArmed = false; pendingExit = true;
+                    }
+                    return; // Don't move trail while paused
+                }
+            }
+
             double trailDist = GetCachedTrailDistance();
 
-            // Trap-tightened trail: if trap detected, reduce distance by 40%
-            if (trapDetectorEnabled && trapDetected)
+            // Trap-tightened trail: if trap detected AND not suspended by stop-hunt, reduce distance by 40%
+            if (trapDetectorEnabled && trapDetected && trapSuspendBarsLeft <= 0)
                 trailDist *= 0.60;
 
             double trailOff = trailDist * NQ_TICKS_PER_POINT * TickSize;
@@ -991,21 +1131,23 @@ namespace NinjaTrader.NinjaScript.Strategies
             int sigCount = activeEntrySignals.Count;
             if (sigCount == 0) return;
 
-            // Profit tier floors
+            // Profit tier floors (rebalanced per Issue 5D)
             double tierFloor = 0;
             double tickPt = TickSize * NQ_TICKS_PER_POINT;
 
-            if (trailMaxProfitPts >= trailActivationPoints * 4)
+            if (trailMaxProfitPts >= dynamicActivation * 4)
             {
-                tierFloor = 0.55 * trailMaxProfitPts * tickPt;
+                // T3-Runner: 50% when trending, 45% otherwise
+                double t3Pct = trailTrendScore > 0.65 ? 0.50 : 0.45;
+                tierFloor = t3Pct * trailMaxProfitPts * tickPt;
                 trailTierName = "T3-Runner";
             }
-            else if (trailMaxProfitPts >= trailActivationPoints * 2.5)
+            else if (trailMaxProfitPts >= dynamicActivation * 2.5)
             {
-                tierFloor = 0.45 * trailMaxProfitPts * tickPt;
+                tierFloor = 0.40 * trailMaxProfitPts * tickPt; // was 0.45
                 trailTierName = "T2-Strong";
             }
-            else if (trailMaxProfitPts >= trailActivationPoints * 2)
+            else if (trailMaxProfitPts >= dynamicActivation * 1.5) // require 1.5x (was 2x) before BE lock
             {
                 tierFloor = TickSize;
                 trailTierName = "T1-BE";
@@ -1015,9 +1157,33 @@ namespace NinjaTrader.NinjaScript.Strategies
                 trailTierName = "Active";
             }
 
+            // Structural trail snap: find nearest structure level in last 5 bars
+            double structuralTrail = 0;
+            if (CurrentBar >= 6)
+            {
+                if (openTradeDirection == 1)
+                {
+                    double nearestLow = double.MaxValue;
+                    for (int i = 1; i <= 5; i++) nearestLow = Math.Min(nearestLow, Low[i]);
+                    structuralTrail = nearestLow - TickSize; // 1 tick below structure
+                }
+                else
+                {
+                    double nearestHigh = double.MinValue;
+                    for (int i = 1; i <= 5; i++) nearestHigh = Math.Max(nearestHigh, High[i]);
+                    structuralTrail = nearestHigh + TickSize; // 1 tick above structure
+                }
+            }
+
             if (openTradeDirection == 1)
             {
                 double newTrail = Math.Round((price - trailOff) / TickSize) * TickSize;
+
+                // Structural snap: use structural level if tighter but still >= trailMinPoints from price
+                if (structuralTrail > 0 && structuralTrail > newTrail
+                    && (price - structuralTrail) / tickPt >= trailMinPoints)
+                    newTrail = structuralTrail;
+
                 if (newTrail > trailPrice) trailPrice = newTrail;
 
                 double floorPrice = Math.Round((averageEntryPrice + tierFloor) / TickSize) * TickSize;
@@ -1025,7 +1191,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 if (price <= trailPrice)
                 {
-                    Print("[Mm-ATM v2] " + Time[0] + " | TRAIL HIT LONG @ " + price.ToString("F2")
+                    Print("[Mm-ATM v3] " + Time[0] + " | TRAIL HIT LONG @ " + price.ToString("F2")
                         + " trail=" + trailPrice.ToString("F2") + " tier=" + trailTierName);
                     for (int i = 0; i < sigCount; i++) ExitLong("Close", activeEntrySignals[i]);
                     stopsArmed = false; pendingExit = true;
@@ -1034,6 +1200,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             else if (openTradeDirection == -1)
             {
                 double newTrail = Math.Round((price + trailOff) / TickSize) * TickSize;
+
+                // Structural snap: use structural level if tighter but still >= trailMinPoints from price
+                if (structuralTrail > 0 && structuralTrail < newTrail
+                    && (structuralTrail - price) / tickPt >= trailMinPoints)
+                    newTrail = structuralTrail;
+
                 if (newTrail < trailPrice) trailPrice = newTrail;
 
                 double floorPrice = Math.Round((averageEntryPrice - tierFloor) / TickSize) * TickSize;
@@ -1041,10 +1213,182 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 if (price >= trailPrice)
                 {
-                    Print("[Mm-ATM v2] " + Time[0] + " | TRAIL HIT SHORT @ " + price.ToString("F2")
+                    Print("[Mm-ATM v3] " + Time[0] + " | TRAIL HIT SHORT @ " + price.ToString("F2")
                         + " trail=" + trailPrice.ToString("F2") + " tier=" + trailTierName);
                     for (int i = 0; i < sigCount; i++) ExitShort("Close", activeEntrySignals[i]);
                     stopsArmed = false; pendingExit = true;
+                }
+            }
+        }
+
+        /// <summary>Smart Trail pause/resume evaluation</summary>
+        private void EvaluateSmartTrailPause(double price, double profitPoints, double dynActivation)
+        {
+            if (smartTrailPaused)
+            {
+                smartTrailPauseBars++;
+
+                // Resume conditions (any one)
+                bool resumed = false;
+                // 1. Safety timeout
+                if (smartTrailPauseBars >= smartTrailMaxPauseBars)
+                    resumed = true;
+
+                // 2. Momentum resumes: price making new bar highs/lows for 2 consecutive bars
+                if (!resumed && CurrentBar >= 3)
+                {
+                    if (openTradeDirection == 1 && Close[0] > High[1] && Close[1] > High[2])
+                        resumed = true;
+                    else if (openTradeDirection == -1 && Close[0] < Low[1] && Close[1] < Low[2])
+                        resumed = true;
+                }
+
+                // 3. Stop hunt complete: reversal bar after sweep
+                if (!resumed && CurrentBar >= 2)
+                {
+                    if (openTradeDirection == 1 && Low[0] > Low[1] && Close[0] > Open[0])
+                        resumed = true;
+                    else if (openTradeDirection == -1 && High[0] < High[1] && Close[0] < Open[0])
+                        resumed = true;
+                }
+
+                if (resumed)
+                {
+                    smartTrailPaused = false;
+                    smartTrailPauseBars = 0;
+                    trailPrice = smartTrailFrozenPrice; // restore frozen trail
+                    Print("[Mm-ATM v3] " + Time[0] + " | SMART TRAIL RESUMED after " + smartTrailPauseBars + " bars");
+                }
+                return;
+            }
+
+            // Pause conditions (all must be true)
+            if (trailMaxProfitPts < dynActivation * 2) return; // need at least 2x activation in profit
+            if (CurrentBar < 3) return;
+
+            double atr = indAtr[0];
+            if (atr <= 0) return;
+
+            // Adverse pullback: price pulling back at least 0.3xATR from recent high
+            bool pullbackDetected = false;
+            if (openTradeDirection == 1)
+                pullbackDetected = (High[1] - Close[0]) > atr * 0.3 && Close[0] < High[1];
+            else
+                pullbackDetected = (Close[0] - Low[1]) > atr * 0.3 && Close[0] > Low[1];
+
+            if (!pullbackDetected) return;
+
+            // EMA still agrees with trade direction (trend intact)
+            if (openTradeDirection == 1 && indEmaFast[0] <= indEmaSlow[0]) return;
+            if (openTradeDirection == -1 && indEmaFast[0] >= indEmaSlow[0]) return;
+
+            // Low volume pullback (not genuine reversal)
+            double avgVol = GetCachedAvgVolume();
+            if (avgVol > 0 && Volume[0] > avgVol * 1.5) return; // high volume = real move
+
+            // Not near major S/R (within 1xATR of 20-bar swing)
+            if (CurrentBar >= 21)
+            {
+                if (openTradeDirection == 1)
+                {
+                    double swLo = MIN(Low, 20)[1];
+                    if (Math.Abs(price - swLo) < atr) return; // near major support, don't pause
+                }
+                else
+                {
+                    double swHi = MAX(High, 20)[1];
+                    if (Math.Abs(price - swHi) < atr) return; // near major resistance, don't pause
+                }
+            }
+
+            // All conditions met  - PAUSE
+            smartTrailPaused = true;
+            smartTrailPauseBars = 0;
+            smartTrailFrozenPrice = trailPrice;
+            Print("[Mm-ATM v3] " + Time[0] + " | SMART TRAIL PAUSED (MM sweep suspected) frozen=" + trailPrice.ToString("F2"));
+        }
+
+        /// <summary>Smart SL: dynamically adjust hidden stop based on profit, traps, and confidence</summary>
+        private void MonitorSmartSL()
+        {
+            if (!smartSlEnabled || !stopsArmed || openTradeDirection == 0) return;
+            if (averageEntryPrice <= 0) return;
+
+            double price = Close[0];
+            double tickPt = TickSize * NQ_TICKS_PER_POINT;
+            double profitPts = openTradeDirection == 1
+                ? (price - averageEntryPrice) / tickPt
+                : (averageEntryPrice - price) / tickPt;
+
+            smartSlEvalBars++;
+
+            // A) Break-even lock: when profit >= smartSlBePct% of TP
+            double bePctThreshold = tpPoints * (smartSlBePct / 100.0);
+            if (!smartSlBreakevenDone && profitPts >= bePctThreshold)
+            {
+                if (openTradeDirection == 1 && hiddenStopPrice < averageEntryPrice)
+                {
+                    hiddenStopPrice = averageEntryPrice + TickSize;
+                    smartSlBreakevenDone = true;
+                    Print("[Mm-ATM v3] " + Time[0] + " | SMART SL: BREAK-EVEN locked @ " + hiddenStopPrice.ToString("F2"));
+                }
+                else if (openTradeDirection == -1 && hiddenStopPrice > averageEntryPrice)
+                {
+                    hiddenStopPrice = averageEntryPrice - TickSize;
+                    smartSlBreakevenDone = true;
+                    Print("[Mm-ATM v3] " + Time[0] + " | SMART SL: BREAK-EVEN locked @ " + hiddenStopPrice.ToString("F2"));
+                }
+            }
+
+            // B) Tighten on high trap score (if still in profit and not yet at BE)
+            if (!smartSlTightened && trapDetected && trapScore >= 65 && profitPts > 0)
+            {
+                double originalSlDist = slPoints * tickPt;
+                if (openTradeDirection == 1)
+                {
+                    double tightenedSl = averageEntryPrice - originalSlDist * 0.75;
+                    if (tightenedSl > hiddenStopPrice) // only tighten, never loosen here
+                    {
+                        hiddenStopPrice = Math.Round(tightenedSl / TickSize) * TickSize;
+                        smartSlTightened = true;
+                        Print("[Mm-ATM v3] " + Time[0] + " | SMART SL: TIGHTENED (trap) @ " + hiddenStopPrice.ToString("F2"));
+                    }
+                }
+                else
+                {
+                    double tightenedSl = averageEntryPrice + originalSlDist * 0.75;
+                    if (tightenedSl < hiddenStopPrice)
+                    {
+                        hiddenStopPrice = Math.Round(tightenedSl / TickSize) * TickSize;
+                        smartSlTightened = true;
+                        Print("[Mm-ATM v3] " + Time[0] + " | SMART SL: TIGHTENED (trap) @ " + hiddenStopPrice.ToString("F2"));
+                    }
+                }
+            }
+
+            // C) Loosen on high-confidence entry (once per trade, if BE not yet locked)
+            double atr = indAtr[0];
+            if (!smartSlBreakevenDone && !smartSlLoosened && smartSlEntryConfidence >= minSignalConfidence + 15)
+            {
+                double adverseMove = openTradeDirection == 1
+                    ? (averageEntryPrice - price) / tickPt
+                    : (price - averageEntryPrice) / tickPt;
+
+                bool emaAgrees = (openTradeDirection == 1 && indEmaFast[0] > indEmaSlow[0])
+                              || (openTradeDirection == -1 && indEmaFast[0] < indEmaSlow[0]);
+
+                double atrPts = atr / tickPt;
+                if (adverseMove < atrPts * 0.5 && emaAgrees)
+                {
+                    double extendPts = Math.Min(10, slPoints + 30 - slPoints); // cap at slPoints+30
+                    double extendOff = extendPts * tickPt;
+                    if (openTradeDirection == 1)
+                        hiddenStopPrice -= extendOff;
+                    else
+                        hiddenStopPrice += extendOff;
+                    hiddenStopPrice = Math.Round(hiddenStopPrice / TickSize) * TickSize;
+                    smartSlLoosened = true;
+                    Print("[Mm-ATM v3] " + Time[0] + " | SMART SL: EXTENDED (hi conf) @ " + hiddenStopPrice.ToString("F2"));
                 }
             }
         }
@@ -1112,6 +1456,17 @@ namespace NinjaTrader.NinjaScript.Strategies
             return cachedTrailDistance;
         }
 
+        private double GetCachedAvgVolume()
+        {
+            if (cachedAvgVolumeBar == CurrentBar) return cachedAvgVolume;
+            cachedAvgVolumeBar = CurrentBar;
+            double sum = 0;
+            int lb = Math.Min(20, CurrentBar);
+            for (int i = 1; i <= lb; i++) sum += Volume[i];
+            cachedAvgVolume = lb > 0 ? sum / lb : 1;
+            return cachedAvgVolume;
+        }
+
         private double LerpD(double a, double b, double t)
         {
             return a + (b - a) * t;
@@ -1130,22 +1485,19 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ? (averageEntryPrice - price) / (TickSize * NQ_TICKS_PER_POINT)
                 : (price - averageEntryPrice) / (TickSize * NQ_TICKS_PER_POINT);
 
-            trapScore = 0;
+            double newTrapScore = 0;
             double atrPts = atr / (TickSize * NQ_TICKS_PER_POINT);
             if (atrPts > 0 && adverseMove > 0)
             {
                 double moveRatio = adverseMove / atrPts;
-                if (moveRatio > 0.5) trapScore += moveRatio * 30;
+                if (moveRatio > 0.5) newTrapScore += moveRatio * 30;
             }
 
-            if (openTradeDirection == 1 && indEmaFast[0] < indEmaSlow[0]) trapScore += 20;
-            else if (openTradeDirection == -1 && indEmaFast[0] > indEmaSlow[0]) trapScore += 20;
+            if (openTradeDirection == 1 && indEmaFast[0] < indEmaSlow[0]) newTrapScore += 20;
+            else if (openTradeDirection == -1 && indEmaFast[0] > indEmaSlow[0]) newTrapScore += 20;
 
-            double volSum = 0;
-            int vlb = Math.Min(10, CurrentBar - 1);
-            for (int i = 1; i <= vlb; i++) volSum += Volume[i];
-            double volAvg = vlb > 0 ? volSum / vlb : Volume[0];
-            if (volAvg > 0 && Volume[0] > volAvg * 1.5 && adverseMove > 0) trapScore += 15;
+            double volAvg = GetCachedAvgVolume();
+            if (volAvg > 0 && Volume[0] > volAvg * 1.5 && adverseMove > 0) newTrapScore += 15;
 
             double bRange = High[0] - Low[0];
             if (bRange > 0)
@@ -1153,19 +1505,70 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (openTradeDirection == 1)
                 {
                     double uw = High[0] - Math.Max(Close[0], Open[0]);
-                    if (uw / bRange > 0.5) trapScore += 10;
+                    if (uw / bRange > 0.5) newTrapScore += 10;
                 }
                 else
                 {
                     double lw = Math.Min(Close[0], Open[0]) - Low[0];
-                    if (lw / bRange > 0.5) trapScore += 10;
+                    if (lw / bRange > 0.5) newTrapScore += 10;
                 }
             }
+
+            // --- Enhanced Post-Entry Trap Detection ---
+
+            // 1. Stop Hunt Spike Detection: bar makes new extreme vs prior 5 bars,
+            //    then closes back inside = MM sweep, suspend trap trail for a few bars
+            if (trapSuspendBarsLeft > 0)
+                trapSuspendBarsLeft--;
+            if (CurrentBar >= 6)
+            {
+                bool stopHuntDetected = false;
+                if (openTradeDirection == 1)
+                {
+                    double priorLow = double.MaxValue;
+                    for (int i = 1; i <= 5; i++) priorLow = Math.Min(priorLow, Low[i]);
+                    if (Low[0] < priorLow && Close[0] > Low[1])
+                        stopHuntDetected = true;
+                }
+                else
+                {
+                    double priorHigh = double.MinValue;
+                    for (int i = 1; i <= 5; i++) priorHigh = Math.Max(priorHigh, High[i]);
+                    if (High[0] > priorHigh && Close[0] < High[1])
+                        stopHuntDetected = true;
+                }
+                if (stopHuntDetected)
+                {
+                    trapSuspendBarsLeft = 4;
+                    Print("[Mm-ATM v3] " + Time[0] + " | STOP HUNT SPIKE detected - trail relaxed for 4 bars");
+                    UpdateDashboardStatus("MM STOP HUNT - trail relaxed", Brushes.Yellow);
+                }
+            }
+
+            // 2. Volume Absorption: large range bar with high volume but close near midpoint
+            //    = absorption, reduce trap score contribution
+            if (bRange > atr * 0.5 && volAvg > 0 && Volume[0] > volAvg * 2)
+            {
+                double midBar = (High[0] + Low[0]) / 2.0;
+                double closeDistFromMid = Math.Abs(Close[0] - midBar) / bRange;
+                if (closeDistFromMid < 0.2) // close is near midpoint
+                    newTrapScore *= 0.6; // absorption detected, reduce score
+            }
+
+            // 3. Time-based trap decay: blend with previous score, decay if not extending
+            if (trapScore > 0 && newTrapScore < trapScore)
+                trapScore = trapScore * 0.85 + newTrapScore * 0.15; // decay towards new score
+            else
+                trapScore = newTrapScore;
+
+            // If stop hunt suspend is active, suppress trap detection
+            if (trapSuspendBarsLeft > 0)
+                trapScore *= 0.5;
 
             trapBarsInTrade++;
             trapDetected = trapScore >= 50;
             if (trapDetected && trapBarsInTrade >= 3)
-                Print("[Mm-ATM v2] " + Time[0] + " | TRAP DETECTED: score=" + trapScore.ToString("F0") + " bars=" + trapBarsInTrade);
+                Print("[Mm-ATM v3] " + Time[0] + " | TRAP DETECTED: score=" + trapScore.ToString("F0") + " bars=" + trapBarsInTrade);
         }
 
         protected override void OnOrderUpdate(Order order, double limitPrice, double stopPrice,
@@ -1180,14 +1583,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                     averageEntryPrice = averageFillPrice > 0 ? averageFillPrice : order.AverageFillPrice;
                     ArmHiddenStops();
                     aggressiveLimitSubmitTime = DateTime.MinValue;
-                    Print("[Mm-ATM v2] " + Time[0] + " | LONG fill confirmed @ " + averageEntryPrice.ToString("F2"));
+                    Print("[Mm-ATM v3] " + Time[0] + " | LONG fill confirmed @ " + averageEntryPrice.ToString("F2"));
                 }
                 else if (order.IsShort && openTradeDirection == -1 && !stopsArmed)
                 {
                     averageEntryPrice = averageFillPrice > 0 ? averageFillPrice : order.AverageFillPrice;
                     ArmHiddenStops();
                     aggressiveLimitSubmitTime = DateTime.MinValue;
-                    Print("[Mm-ATM v2] " + Time[0] + " | SHORT fill confirmed @ " + averageEntryPrice.ToString("F2"));
+                    Print("[Mm-ATM v3] " + Time[0] + " | SHORT fill confirmed @ " + averageEntryPrice.ToString("F2"));
                 }
             }
             else if (orderState == OrderState.Cancelled || orderState == OrderState.Rejected)
@@ -1197,7 +1600,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     aggressiveLimitSubmitTime = DateTime.MinValue;
                     if (Position.MarketPosition == MarketPosition.Flat && openTradeDirection != 0)
                     {
-                        Print("[Mm-ATM v2] " + Time[0] + " | Order " + orderState + " \u2014 resetting");
+                        Print("[Mm-ATM v3] " + Time[0] + " | Order " + orderState + " \u2014 resetting");
                         ResetPositionState();
                     }
                 }
@@ -1253,46 +1656,120 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // Pre-entry trap filter (Part 4e)
-        private double CalcPreEntryTrapScore(int direction)
+        private double CalcPreEntryTrapScore(int direction, out string trapReason)
         {
+            trapReason = "";
             if (CurrentBar < 5) return 0;
             double score = 0;
             double atr = indAtr[0];
             if (atr <= 0) return 0;
 
+            // 1. Recent move against direction (capped at 30)
             double recentMove = direction == 1
                 ? Close[0] - Math.Min(Low[0], Low[1])
                 : Math.Max(High[0], High[1]) - Close[0];
             double atrPts = atr / (TickSize * NQ_TICKS_PER_POINT);
             if (atrPts > 0)
-                score += Math.Min(40, (recentMove / (TickSize * NQ_TICKS_PER_POINT)) / atrPts * 30);
+            {
+                double moveScore = Math.Min(30, (recentMove / (TickSize * NQ_TICKS_PER_POINT)) / atrPts * 30);
+                score += moveScore;
+                if (moveScore >= 20) trapReason += "ExtMove ";
+            }
 
-            if (direction == 1 && indEmaFast[0] < indEmaSlow[0]) score += 25;
-            if (direction == -1 && indEmaFast[0] > indEmaSlow[0]) score += 25;
+            // 2. EMA conflict
+            if (direction == 1 && indEmaFast[0] < indEmaSlow[0]) { score += 25; trapReason += "EMAconflict "; }
+            if (direction == -1 && indEmaFast[0] > indEmaSlow[0]) { score += 25; trapReason += "EMAconflict "; }
 
+            // 3. Rejection wick
             double barRange = High[0] - Low[0];
             if (barRange > 0)
             {
-                if (direction == 1) { double uw = (High[0] - Math.Max(Close[0], Open[0])) / barRange; if (uw > 0.45) score += 20; }
-                if (direction == -1) { double lw = (Math.Min(Close[0], Open[0]) - Low[0]) / barRange; if (lw > 0.45) score += 20; }
+                if (direction == 1) { double uw = (High[0] - Math.Max(Close[0], Open[0])) / barRange; if (uw > 0.45) { score += 20; trapReason += "Wick "; } }
+                if (direction == -1) { double lw = (Math.Min(Close[0], Open[0]) - Low[0]) / barRange; if (lw > 0.45) { score += 20; trapReason += "Wick "; } }
             }
+
+            // 4. Prior swing proximity (20-bar swing high/low within 2xATR)
+            if (CurrentBar >= 20)
+            {
+                double swingRef = direction == 1 ? double.MinValue : double.MaxValue;
+                for (int i = 1; i <= 20; i++)
+                {
+                    if (direction == 1) swingRef = Math.Max(swingRef, High[i]);
+                    else swingRef = Math.Min(swingRef, Low[i]);
+                }
+                double distToSwing = direction == 1 ? swingRef - Close[0] : Close[0] - swingRef;
+                if (distToSwing >= 0 && distToSwing < atr * 2)
+                { score += 25; trapReason += "SwingProx "; }
+            }
+
+            // 5. Round number proximity (NQ round 100s and 50s)
+            double priceNQ = Close[0];
+            double nearest50 = Math.Round(priceNQ / 50.0) * 50.0;
+            if (Math.Abs(priceNQ - nearest50) < atr * 0.5)
+            { score += 20; trapReason += "RoundNum "; }
+
+            // 6. Opening trap window (9:30-10:00 ET)
+            int ct = ToTime(Time[0]);
+            if (ct >= 93000 && ct < 100000)
+            { score += 20; trapReason += "OpenTrap "; }
+
+            // 7. Overextended from VWAP
+            if (vwapValue > 0 && atr > 0)
+            {
+                double vwapDist = (Close[0] - vwapValue) * direction;
+                if (vwapDist > atr * 2)
+                { score += 20; trapReason += "VWAPext "; }
+            }
+
+            // 8. Consecutive candles same direction
+            int consecCount = 0;
+            for (int i = 0; i < Math.Min(5, CurrentBar); i++)
+            {
+                bool sameDir = direction == 1 ? Close[i] > Open[i] : Close[i] < Open[i];
+                if (sameDir) consecCount++; else break;
+            }
+            if (consecCount >= 4) { score += 25; trapReason += "Consec4+ "; }
+            else if (consecCount >= 3) { score += 15; trapReason += "Consec3 "; }
+
+            // Context adjustment: if HTF trend agrees, raise effective threshold
+            // (implemented by REDUCING score when trend agrees)
+            double htfTrend = CalcHtfTrend();
+            if ((direction == 1 && htfTrend > 0) || (direction == -1 && htfTrend < 0))
+                score *= 0.7; // ~15pt reduction on 60 score = effective threshold 75
+
             return Math.Min(100, score);
+        }
+
+        // Overload for backward compatibility
+        private double CalcPreEntryTrapScore(int direction)
+        {
+            string reason;
+            return CalcPreEntryTrapScore(direction, out reason);
         }
 
         private void ExecuteLongEntry(bool isManual = false)
         {
             if (!CanEnterTrade("BUY MKT", isManual, 1)) return;
 
-            // Pre-entry trap filter: block auto, warn manual
-            if (!isManual)
+            // Pre-entry trap filter: block auto, warn manual (skip for Liquidity Sweep Reversal s=2)
+            int activeStrat = autoStrategy == 4 ? bestAutoStrategy : autoStrategy;
+            if (!isManual && activeStrat != 2)
             {
-                double trapRisk = CalcPreEntryTrapScore(1);
+                string trapReason;
+                double trapRisk = CalcPreEntryTrapScore(1, out trapReason);
                 if (trapRisk >= 60)
                 {
-                    Print("[Mm-ATM v2] " + Time[0] + " | PRE-ENTRY TRAP BLOCKED: score=" + trapRisk.ToString("F0"));
-                    UpdateDashboardStatus("\u26a0 Entry blocked: trap risk " + trapRisk.ToString("F0") + "%", Brushes.Orange);
+                    Print("[Mm-ATM v3] " + Time[0] + " | PRE-ENTRY TRAP BLOCKED: score=" + trapRisk.ToString("F0") + " [" + trapReason.Trim() + "]");
+                    UpdateDashboardStatus("\u26a0 Trap " + trapRisk.ToString("F0") + "% [" + trapReason.Trim() + "]", Brushes.Orange);
                     return;
                 }
+            }
+            else if (isManual)
+            {
+                string trapReason;
+                double trapRisk = CalcPreEntryTrapScore(1, out trapReason);
+                if (trapRisk >= 60)
+                    UpdateDashboardStatus("\u26a0 Trap warn " + trapRisk.ToString("F0") + "% [" + trapReason.Trim() + "]", Brushes.Orange);
             }
 
             if (Position.MarketPosition == MarketPosition.Flat)
@@ -1312,7 +1789,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             totalContracts = newQty;
 
             ArmHiddenStops();
-            Print("[Mm-ATM v2] " + Time[0] + " | LONG #" + openDcaCount + " qty=" + contracts
+            // Store entry confidence for Smart SL
+            smartSlEntryConfidence = lastBullConfidence;
+            smartSlBreakevenDone = false;
+            smartSlTightened = false;
+            smartSlLoosened = false;
+            smartSlEvalBars = 0;
+            Print("[Mm-ATM v3] " + Time[0] + " | LONG #" + openDcaCount + " qty=" + contracts
                 + " @ " + Close[0].ToString("F2") + " AvgEntry=" + averageEntryPrice.ToString("F2"));
             UpdateDashboardStatus("\u25cf LONG #" + openDcaCount + " @ " + Close[0].ToString("F2"), Brushes.LimeGreen);
         }
@@ -1321,15 +1804,25 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (!CanEnterTrade("SELL MKT", isManual, -1)) return;
 
-            if (!isManual)
+            // Pre-entry trap filter: block auto, warn manual (skip for Liquidity Sweep Reversal s=2)
+            int activeStratShort = autoStrategy == 4 ? bestAutoStrategy : autoStrategy;
+            if (!isManual && activeStratShort != 2)
             {
-                double trapRisk = CalcPreEntryTrapScore(-1);
+                string trapReason;
+                double trapRisk = CalcPreEntryTrapScore(-1, out trapReason);
                 if (trapRisk >= 60)
                 {
-                    Print("[Mm-ATM v2] " + Time[0] + " | PRE-ENTRY TRAP BLOCKED: score=" + trapRisk.ToString("F0"));
-                    UpdateDashboardStatus("\u26a0 Entry blocked: trap risk " + trapRisk.ToString("F0") + "%", Brushes.Orange);
+                    Print("[Mm-ATM v3] " + Time[0] + " | PRE-ENTRY TRAP BLOCKED: score=" + trapRisk.ToString("F0") + " [" + trapReason.Trim() + "]");
+                    UpdateDashboardStatus("\u26a0 Trap " + trapRisk.ToString("F0") + "% [" + trapReason.Trim() + "]", Brushes.Orange);
                     return;
                 }
+            }
+            else if (isManual)
+            {
+                string trapReason;
+                double trapRisk = CalcPreEntryTrapScore(-1, out trapReason);
+                if (trapRisk >= 60)
+                    UpdateDashboardStatus("\u26a0 Trap warn " + trapRisk.ToString("F0") + "% [" + trapReason.Trim() + "]", Brushes.Orange);
             }
 
             if (Position.MarketPosition == MarketPosition.Flat)
@@ -1349,7 +1842,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             totalContracts = newQty;
 
             ArmHiddenStops();
-            Print("[Mm-ATM v2] " + Time[0] + " | SHORT #" + openDcaCount + " qty=" + contracts
+            // Store entry confidence for Smart SL
+            smartSlEntryConfidence = lastBearConfidence;
+            smartSlBreakevenDone = false;
+            smartSlTightened = false;
+            smartSlLoosened = false;
+            smartSlEvalBars = 0;
+            Print("[Mm-ATM v3] " + Time[0] + " | SHORT #" + openDcaCount + " qty=" + contracts
                 + " @ " + Close[0].ToString("F2") + " AvgEntry=" + averageEntryPrice.ToString("F2"));
             UpdateDashboardStatus("\u25cf SHORT #" + openDcaCount + " @ " + Close[0].ToString("F2"), Brushes.OrangeRed);
         }
@@ -1372,7 +1871,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             aggressiveLimitSubmitTime = State == State.Realtime ? DateTime.Now : Time[0];
             totalContracts += contracts;
             averageEntryPrice = 0;
-            Print("[Mm-ATM v2] " + Time[0] + " | BUY ASK #" + openDcaCount + " @ ask " + limitPrice.ToString("F2"));
+            Print("[Mm-ATM v3] " + Time[0] + " | BUY ASK #" + openDcaCount + " @ ask " + limitPrice.ToString("F2"));
             UpdateDashboardStatus("\u25cf BUY ASK #" + openDcaCount + " @ " + limitPrice.ToString("F2"), Brushes.LimeGreen);
         }
 
@@ -1394,7 +1893,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             aggressiveLimitSubmitTime = State == State.Realtime ? DateTime.Now : Time[0];
             totalContracts += contracts;
             averageEntryPrice = 0;
-            Print("[Mm-ATM v2] " + Time[0] + " | SELL BID #" + openDcaCount + " @ bid " + limitPrice.ToString("F2"));
+            Print("[Mm-ATM v3] " + Time[0] + " | SELL BID #" + openDcaCount + " @ bid " + limitPrice.ToString("F2"));
             UpdateDashboardStatus("\u25cf SELL BID #" + openDcaCount + " @ " + limitPrice.ToString("F2"), Brushes.OrangeRed);
         }
 
@@ -1417,7 +1916,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             averageEntryPrice = totalContracts > 0 ? (averageEntryPrice * totalContracts + limitPrice * contracts) / newQty : limitPrice;
             totalContracts = newQty;
             ArmHiddenStops();
-            Print("[Mm-ATM v2] " + Time[0] + " | BUY LMT #" + openDcaCount + " @ " + limitPrice.ToString("F2"));
+            Print("[Mm-ATM v3] " + Time[0] + " | BUY LMT #" + openDcaCount + " @ " + limitPrice.ToString("F2"));
             UpdateDashboardStatus("\u25cf BUY LMT #" + openDcaCount + " @ " + limitPrice.ToString("F2"), Brushes.LimeGreen);
         }
 
@@ -1440,7 +1939,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             averageEntryPrice = totalContracts > 0 ? (averageEntryPrice * totalContracts + limitPrice * contracts) / newQty : limitPrice;
             totalContracts = newQty;
             ArmHiddenStops();
-            Print("[Mm-ATM v2] " + Time[0] + " | SELL LMT #" + openDcaCount + " @ " + limitPrice.ToString("F2"));
+            Print("[Mm-ATM v3] " + Time[0] + " | SELL LMT #" + openDcaCount + " @ " + limitPrice.ToString("F2"));
             UpdateDashboardStatus("\u25cf SELL LMT #" + openDcaCount + " @ " + limitPrice.ToString("F2"), Brushes.OrangeRed);
         }
 
@@ -1476,7 +1975,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 try { Account.Flatten(new[] { Instrument }); }
                 catch (Exception ex)
                 {
-                    Print("[Mm-ATM v2] Account.Flatten failed: " + ex.Message);
+                    Print("[Mm-ATM v3] Account.Flatten failed: " + ex.Message);
                     ManagedExitAll();
                 }
             }
@@ -1546,7 +2045,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 if (working.Count > 0) { Account.Cancel(working.ToArray()); cancelled = true; }
             }
-            catch (Exception ex) { Print("[Mm-ATM v2] CancelPendingOrders: " + ex.Message); }
+            catch (Exception ex) { Print("[Mm-ATM v3] CancelPendingOrders: " + ex.Message); }
             return cancelled;
         }
 
@@ -1562,6 +2061,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (activeEntrySignals.Count > 0) activeEntrySignals.RemoveAt(activeEntrySignals.Count - 1);
             openDcaCount = Math.Max(0, openDcaCount - 1);
             totalContracts = Math.Max(0, totalContracts - 1);
+            ArmHiddenStops(); // Recalculate stops for remaining position
             UpdateDashboardStatus("\u25cf Closed 1 contract", Brushes.Yellow);
         }
 
@@ -1638,7 +2138,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (State == State.Realtime)
                 {
                     try { Account.Flatten(new[] { Instrument }); }
-                    catch (Exception ex) { Print("[Mm-ATM v2] Emergency kill flatten failed: " + ex.Message); ManagedExitAll(); }
+                    catch (Exception ex) { Print("[Mm-ATM v3] Emergency kill flatten failed: " + ex.Message); ManagedExitAll(); }
                 }
                 else
                 {
@@ -1654,7 +2154,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             // Guard: never reset while we have an actual position
             if (Position.MarketPosition != MarketPosition.Flat)
             {
-                Print("[Mm-ATM v2] " + Time[0] + " | WARNING: ResetPositionState blocked \u2014 Position is " + Position.MarketPosition);
+                Print("[Mm-ATM v3] " + Time[0] + " | WARNING: ResetPositionState blocked \u2014 Position is " + Position.MarketPosition);
                 return;
             }
             stopsArmed = false; pendingExit = false; pendingExitTicks = 0;
@@ -1724,20 +2224,20 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
             }
 
-            // v2 uses incremental tracking â€” dailyRealizedPnL already contains only
+            // v3 uses incremental tracking  - dailyRealizedPnL already contains only
             // trades completed after Realtime start; no baseline subtraction needed
             double checkPnL = dailyRealizedPnL;
             if (checkPnL <= -maxDailyLossDollars && !dailyLimitHit)
             {
                 dailyLimitHit = true;
                 pendingLimitFlatten = true;
-                Print("[Mm-ATM v2] *** DAILY LOSS LIMIT: " + checkPnL.ToString("C0") + " ***");
+                Print("[Mm-ATM v3] *** DAILY LOSS LIMIT: " + checkPnL.ToString("C0") + " ***");
             }
             if (checkPnL >= maxDailyProfitDollars && !dailyProfitHit)
             {
                 dailyProfitHit = true;
                 pendingLimitFlatten = true;
-                Print("[Mm-ATM v2] *** DAILY PROFIT TARGET: " + checkPnL.ToString("C0") + " ***");
+                Print("[Mm-ATM v3] *** DAILY PROFIT TARGET: " + checkPnL.ToString("C0") + " ***");
             }
         }
 
@@ -1784,9 +2284,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             double vol = Volume[0];
             if (volumeAtPrice.ContainsKey(tp)) volumeAtPrice[tp] += vol;
             else volumeAtPrice[tp] = vol;
-            // Only recalculate levels every 10 bars to avoid expensive sort/expansion
-            if (CurrentBar % 10 == 0)
+            // Only recalculate levels every 20 bars AND if new price levels added
+            if (CurrentBar % 20 == 0 && volumeAtPrice.Count > lastVpRecalcCount + 5)
+            {
+                lastVpRecalcCount = volumeAtPrice.Count;
                 CalculateVolumeProfileLevels();
+            }
         }
 
         private void CalculateVolumeProfileLevels()
@@ -1851,16 +2354,22 @@ namespace NinjaTrader.NinjaScript.Strategies
             dailyProfitHit       = false;
             dailyTradeCount      = 0;
             processedTradeCount  = 0;
+            pnlBaselineOffset    = 0;
             flattenFired         = false;
             emergencyKillActive  = false;
             consecutiveLosses    = 0;
             lastLossTime         = DateTime.MinValue;
+            autoStratConsecutiveBars = 0;
+            lastBestAutoStrategy = -1;
+            lastBullConfidence   = 0;
+            lastBearConfidence   = 0;
             orbSet               = false;
             orbHigh              = 0;
             orbLow               = 0;
             if (volumeAtPrice != null) { volumeAtPrice.Clear(); volumeProfileReady = false; }
             pocLevel = 0; vahLevel = 0; valLevel = 0;
-            Print("Session reset: " + sessionDate.ToShortDateString()
+            totalSessionVolume = 0;
+            Print("[Mm-ATM v3] Session reset: " + sessionDate.ToShortDateString()
                 + " MaxLoss=$" + maxDailyLossDollars + " ProfitTarget=$" + maxDailyProfitDollars
                 + " MaxTrades=" + (maxTradesPerDay > 0 ? maxTradesPerDay.ToString() : "\u221e"));
         }
@@ -1963,7 +2472,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     1, prevBarVwap, 0, vwapValue,
                     Brushes.Yellow, DashStyleHelper.Solid, 2);
                 // Remove old VWAP segment to prevent unbounded accumulation
-                if (CurrentBar > 200) RemoveDrawObject("vwap_" + (CurrentBar - 200));
+                if (CurrentBar > 50) RemoveDrawObject("vwap_" + (CurrentBar - 50));
             }
         }
 
@@ -1993,13 +2502,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 Draw.ArrowUp(this, "sweepUp_" + CurrentBar, false, 0, Low[0] - 8 * TickSize, Brushes.LimeGreen);
                 Draw.Text(this, "sweepUpTxt_" + CurrentBar, "Sweep\u2191", 0, Low[0] - 16 * TickSize, Brushes.LimeGreen);
-                if (CurrentBar > 50) { RemoveDrawObject("sweepUp_" + (CurrentBar - 50)); RemoveDrawObject("sweepUpTxt_" + (CurrentBar - 50)); }
+                if (CurrentBar > 20) { RemoveDrawObject("sweepUp_" + (CurrentBar - 20)); RemoveDrawObject("sweepUpTxt_" + (CurrentBar - 20)); }
             }
             if (prevHigh > swingHigh && price < swingHigh)
             {
                 Draw.ArrowDown(this, "sweepDn_" + CurrentBar, false, 0, High[0] + 8 * TickSize, Brushes.OrangeRed);
                 Draw.Text(this, "sweepDnTxt_" + CurrentBar, "Sweep\u2193", 0, High[0] + 16 * TickSize, Brushes.OrangeRed);
-                if (CurrentBar > 50) { RemoveDrawObject("sweepDn_" + (CurrentBar - 50)); RemoveDrawObject("sweepDnTxt_" + (CurrentBar - 50)); }
+                if (CurrentBar > 20) { RemoveDrawObject("sweepDn_" + (CurrentBar - 20)); RemoveDrawObject("sweepDnTxt_" + (CurrentBar - 20)); }
             }
         }
 
@@ -2054,6 +2563,17 @@ namespace NinjaTrader.NinjaScript.Strategies
                     bestAutoStrategy = bestIdx;
                 // else keep previous bestAutoStrategy
 
+                // Session-aware strategy override (Issue 3D)
+                int ct = ToTime(Time[0]);
+                if (ct >= 93000 && ct < 100000)
+                    bestAutoStrategy = 2; // Force Liquidity Sweep Reversal at open
+                else if (ct >= 113000 && ct < 140000)
+                    bestAutoStrategy = 0; // Force Momentum+VWAP during lunch
+
+                // Store all 4 strategy scores for dashboard display
+                for (int s = 0; s < 4; s++)
+                    strategyScores[s] = Math.Max(bullScores[s], bearScores[s]);
+
                 lastBullConfidence = bullScores[bestAutoStrategy];
                 lastBearConfidence = bearScores[bestAutoStrategy];
             }
@@ -2069,6 +2589,19 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             ApplySmartFilters();
+
+            // Session-aware: during lunch (11:30-14:00) require higher confidence
+            {
+                int ctPost = ToTime(Time[0]);
+                if (ctPost >= 113000 && ctPost < 140000)
+                {
+                    // Effectively raise min confidence by 10 during lunch
+                    lastBullConfidence -= 10;
+                    lastBearConfidence -= 10;
+                    if (lastBullConfidence < 0) lastBullConfidence = 0;
+                    if (lastBearConfidence < 0) lastBearConfidence = 0;
+                }
+            }
         }
 
         // --- Strategy 0: Momentum + VWAP ---
@@ -2098,12 +2631,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             int ct = ToTime(Time[0]);
             if ((ct >= 93000 && ct < 93500) || (ct >= 120000 && ct < 133000)) return;
 
-            double hi20 = double.MinValue, lo20 = double.MaxValue;
-            for (int i = 1; i <= 20; i++)
-            {
-                if (High[i] > hi20) hi20 = High[i];
-                if (Low[i] < lo20) lo20 = Low[i];
-            }
+            double hi20 = MAX(High, 20)[1];
+            double lo20 = MIN(Low, 20)[1];
             double atr = indAtr[0];
 
             // Bullish
@@ -2126,12 +2655,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (CurrentBar < 25) return;
             double atr = indAtr[0]; if (atr <= 0) return;
-            double swLo = double.MaxValue, swHi = double.MinValue;
-            for (int i = 2; i <= 20; i++)
-            {
-                if (Low[i] < swLo) swLo = Low[i];
-                if (High[i] > swHi) swHi = High[i];
-            }
+            double swLo = MIN(Low, 19)[2];
+            double swHi = MAX(High, 19)[2];
             double rsi = indRsi[0];
 
             // Bullish sweep
@@ -2139,7 +2664,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             else if (Low[0] < swLo && Close[0] > Low[0]) bull += 25;
             if (rsi < 40) bull += 30;
             if ((Close[0] - Low[0]) > 0.3 * atr) bull += 25;
-            double avgVol = 0; for (int i = 1; i <= 20; i++) avgVol += Volume[i]; avgVol /= 20;
+            double avgVol = GetCachedAvgVolume();
             if (Volume[0] > 1.5 * avgVol) bull += 10;
 
             // Bearish sweep
@@ -2179,28 +2704,29 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         #endregion
 
-        #region Smart Filters (v2 enhanced: 7 new filters)
+        #region Smart Filters (v3 enhanced: 7 new filters)
 
         private void ApplySmartFilters()
         {
             if (CurrentBar < emaPeriodSlow + 5) return;
             double atr = indAtr[0];
 
+            // Save raw scores before filters to enforce penalty floor
+            double rawBull = lastBullConfidence;
+            double rawBear = lastBearConfidence;
+
             // --- Original 5 filters from v1 ---
 
-            // 1. Volume Confirmation
-            double avgVol = 0;
-            int lookback = Math.Min(20, CurrentBar);
-            for (int i = 1; i <= lookback; i++) avgVol += Volume[i];
-            avgVol = lookback > 0 ? avgVol / lookback : 1;
+            // 1. Volume Confirmation (use cached avg volume)
+            double avgVol = GetCachedAvgVolume();
             double vr = avgVol > 0 ? Volume[0] / avgVol : 1;
             if (vr < 0.5) { lastBullConfidence *= 0.7; lastBearConfidence *= 0.7; }
             else if (vr > 2.0) { lastBullConfidence *= 1.15; lastBearConfidence *= 1.15; }
 
-            // 2. Bull/Bear Conflict
+            // 2. Bull/Bear Conflict (threshold raised to 0.80  - less aggressive)
             double conflict = Math.Min(lastBullConfidence, lastBearConfidence);
             double dominant = Math.Max(lastBullConfidence, lastBearConfidence);
-            if (dominant > 0 && conflict / dominant > 0.70)
+            if (dominant > 0 && conflict / dominant > 0.80)
             { lastBullConfidence *= 0.7; lastBearConfidence *= 0.7; }
 
             // 3. Momentum Exhaustion
@@ -2211,12 +2737,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (move > 1.5 && indRsi[0] < 20) lastBearConfidence *= 0.6;
             }
 
-            // 4. Bar Quality (Wick Rejection)
+            // 4. Bar Quality (Wick Rejection  - threshold lowered to 0.15 for less false triggers)
             double barRange = High[0] - Low[0];
             if (barRange > 0)
             {
                 double bodyPct = Math.Abs(Close[0] - Open[0]) / barRange;
-                if (bodyPct < 0.25) { lastBullConfidence *= 0.8; lastBearConfidence *= 0.8; }
+                if (bodyPct < 0.15) { lastBullConfidence *= 0.8; lastBearConfidence *= 0.8; }
             }
 
             // 5. Night Session Penalty
@@ -2224,7 +2750,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (ct >= 180000 || ct < 80000)
             { lastBullConfidence *= 0.7; lastBearConfidence *= 0.7; }
 
-            // --- New v2 Filters (Part 4) ---
+            // --- New v3 Filters (Part 4) ---
 
             // 6. HTF Trend Filter (Part 4a)
             if (htfFilterEnabled && indEmaHtf != null)
@@ -2268,16 +2794,56 @@ namespace NinjaTrader.NinjaScript.Strategies
                 double distFromPOC = Math.Abs(Close[0] - pocLevel);
                 double pocRange = atr > 0 ? distFromPOC / atr : 0;
 
-                // Near POC (value zone) â€” less directional edge, penalize
+                // Near POC (value zone)  - less directional edge, penalize
                 if (pocRange < 0.3)
                 { lastBullConfidence *= 0.85; lastBearConfidence *= 0.85; }
 
-                // Price near VAH/VAL â€” potential bounce zone supports direction
+                // Price near VAH/VAL  - potential bounce zone supports direction
                 if (Close[0] >= vahLevel && Close[0] <= vahLevel + atr * 0.3)
-                    lastBearConfidence *= 1.1;  // rejection from VAH â†’ bearish support
+                    lastBearConfidence *= 1.1;  // rejection from VAH -> bearish support
                 if (Close[0] <= valLevel && Close[0] >= valLevel - atr * 0.3)
-                    lastBullConfidence *= 1.1;  // bounce off VAL â†’ bullish support
+                    lastBullConfidence *= 1.1;  // bounce off VAL -> bullish support
             }
+
+            // --- New Issue-3 Filters ---
+
+            // 11. RSI/Price Divergence
+            if (CurrentBar >= 5 && atr > 0)
+            {
+                double rsi0 = indRsi[0], rsi4 = indRsi[4];
+                if (rsi0 < rsi4 - 5 && Close[0] > Close[4]) lastBearConfidence += 10;
+                if (rsi0 > rsi4 + 5 && Close[0] < Close[4]) lastBullConfidence += 10;
+            }
+
+            // 12. VWAP Slope Filter
+            if (vwapValue > 0 && prevBarVwap > 0 && atr > 0)
+            {
+                double vwapSlope = vwapValue - prevBarVwap;
+                double slopeThreshold = atr * 0.05;
+                if (vwapSlope > slopeThreshold) { lastBullConfidence += 10; lastBearConfidence -= 5; }
+                else if (vwapSlope < -slopeThreshold) { lastBearConfidence += 10; lastBullConfidence -= 5; }
+            }
+
+            // 13. POC Magnetic Filter
+            if (useVolumeProfileFilters && pocLevel > 0 && atr > 0)
+            {
+                double distToPoc = Close[0] - pocLevel;
+                double absDist = Math.Abs(distToPoc);
+                if (absDist < atr)
+                {
+                    if (distToPoc > 0) lastBullConfidence *= 0.75;
+                    else lastBearConfidence *= 0.75;
+                }
+            }
+
+            // 14. Lunch Doldrums (11:30-14:00 ET)
+            if (ct >= 113000 && ct < 140000)
+            { lastBullConfidence *= 0.85; lastBearConfidence *= 0.85; }
+
+            // Penalty floor: never reduce below 45% of raw score
+            double totalPenaltyFloor = 0.45;
+            lastBullConfidence = Math.Max(lastBullConfidence, rawBull * totalPenaltyFloor);
+            lastBearConfidence = Math.Max(lastBearConfidence, rawBear * totalPenaltyFloor);
 
             lastBullConfidence = Math.Max(0, Math.Min(120, lastBullConfidence));
             lastBearConfidence = Math.Max(0, Math.Min(120, lastBearConfidence));
@@ -2320,7 +2886,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             return bullStruc - bearStruc;   // +1 full bull, -1 full bear
         }
 
-        // Key Level Mid-Range Penalty: price stuck in mid value area â†’ less edge
+        // Key Level Mid-Range Penalty: price stuck in mid value area -> less edge
         private double CalcKeyLevelMidRangePenalty()
         {
             if (vahLevel <= valLevel || pocLevel <= 0) return 1.0;
@@ -2387,7 +2953,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 };
                 dashTitleBar.Child = new TextBlock
                 {
-                    Text = "\u2630  NQ  Mm-ATM  v2",
+                    Text = "\u2630  NQ  Mm-ATM  v3",
                     Foreground = Brushes.White, FontSize = 13, FontWeight = FontWeights.Bold,
                     HorizontalAlignment = HorizontalAlignment.Center
                 };
@@ -2619,6 +3185,40 @@ namespace NinjaTrader.NinjaScript.Strategies
                 trapRow.Children.Add(lblTrapInfo);
                 stack.Children.Add(trapRow);
 
+                // Smart Trail toggle + info
+                var smartTrailRow = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Left, Margin = new Thickness(0, 2, 0, 0) };
+                btnSmartTrailToggle = new Button
+                {
+                    Content = smartTrailEnabled ? "S-TRAIL \u2713" : "S-TRAIL",
+                    Width = 80, Height = 22,
+                    Background = smartTrailEnabled
+                        ? new SolidColorBrush(Color.FromRgb(50, 130, 70))
+                        : new SolidColorBrush(Color.FromRgb(50, 55, 65)),
+                    Foreground = Brushes.White, FontSize = 9, FontWeight = FontWeights.Bold,
+                    BorderThickness = new Thickness(0), Margin = new Thickness(0, 0, 6, 0)
+                };
+                smartTrailRow.Children.Add(btnSmartTrailToggle);
+                lblSmartTrailInfo = MakeLabel("Smart Trail: \u2014", Brushes.LimeGreen, 10, FontWeights.Normal, HorizontalAlignment.Left);
+                smartTrailRow.Children.Add(lblSmartTrailInfo);
+                stack.Children.Add(smartTrailRow);
+
+                // Smart SL toggle + info
+                var smartSlRow = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Left, Margin = new Thickness(0, 2, 0, 0) };
+                btnSmartSlToggle = new Button
+                {
+                    Content = smartSlEnabled ? "SMART SL \u2713" : "SMART SL",
+                    Width = 80, Height = 22,
+                    Background = smartSlEnabled
+                        ? new SolidColorBrush(Color.FromRgb(50, 130, 70))
+                        : new SolidColorBrush(Color.FromRgb(50, 55, 65)),
+                    Foreground = Brushes.White, FontSize = 9, FontWeight = FontWeights.Bold,
+                    BorderThickness = new Thickness(0), Margin = new Thickness(0, 0, 6, 0)
+                };
+                smartSlRow.Children.Add(btnSmartSlToggle);
+                lblSmartSlInfo = MakeLabel("Smart SL: \u2014", Brushes.Cyan, 10, FontWeights.Normal, HorizontalAlignment.Left);
+                smartSlRow.Children.Add(lblSmartSlInfo);
+                stack.Children.Add(smartSlRow);
+
                 stack.Children.Add(MakeSeparator());
 
                 // Confidence scores (Bug 4: always green/red with opacity)
@@ -2798,6 +3398,23 @@ namespace NinjaTrader.NinjaScript.Strategies
                                             ? new SolidColorBrush(Color.FromRgb(140, 90, 20))
                                             : new SolidColorBrush(Color.FromRgb(50, 55, 65));
                                     }
+                                    else if (btn == btnSmartTrailToggle)
+                                    {
+                                        smartTrailEnabled = !smartTrailEnabled;
+                                        btnSmartTrailToggle.Content = smartTrailEnabled ? "S-TRAIL \u2713" : "S-TRAIL";
+                                        btnSmartTrailToggle.Background = smartTrailEnabled
+                                            ? new SolidColorBrush(Color.FromRgb(50, 130, 70))
+                                            : new SolidColorBrush(Color.FromRgb(50, 55, 65));
+                                        if (!smartTrailEnabled) { smartTrailPaused = false; smartTrailPauseBars = 0; }
+                                    }
+                                    else if (btn == btnSmartSlToggle)
+                                    {
+                                        smartSlEnabled = !smartSlEnabled;
+                                        btnSmartSlToggle.Content = smartSlEnabled ? "SMART SL \u2713" : "SMART SL";
+                                        btnSmartSlToggle.Background = smartSlEnabled
+                                            ? new SolidColorBrush(Color.FromRgb(50, 130, 70))
+                                            : new SolidColorBrush(Color.FromRgb(50, 55, 65));
+                                    }
                                     else if (btn == btnHoursToggle)
                                     {
                                         tradingHoursEnabled = !tradingHoursEnabled;
@@ -2832,7 +3449,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     chartGrid.Children.Add(dashboardPanel);
                     dashboardHostPanel = chartGrid;
                     placed = true;
-                    Print("[Mm-ATM v2] Dashboard: floating overlay at (" + startX.ToString("F0") + ", 10)");
+                    Print("[Mm-ATM v3] Dashboard: floating overlay at (" + startX.ToString("F0") + ", 10)");
                 }
 
                 if (!placed)
@@ -2847,7 +3464,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                             g.Children.Add(dashboardPanel);
                             dashboardHostPanel = g;
                             placed = true;
-                            Print("[Mm-ATM v2] Dashboard: floating overlay (fallback grid)");
+                            Print("[Mm-ATM v3] Dashboard: floating overlay (fallback grid)");
                             break;
                         }
                     }
@@ -2855,7 +3472,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 if (!placed)
                 {
-                    Print("[Mm-ATM v2] Dashboard: FAILED to find host \u2014 will retry");
+                    Print("[Mm-ATM v3] Dashboard: FAILED to find host \u2014 will retry");
                     dashboardPanel    = null;
                     dashboardAttached = false;
                 }
@@ -2863,14 +3480,14 @@ namespace NinjaTrader.NinjaScript.Strategies
               }
               catch (Exception ex)
               {
-                Print("[Mm-ATM v2] Dashboard build error: " + ex.Message + " \u2014 will retry");
+                Print("[Mm-ATM v3] Dashboard build error: " + ex.Message + " \u2014 will retry");
                 dashboardPanel    = null;
                 dashboardAttached = false;
               }
             });
         }
 
-        // â”€â”€â”€ Dashboard helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- Dashboard helpers ---
 
         private StackPanel MakeAdjustRow(string label, string value,
             RoutedEventHandler minusHandler, RoutedEventHandler plusHandler, string suffix)
@@ -2992,14 +3609,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             });
         }
 
-        // â”€â”€â”€ Full dashboard refresh â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- Full dashboard refresh ---
 
         private void UpdateDashboard()
         {
             if (ChartControl == null) return;
             if (lblPnL == null || lblStatus == null || lblPosition == null) return;
 
-            // â”€â”€ Capture ALL NinjaTrader data on the data thread (thread-safe) â”€â”€
+            // --- Capture ALL NinjaTrader data on the data thread (thread-safe) ---
             double snapClose         = Close[0];
             MarketPosition snapMktPos = Position.MarketPosition;
             int    snapPosQty        = Position.Quantity;
@@ -3198,9 +3815,69 @@ namespace NinjaTrader.NinjaScript.Strategies
                         }
                     }
 
-                    // Active strategy
+                    // Active strategy + scores
                     if (lblActiveStrategy != null)
-                        lblActiveStrategy.Text = "Active: " + (!string.IsNullOrEmpty(snapLastStrat) ? snapLastStrat : "\u2014");
+                    {
+                        string stratText = "Active: " + (!string.IsNullOrEmpty(snapLastStrat) ? snapLastStrat : "\u2014");
+                        if (autoStrategy == 4 && strategyScores != null)
+                        {
+                            string[] abbr = { "M+V", "KLB", "LSR", "ORB" };
+                            string scores = "";
+                            for (int s = 0; s < 4; s++)
+                            {
+                                scores += abbr[s] + "=" + strategyScores[s].ToString("F0");
+                                if (s == bestAutoStrategy) scores += "\u2713";
+                                if (s < 3) scores += " ";
+                            }
+                            stratText += "\n" + scores;
+                        }
+                        lblActiveStrategy.Text = stratText;
+                    }
+
+                    // Smart Trail info
+                    if (lblSmartTrailInfo != null)
+                    {
+                        if (smartTrailEnabled && smartTrailPaused)
+                        {
+                            lblSmartTrailInfo.Text = "S-Trail: PAUSED (" + smartTrailPauseBars + "/" + smartTrailMaxPauseBars + ")";
+                            lblSmartTrailInfo.Foreground = Brushes.Orange;
+                        }
+                        else if (smartTrailEnabled && snapTrailActive)
+                        {
+                            lblSmartTrailInfo.Text = "S-Trail: monitoring";
+                            lblSmartTrailInfo.Foreground = Brushes.LimeGreen;
+                        }
+                        else
+                        {
+                            lblSmartTrailInfo.Text = smartTrailEnabled ? "S-Trail: \u2014" : "S-Trail: OFF";
+                            lblSmartTrailInfo.Foreground = Brushes.Gray;
+                        }
+                    }
+
+                    // Smart SL info
+                    if (lblSmartSlInfo != null)
+                    {
+                        if (smartSlEnabled && smartSlBreakevenDone)
+                        {
+                            lblSmartSlInfo.Text = "Smart SL: BE @ " + snapHiddenSL.ToString("F2");
+                            lblSmartSlInfo.Foreground = Brushes.LimeGreen;
+                        }
+                        else if (smartSlEnabled && smartSlTightened)
+                        {
+                            lblSmartSlInfo.Text = "Smart SL: TIGHT @ " + snapHiddenSL.ToString("F2");
+                            lblSmartSlInfo.Foreground = Brushes.Orange;
+                        }
+                        else if (smartSlEnabled && smartSlLoosened)
+                        {
+                            lblSmartSlInfo.Text = "Smart SL: EXTENDED";
+                            lblSmartSlInfo.Foreground = Brushes.Cyan;
+                        }
+                        else
+                        {
+                            lblSmartSlInfo.Text = smartSlEnabled ? "Smart SL: monitoring" : "Smart SL: OFF";
+                            lblSmartSlInfo.Foreground = Brushes.Gray;
+                        }
+                    }
                 }
                 else
                 {
@@ -3272,6 +3949,18 @@ namespace NinjaTrader.NinjaScript.Strategies
                         lblTrapInfo.Foreground = Brushes.Gray;
                     }
                     if (lblActiveStrategy != null) lblActiveStrategy.Text = "Active: \u2014";
+
+                    // Reset Smart Trail / Smart SL labels when flat
+                    if (lblSmartTrailInfo != null)
+                    {
+                        lblSmartTrailInfo.Text = smartTrailEnabled ? "S-Trail: \u2014" : "S-Trail: OFF";
+                        lblSmartTrailInfo.Foreground = Brushes.Gray;
+                    }
+                    if (lblSmartSlInfo != null)
+                    {
+                        lblSmartSlInfo.Text = smartSlEnabled ? "Smart SL: \u2014" : "Smart SL: OFF";
+                        lblSmartSlInfo.Foreground = Brushes.Gray;
+                    }
                 }
 
                 // VWAP
@@ -3364,217 +4053,241 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         #endregion
 
-        // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-        //  PROPERTIES  (9 groups per v2 spec)
-        // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+        // ==========================================================
+        //  PROPERTIES  (9 groups per v3 spec)
+        // ==========================================================
 
         #region Properties
 
-        // Group 1 â€” Risk Management
+        // Group 1  - Risk Management
         [NinjaScriptProperty]
         [Range(1, 500)]
-        [Display(Name = "Stop Loss (NQ points)", Order = 1, GroupName = "1 â€” Risk Management",
+        [Display(Name = "Stop Loss (NQ points)", Order = 1, GroupName = "1 - Risk Management",
                  Description = "Hidden SL distance from average entry.")]
         public int SlPoints { get { return slPoints; } set { slPoints = value; } }
 
         [NinjaScriptProperty]
         [Range(1, 500)]
-        [Display(Name = "Take Profit (NQ points)", Order = 2, GroupName = "1 â€” Risk Management",
+        [Display(Name = "Take Profit (NQ points)", Order = 2, GroupName = "1 - Risk Management",
                  Description = "Hidden TP distance from average entry.")]
         public int TpPoints { get { return tpPoints; } set { tpPoints = value; } }
 
         [NinjaScriptProperty]
         [Range(500, 10000)]
-        [Display(Name = "Max Daily Loss ($)", Order = 3, GroupName = "1 â€” Risk Management",
+        [Display(Name = "Max Daily Loss ($)", Order = 3, GroupName = "1 - Risk Management",
                  Description = "Hard daily loss cap.")]
         public int MaxDailyLossDollars { get { return maxDailyLossDollars; } set { maxDailyLossDollars = value; } }
 
         [NinjaScriptProperty]
         [Range(500, 20000)]
-        [Display(Name = "Daily Profit Target ($)", Order = 4, GroupName = "1 â€” Risk Management")]
+        [Display(Name = "Daily Profit Target ($)", Order = 4, GroupName = "1 - Risk Management")]
         public int MaxDailyProfitDollars { get { return maxDailyProfitDollars; } set { maxDailyProfitDollars = value; } }
 
         [NinjaScriptProperty]
         [Range(0, 999)]
-        [Display(Name = "Max Trades Per Day", Order = 5, GroupName = "1 â€” Risk Management",
+        [Display(Name = "Max Trades Per Day", Order = 5, GroupName = "1 - Risk Management",
                  Description = "0 = unlimited.")]
         public int MaxTradesPerDay { get { return maxTradesPerDay; } set { maxTradesPerDay = value; } }
 
         [NinjaScriptProperty]
         [Range(1, 10)]
-        [Display(Name = "Contracts per entry", Order = 6, GroupName = "1 â€” Risk Management")]
+        [Display(Name = "Contracts per entry", Order = 6, GroupName = "1 - Risk Management")]
         public int Contracts { get { return contracts; } set { contracts = value; } }
 
-        // Group 2 â€” Position Sizing (replaces DCA)
+        // Group 2  - Position Sizing (replaces DCA)
         [NinjaScriptProperty]
         [Range(1, 10)]
-        [Display(Name = "Max Contracts", Order = 1, GroupName = "2 â€” Position Sizing",
+        [Display(Name = "Max Contracts", Order = 1, GroupName = "2 - Position Sizing",
                  Description = "Maximum total contracts across all adds.")]
         public int MaxContracts { get { return maxContracts; } set { maxContracts = value; } }
 
         [NinjaScriptProperty]
         [Range(0, 200)]
-        [Display(Name = "DCA Suggestion Distance (NQ pt)", Order = 2, GroupName = "2 â€” Position Sizing",
+        [Display(Name = "DCA Suggestion Distance (NQ pt)", Order = 2, GroupName = "2 - Position Sizing",
                  Description = "Visual DCA suggestion line distance. 0 = off. Chart line only, no auto entry.")]
         public int DcaSuggestionPoints { get { return dcaSuggestionPoints; } set { dcaSuggestionPoints = value; } }
 
-        // Group 3 â€” Trading Mode
+        // Group 3  - Trading Mode
         [NinjaScriptProperty]
-        [Display(Name = "Auto Mode (default)", Order = 1, GroupName = "3 â€” Trading Mode")]
+        [Display(Name = "Auto Mode (default)", Order = 1, GroupName = "3 - Trading Mode")]
         public bool AutoMode { get { return autoMode; } set { autoMode = value; } }
 
         [NinjaScriptProperty]
         [Range(0, 4)]
-        [Display(Name = "Auto Strategy (0-4)", Order = 2, GroupName = "3 â€” Trading Mode",
+        [Display(Name = "Auto Strategy (0-4)", Order = 2, GroupName = "3 - Trading Mode",
                  Description = "0=Momentum+VWAP  1=Key Level  2=Liquidity Sweep  3=ORB  4=Auto Select")]
         public int AutoStrategy { get { return autoStrategy; } set { autoStrategy = value; } }
 
         [NinjaScriptProperty]
         [Range(50, 100)]
-        [Display(Name = "Min Signal Confidence (%)", Order = 3, GroupName = "3 â€” Trading Mode")]
+        [Display(Name = "Min Signal Confidence (%)", Order = 3, GroupName = "3 - Trading Mode")]
         public double MinSignalConfidence { get { return minSignalConfidence; } set { minSignalConfidence = value; } }
 
         [NinjaScriptProperty]
         [Range(0, 120)]
-        [Display(Name = "Entry Delay (seconds)", Order = 4, GroupName = "3 â€” Trading Mode")]
+        [Display(Name = "Entry Delay (seconds)", Order = 4, GroupName = "3 - Trading Mode")]
         public int EntryDelaySeconds { get { return entryDelaySeconds; } set { entryDelaySeconds = value; } }
 
-        // Group 4 â€” Indicators
+        // Group 4  - Indicators
         [NinjaScriptProperty]
         [Range(3, 50)]
-        [Display(Name = "EMA Fast Period", Order = 1, GroupName = "4 â€” Indicators")]
+        [Display(Name = "EMA Fast Period", Order = 1, GroupName = "4 - Indicators")]
         public int EmaPeriodFast { get { return emaPeriodFast; } set { emaPeriodFast = value; } }
 
         [NinjaScriptProperty]
         [Range(10, 200)]
-        [Display(Name = "EMA Slow Period", Order = 2, GroupName = "4 â€” Indicators")]
+        [Display(Name = "EMA Slow Period", Order = 2, GroupName = "4 - Indicators")]
         public int EmaPeriodSlow { get { return emaPeriodSlow; } set { emaPeriodSlow = value; } }
 
         [NinjaScriptProperty]
         [Range(5, 30)]
-        [Display(Name = "RSI Period", Order = 3, GroupName = "4 â€” Indicators")]
+        [Display(Name = "RSI Period", Order = 3, GroupName = "4 - Indicators")]
         public int RsiPeriod { get { return rsiPeriod; } set { rsiPeriod = value; } }
 
         [NinjaScriptProperty]
         [Range(5, 30)]
-        [Display(Name = "ATR Period", Order = 4, GroupName = "4 â€” Indicators")]
+        [Display(Name = "ATR Period", Order = 4, GroupName = "4 - Indicators")]
         public int AtrPeriod { get { return atrPeriod; } set { atrPeriod = value; } }
 
         [NinjaScriptProperty]
         [Range(10, 200)]
-        [Display(Name = "HTF EMA Period", Order = 5, GroupName = "4 â€” Indicators",
+        [Display(Name = "HTF EMA Period", Order = 5, GroupName = "4 - Indicators",
                  Description = "Higher Time-Frame EMA period for trend filter.")]
         public int HtfEmaPeriod { get { return htfEmaPeriod; } set { htfEmaPeriod = value; } }
 
-        // Group 5 â€” Display
+        // Group 5  - Display
         [NinjaScriptProperty]
         [Range(1, 50)]
-        [Display(Name = "SL/TP Adjust Step (points)", Order = 1, GroupName = "5 â€” Display")]
+        [Display(Name = "SL/TP Adjust Step (points)", Order = 1, GroupName = "5 - Display")]
         public int SlTpAdjustStep { get { return slTpAdjustStep; } set { slTpAdjustStep = value; } }
 
         [NinjaScriptProperty]
         [Range(10, 95)]
-        [Display(Name = "Jump SL % (toward price)", Order = 2, GroupName = "5 â€” Display")]
+        [Display(Name = "Jump SL % (toward price)", Order = 2, GroupName = "5 - Display")]
         public int JumpSlPercent { get { return jumpSlPercent; } set { jumpSlPercent = value; } }
 
         [NinjaScriptProperty]
-        [Display(Name = "Show EMA on chart", Order = 3, GroupName = "5 â€” Display")]
+        [Display(Name = "Show EMA on chart", Order = 3, GroupName = "5 - Display")]
         public bool ShowEma { get { return showEma; } set { showEma = value; } }
 
         [NinjaScriptProperty]
-        [Display(Name = "Show RSI panel", Order = 4, GroupName = "5 â€” Display")]
+        [Display(Name = "Show RSI panel", Order = 4, GroupName = "5 - Display")]
         public bool ShowRsi { get { return showRsi; } set { showRsi = value; } }
 
         [NinjaScriptProperty]
-        [Display(Name = "Show ATR panel", Order = 5, GroupName = "5 â€” Display")]
+        [Display(Name = "Show ATR panel", Order = 5, GroupName = "5 - Display")]
         public bool ShowAtr { get { return showAtr; } set { showAtr = value; } }
 
         [NinjaScriptProperty]
-        [Display(Name = "Show VWAP line", Order = 6, GroupName = "5 â€” Display")]
+        [Display(Name = "Show VWAP line", Order = 6, GroupName = "5 - Display")]
         public bool ShowVwap { get { return showVwap; } set { showVwap = value; } }
 
         [NinjaScriptProperty]
-        [Display(Name = "Show Key Levels", Order = 7, GroupName = "5 â€” Display")]
+        [Display(Name = "Show Key Levels", Order = 7, GroupName = "5 - Display")]
         public bool ShowKeyLevels { get { return showKeyLevels; } set { showKeyLevels = value; } }
 
         [NinjaScriptProperty]
-        [Display(Name = "Show Sweep Signals", Order = 8, GroupName = "5 â€” Display")]
+        [Display(Name = "Show Sweep Signals", Order = 8, GroupName = "5 - Display")]
         public bool ShowSweepSignals { get { return showSweepSignals; } set { showSweepSignals = value; } }
 
-        // Group 6 â€” Trading Hours
+        // Group 6  - Trading Hours
         [NinjaScriptProperty]
-        [Display(Name = "Enable Trading Hours Filter", Order = 0, GroupName = "6 â€” Trading Hours",
+        [Display(Name = "Enable Trading Hours Filter", Order = 0, GroupName = "6 - Trading Hours",
                  Description = "When OFF, auto entries can fire at any time. Toggleable on dashboard.")]
         public bool TradingHoursEnabled { get { return tradingHoursEnabled; } set { tradingHoursEnabled = value; } }
 
         [NinjaScriptProperty]
         [Range(0, 235959)]
-        [Display(Name = "Trading Start (HHMMSS ET)", Order = 1, GroupName = "6 â€” Trading Hours")]
+        [Display(Name = "Trading Start (HHMMSS ET)", Order = 1, GroupName = "6 - Trading Hours")]
         public int TradingStartTime { get { return tradingStartTime; } set { tradingStartTime = value; } }
 
         [NinjaScriptProperty]
         [Range(0, 235959)]
-        [Display(Name = "Trading End (HHMMSS ET)", Order = 2, GroupName = "6 â€” Trading Hours")]
+        [Display(Name = "Trading End (HHMMSS ET)", Order = 2, GroupName = "6 - Trading Hours")]
         public int TradingEndTime { get { return tradingEndTime; } set { tradingEndTime = value; } }
 
         [NinjaScriptProperty]
         [Range(0, 235959)]
-        [Display(Name = "Auto-Flatten Time (HHMMSS ET)", Order = 3, GroupName = "6 â€” Trading Hours")]
+        [Display(Name = "Auto-Flatten Time (HHMMSS ET)", Order = 3, GroupName = "6 - Trading Hours")]
         public int FlattenTime { get { return flattenTime; } set { flattenTime = value; } }
 
-        // Group 7 â€” Adaptive Trail
+        // Group 7  - Adaptive Trail
         [NinjaScriptProperty]
-        [Display(Name = "Enable Adaptive Trail", Order = 1, GroupName = "7 â€” Adaptive Trail")]
+        [Display(Name = "Enable Adaptive Trail", Order = 1, GroupName = "7 - Adaptive Trail")]
         public bool TrailEnabled { get { return trailEnabled; } set { trailEnabled = value; } }
 
         [NinjaScriptProperty]
         [Range(1, 100)]
-        [Display(Name = "Trail Activation (NQ points)", Order = 2, GroupName = "7 â€” Adaptive Trail")]
+        [Display(Name = "Trail Activation (NQ points)", Order = 2, GroupName = "7 - Adaptive Trail")]
         public int TrailActivationPoints { get { return trailActivationPoints; } set { trailActivationPoints = value; } }
 
         [NinjaScriptProperty]
         [Range(1, 100)]
-        [Display(Name = "Trail Min Distance (NQ points)", Order = 3, GroupName = "7 â€” Adaptive Trail")]
+        [Display(Name = "Trail Min Distance (NQ points)", Order = 3, GroupName = "7 - Adaptive Trail")]
         public int TrailMinPoints { get { return trailMinPoints; } set { trailMinPoints = value; } }
 
         [NinjaScriptProperty]
         [Range(2, 200)]
-        [Display(Name = "Trail Max Distance (NQ points)", Order = 4, GroupName = "7 â€” Adaptive Trail")]
+        [Display(Name = "Trail Max Distance (NQ points)", Order = 4, GroupName = "7 - Adaptive Trail")]
         public int TrailMaxPoints { get { return trailMaxPoints; } set { trailMaxPoints = value; } }
 
         [NinjaScriptProperty]
         [Range(0.5, 5.0)]
-        [Display(Name = "Trail ATR Multiplier", Order = 5, GroupName = "7 â€” Adaptive Trail")]
+        [Display(Name = "Trail ATR Multiplier", Order = 5, GroupName = "7 - Adaptive Trail")]
         public double TrailAtrMultiplier { get { return trailAtrMultiplier; } set { trailAtrMultiplier = value; } }
 
-        // Group 8 â€” Trap Detector
+        // Group 8  - Trap Detector
         [NinjaScriptProperty]
-        [Display(Name = "Enable Post-Entry Trap Detector", Order = 1, GroupName = "8 â€” Trap Detector",
+        [Display(Name = "Enable Post-Entry Trap Detector", Order = 1, GroupName = "8 - Trap Detector",
                  Description = "Monitor for adverse price action after entry. Dashboard shows trap score and alert.")]
         public bool EnablePostEntryTrapDetector { get { return enablePostEntryTrapDetector; } set { enablePostEntryTrapDetector = value; } }
 
         [NinjaScriptProperty]
         [Range(0, 10)]
-        [Display(Name = "Volatility Spike Guard Bars", Order = 2, GroupName = "8 â€” Trap Detector",
-                 Description = "Skip trail updates when bar range > 3Ã—ATR. 0 = disabled.")]
+        [Display(Name = "Volatility Spike Guard Bars", Order = 2, GroupName = "8 - Trap Detector",
+                 Description = "Skip trail updates when bar range > 3xATR. 0 = disabled.")]
         public int VolatilitySpikeGuardBars { get { return volatilitySpikeGuardBars; } set { volatilitySpikeGuardBars = value; } }
 
-        // Group 9 â€” Signal Quality (v2 new)
+        // Group 9  - Signal Quality (v3 new)
         [NinjaScriptProperty]
-        [Display(Name = "HTF Trend Filter", Order = 1, GroupName = "9 â€” Signal Quality",
+        [Display(Name = "HTF Trend Filter", Order = 1, GroupName = "9 - Signal Quality",
                  Description = "Reduce confidence when signal opposes higher time-frame EMA trend.")]
         public bool HtfFilterEnabled { get { return htfFilterEnabled; } set { htfFilterEnabled = value; } }
 
         [NinjaScriptProperty]
-        [Display(Name = "Volume Profile Filters", Order = 2, GroupName = "9 â€” Signal Quality",
+        [Display(Name = "Volume Profile Filters", Order = 2, GroupName = "9 - Signal Quality",
                  Description = "Use real-time POC/VAH/VAL for mid-range penalty and bounce support.")]
         public bool UseVolumeProfileFilters { get { return useVolumeProfileFilters; } set { useVolumeProfileFilters = value; } }
 
         [NinjaScriptProperty]
         [Range(0, 600)]
-        [Display(Name = "Loss Cooldown (seconds)", Order = 3, GroupName = "9 â€” Signal Quality",
+        [Display(Name = "Loss Cooldown (seconds)", Order = 3, GroupName = "9 - Signal Quality",
                  Description = "Pause auto entries after consecutive losses. 0 = disabled.")]
         public int LossCooldownSeconds { get { return lossCooldownSeconds; } set { lossCooldownSeconds = value; } }
+
+        // Group 10  - Smart Trail
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Smart Trail", Order = 1, GroupName = "10 - Smart Trail",
+                 Description = "Auto-pause trail during suspected MM stop-hunt pullbacks.")]
+        public bool SmartTrailEnabled { get { return smartTrailEnabled; } set { smartTrailEnabled = value; } }
+
+        [NinjaScriptProperty]
+        [Range(2, 30)]
+        [Display(Name = "Smart Trail Max Pause Bars", Order = 2, GroupName = "10 - Smart Trail",
+                 Description = "Safety: auto-resume trail after this many bars paused.")]
+        public int SmartTrailMaxPauseBars { get { return smartTrailMaxPauseBars; } set { smartTrailMaxPauseBars = value; } }
+
+        // Group 11  - Smart SL
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Smart SL", Order = 1, GroupName = "11 - Smart SL",
+                 Description = "Dynamically adjust hidden SL based on profit, traps, and confidence.")]
+        public bool SmartSlEnabled { get { return smartSlEnabled; } set { smartSlEnabled = value; } }
+
+        [NinjaScriptProperty]
+        [Range(10, 90)]
+        [Display(Name = "Smart SL Break-Even % of TP", Order = 2, GroupName = "11 - Smart SL",
+                 Description = "Move SL to break-even when profit reaches this % of TP target.")]
+        public int SmartSlBePct { get { return smartSlBePct; } set { smartSlBePct = value; } }
 
         #endregion
     }

@@ -1,0 +1,686 @@
+My prompt to Sonnet 4.6:
+Please review the prompt below as I want to make modifications to my existing Ninjatrader NT8 code. You are an expert in ninjatrader and stock market specially in futures trading NQ.
+I want you to make this prompt very intelligent to ask Opus 4.6 to modify the code for what I am providing below. If you think it is important to review the code first, please ask as well or make modifications as needed. Once you provide a revised prompt I will execute in my visual code with Opus 4.6. to modify my code and create a new module based on it.
+you are an expert in ninjatrader NT8 code and know everything to create strategies using NT8 features.
+Please review the mm_ATM.cs code and create a new vesion as mm_ATM_v1.
+1) Please review how NT8 implements Buy/Sell Mkt, Buy/Sell Ask, Bul/Sell Bid, Rev, Close. I want you to use the same features.
+2) The code current BUY MKT, SELL MKT, BUY LMT and SELL LMT are not working as expected and has bugs. So, please fix by using the same logic as provided by NT8 in 1) if possible. replace all these featues using the NT8 existing featues. Make this very efficient and fast trade to enter and close the positions.
+3) Please replace the CLOSE 1 and CLOSE ALL by using the NT8 Close. Make sure this feature is working fine and reliable. Try to simplify by using the NT8 components if posible. By using what NT8 has to can simplify and make the close very efficient and fast trade.
+4) I still want to have a Emmergency Kill that will simulate a close to all positions immidiatelly. if there is anything in NT8 that it is used, please use it and close the strategy automatically after close all positions.
+5) All current features for the SL, TP, ADAPTIVE TRAILING STOP like jump SL, TP, TRAIL should continue to exist as defined as hidden maket order features and the existing features. This is our smart and intelingent mode to beat the market maker and bots. You should add any adaptative features to always be smart than MM.
+6) All features to do not show order trigger fingerprint "STEALTH ORDER NAMING" in the NT8 Execution Name column in Ninjatrader to hide from the to Prop firms should continue to exist when placing orders. make this to work with the changes requested to 1).
+7)  Please review simplify the display for unrealized, Daily P&L, Trades, and Account balance. I noticed that this is not working as expected and might have some bugs. They to simplify and fix the bugs not display correctly. Also, remember that we have some features like Max Daily Loss, Daily Profit, Max Trades, DCA that you should control.
+8) Please add a customized flag to enable and disable the Trading hours. I may want to trade Auto at any time so it is important to allow when I turn off. Manual mode can trade at any time. Please consider the CME hours allowed. ALso, close any positions at 4:50 PM ET automatically if any is opened.
+All auto strategy entry features, risk management,  PROFIT-TIER TRAILING STOP, SMART SIGNAL FILTERS (Trap Detection) should continue, but review them and make sure they are very smart and interlligent to beat the Market Marker and bots. Always make this very profitable.
+PLease review the dashboard to accomodate the changes requested above. Make it very user friendly for usability to trade using the dashboard and visualization. Fix any  bugs.
+Last, I would like you to add one more level of smart and intelligent trade (customized on/off) for you to detect trap after you enter the trade. I want you to adapt to the market conditions and if this is on and you notice a trap happening multiple times (such as range trap from MM), please try to adapt to it to buy at bottom and sell at top. But if you have to adapt and recognize that this is happening and try to be smart to prevent trades or take advantage of the pattern recognized. I have noticed that this happens during the night when the volumn is low for NQ and the bots are being very smart to trap. 
+Simplify the code, make it smarter and intelligent and very efficient and extremely profitable.
+
+xxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+Please modify the prompt to ask to review the following bugs as well: I have noticed that if I enable the strategy trade, then disable and reenable, the strategy no longer opens. I have to remove and re-add it.
+Please make all default values to appear again fresh as if I had added the strategy for the first time. Make the enable and disable works the same.
+reset the unrealize and daily p&n when disable and enable the strategy, but always bring the account balance. Make the daily loss works without bugs.
+
+Please clarify 1b and 1d. What is the difference and should we do the same as we have in NT8 to have similar bottoms in the dashboard? I did not understand the difference 1b and 1d. If you advise to keep as you defined in 1b and 1d it is ok, otherwise please mimic similar bottoms as NT8 has today in the dashboard.
+PLease document all features in the code.
+
+==============================================================================================
+Generated prompt to Opus 4.6:
+
+
+
+You are an expert NinjaTrader 8 (NT8 8.1.x) strategy developer specializing in NQ futures 
+trading. You have complete mastery of the NT8 managed order framework, WPF dashboard overlays,
+and institutional-grade execution patterns for prop-firm environments.
+
+I am providing my existing strategy file: mm_ATM.cs (class Mm_ATM, ~3338 lines).
+Produce a COMPLETE, FULLY-COMPILABLE new file: mm_ATM_v1.cs (class Mm_ATM_v1).
+
+CRITICAL OUTPUT RULE: Output the ENTIRE file — every line, every method, every region.
+Do NOT summarize, truncate, or use placeholder comments like "// ... rest of method unchanged".
+Every method body must be fully written out. The file must compile in NT8's NinjaScript Editor
+without any errors or warnings.
+
+Preserve every existing feature unless I explicitly ask you to replace or remove it.
+
+═══════════════════════════════════════════════════════════════════════════════
+SECTION 0 — ENABLE/DISABLE CYCLE BUG (CRITICAL — fix this first)
+═══════════════════════════════════════════════════════════════════════════════
+
+PROBLEM OBSERVED:
+When the strategy is running in Realtime, if the user disables it (via the checkbox in the 
+Strategies tab) and then re-enables it, the strategy NO LONGER accepts new orders — buttons 
+appear to work but no entries fire, and the strategy behaves as if permanently halted. 
+The only fix currently is to remove and re-add the strategy. This is a showstopper bug.
+
+ROOT CAUSE ANALYSIS (investigate and fix all of these):
+
+0a. STATE NOT FULLY RESET ON RE-ENABLE:
+    NT8's disable/re-enable cycle transitions the strategy through:
+      State.Terminated → State.SetDefaults → State.Configure → State.DataLoaded → 
+      State.Historical (replays bars) → State.Realtime
+    The strategy has a full reset in State.Realtime, but several flags that gate order 
+    submission may survive if the Historical replay leaves them in a bad state:
+    - pendingExit may be true from the prior session's last exit
+    - dailyLimitHit or dailyProfitHit may be true from the prior session
+    - openTradeDirection != 0 if Historical replay detected a position that doesn't 
+      actually exist in Realtime
+    - flattenFired = true preventing the flatten from re-arming
+    - activeEntrySignals list may contain stale signals from the prior run
+    FIX: In State.Realtime reset block, ensure EVERY boolean flag and stateful field 
+    is reset unconditionally. Do not rely on State.DataLoaded or Historical to set these.
+    Specifically add resets for: dailyLimitHit, dailyProfitHit, dailyTradeCount, 
+    flattenFired, pendingLimitFlatten, openTradeDirection, stopsArmed, pendingExit,
+    pendingExitTicks, flatSyncGraceTicks, all pending* action flags, activeEntrySignals.Clear(),
+    trailActive, trailPrice, trailMaxProfitPts, trapPatternActive, trapDirectionHistory.Clear().
+
+0b. HISTORICAL REPLAY INTERFERENCE:
+    During the Historical replay phase (before Realtime), OnBarUpdate runs against 
+    historical bars. If any of those bars trigger auto-entry logic or the daily limit 
+    check (e.g., SystemPerformance.AllTrades has yesterday's trades), flags like 
+    dailyLimitHit can become true during Historical and then block Realtime entries.
+    FIX: Gate ALL stateful mutations (dailyLimitHit, dailyProfitHit, pendingExit, 
+    openTradeDirection changes, DCA counters) behind:
+      if (State != State.Realtime) return; // or skip that block
+    Specifically: in OnExecutionUpdate and OnPositionUpdate, add an early return if 
+    State != State.Realtime. Historical fills should not mutate daily P&L flags.
+    In OnBarUpdate, guard the auto-flatten, CME close, daily limit flatten, and 
+    dailyLimitHit status display with: if (State != State.Realtime) return/skip.
+
+0c. DASHBOARD NOT REBUILT ON RE-ENABLE:
+    dashboardAttached is set to false in State.Terminated/RemoveDashboard, but the 
+    dashboard build is only attempted in OnBarUpdate when !dashboardAttached. If the 
+    ChartControl is not yet ready on the first Realtime bar, dashboardAttached remains 
+    false but the panel reference is null and the build fails silently, leaving the 
+    dashboard in a broken state. The strategy runs but has no UI, making it appear broken.
+    FIX: Add a retry counter: private int dashBuildRetryCount = 0 (max 10 retries).
+    In BuildDashboard(), if placement fails (placed == false), increment dashBuildRetryCount 
+    and set dashboardAttached = false. In OnBarUpdate, if !dashboardAttached and 
+    dashBuildRetryCount < 10, attempt BuildDashboard() every 5 ticks (not every tick).
+    Reset dashBuildRetryCount = 0 in State.Realtime reset block.
+
+0d. PNLBASELINEOFFSET CALCULATION ON RE-ENABLE:
+    The current code in State.Realtime calculates pnlBaselineOffset by summing 
+    SystemPerformance.AllTrades for today's date. If there were trades in the prior 
+    session (before disable), this correctly offsets them. However, if re-enabled on 
+    the SAME DAY after some trades, the offset is recalculated including those same 
+    trades, which then makes dailyRealizedPnL appear as $0 even when real P&L exists.
+    The user wants: on re-enable, reset Unrealized and Daily P&L display to $0 
+    (fresh visual start), but always show the real account cash balance.
+    FIX: 
+    - Keep the pnlBaselineOffset calculation exactly as-is (it correctly zeros out 
+      the displayed daily P&L on re-enable — this IS the intended behavior per the user).
+    - In State.Realtime, explicitly set dailyRealizedPnL = 0 after recalculating 
+      pnlBaselineOffset (the display starts at $0; the offset handles the math).
+    - Account balance (Account.Get(AccountItem.CashValue)) is read live from the 
+      account object every dashboard refresh — it always shows the real balance 
+      regardless of enable/disable cycles. This is correct — preserve it.
+
+0e. MAX DAILY LOSS RESET ON RE-ENABLE:
+    dailyLimitHit is reset in State.Realtime, but the dailyRealizedPnL is reset to 0 
+    too, so the daily loss guard should work fresh after re-enable.
+    However: if the user hit the daily loss limit, disabled, and re-enabled, the intent 
+    is to allow trading again (fresh start). The State.Realtime reset already handles 
+    this by setting dailyLimitHit = false and dailyRealizedPnL = 0.
+    FIX: Verify the reset in State.Realtime is truly unconditional — do NOT use 
+    "if (dailyLimitHit)" guards around the reset. Set it to false regardless.
+    Add a Print statement: "State.Realtime: dailyLimitHit RESET — daily loss guard cleared"
+
+0f. FRESH DEFAULT VALUES ON RE-ENABLE:
+    The user wants all parameter defaults to appear fresh as if the strategy was just 
+    added for the first time. Parameters set via SetDefaults persist across enable/disable 
+    in NT8 (they are stored in the workspace). This is NT8's expected behavior and 
+    cannot be fully overridden. However, all RUNTIME state (not user parameters) must 
+    reset cleanly. Ensure the State.Realtime block resets:
+    - slPoints back to defaultSlPoints (the value from SetDefaults)
+    - tpPoints back to defaultTpPoints 
+    - contracts back to defaultContracts (add this saved default, same pattern)
+    - jumpSlPercent back to defaultJumpSlPercent (add this saved default)
+    - autoMode stays as the user last set it (this IS a user parameter, correct)
+    - autoStrategy stays as the user last set it (user parameter, correct)
+    After resetting these runtime values, call UpdateAdjustLabels() via Dispatcher 
+    to reflect the reset values in the dashboard UI immediately.
+
+═══════════════════════════════════════════════════════════════════════════════
+SECTION 1 — ORDER EXECUTION OVERHAUL
+═══════════════════════════════════════════════════════════════════════════════
+
+DASHBOARD BUTTON LAYOUT — MIRROR NT8'S NATIVE ORDER ENTRY PANEL:
+NT8's SuperDOM and Order Entry panel has these order types for NQ:
+  • Market  — fills immediately at best available price (no price specified)
+  • Ask/Bid — aggressive limit AT current ask (buy) or bid (sell); near-instant fill
+               but with a price ceiling/floor to cap slippage on fast moves
+  • Limit   — passive resting order BELOW bid (buy) or ABOVE ask (sell); waits for 
+               price to come to you; may not fill if price moves away
+
+The dashboard will have THREE rows of order buttons, exactly mirroring NT8:
+  ROW 1 (Market):  [ ▲ BUY MKT  ]  [ ▽ SELL MKT  ]
+  ROW 2 (Ask/Bid): [ ▲ BUY ASK  ]  [ ▽ SELL BID  ]
+  ROW 3 (Limit):   [ ▲ BUY LMT  ]  [ ▽ SELL LMT  ]
+
+Colors: All BUY buttons = lime green background. All SELL buttons = red background.
+All six button types are subject to identical guards: pendingExit block, dailyLimitHit, 
+dailyProfitHit, maxTradesPerDay, CME maintenance window, DCA limits, entry cooldown.
+All six use stealth signal naming: signalName = " " (single space).
+
+─────────────────────────────────────────────────────────
+1a. BUY MKT / SELL MKT (EnterLong / EnterShort — market orders)
+─────────────────────────────────────────────────────────
+NT8 implementation: EnterLong(contracts, signalName) / EnterShort(contracts, signalName)
+These submit a market order. NT8 routes them as market orders to the exchange.
+
+CURRENT BUG: averageEntryPrice is set to Close[0] at submission time (before fill 
+confirmation), so ArmHiddenStops() arms SL/TP at the wrong price. If the fill comes 
+back at a different price (slippage), SL and TP are offset from the real entry.
+
+FIX: 
+- Keep EnterLong/EnterShort as the submission mechanism (correct for managed mode).
+- Remove ArmHiddenStops() from ExecuteLongEntry and ExecuteShortEntry.
+- Set openTradeDirection immediately at submission (needed for state tracking).
+- Set averageEntryPrice = 0 (unknown until fill) at submission time.
+- Arm stops in OnOrderUpdate when orderState == OrderState.Filled using averageFillPrice.
+- Log submission: Print("BUY MKT submitted — waiting for fill confirmation")
+
+─────────────────────────────────────────────────────────
+1b. BUY ASK / SELL BID (EnterLongLimit at Ask / EnterShortLimit at Bid)
+─────────────────────────────────────────────────────────
+NT8 implementation: This is an AGGRESSIVE LIMIT order.
+  - BUY ASK  = EnterLongLimit(contracts, GetCurrentAsk(), signalName)
+    Places a buy limit AT the current ask price. Since the ask IS the best offer,
+    this will fill almost immediately (like a market order) but cannot fill ABOVE
+    the ask — gives you slippage protection on fast-moving NQ spikes.
+  - SELL BID = EnterShortLimit(contracts, GetCurrentBid(), signalName)
+    Places a sell limit AT the current bid price. Fills almost immediately but 
+    cannot fill BELOW the bid.
+
+Use case: preferred over Market when you want speed but with a price ceiling/floor.
+Typical for NQ scalping where a 1-2 tick slippage difference matters.
+
+CURRENT BUG: The existing ExecuteLongLimitEntry places at GetCurrentBid() (should be 
+GetCurrentAsk() for aggressive fills), and ExecuteShortLimitEntry places at 
+GetCurrentAsk() (should be GetCurrentBid()). This is backwards.
+
+FIX:
+- BUY ASK  → EnterLongLimit(contracts, GetCurrentAsk(), signalName)
+- SELL BID → EnterShortLimit(contracts, GetCurrentBid(), signalName)
+- These are the "ROW 2" buttons (new BUY ASK / SELL BID buttons).
+- Arm stops in OnOrderUpdate on fill, using averageFillPrice (same pattern as 1a).
+- If the order is not filled within 3 seconds (add a DateTime timestamp on submission),
+  cancel it via CancelOrder() and show "⚠ ASK/BID order expired — not filled" on dashboard.
+
+─────────────────────────────────────────────────────────
+1c. BUY LMT / SELL LMT (EnterLongLimit / EnterShortLimit — passive)
+─────────────────────────────────────────────────────────
+NT8 implementation: PASSIVE LIMIT order — waits for price to come to you.
+  - BUY LMT  = EnterLongLimit(contracts, GetCurrentBid(), signalName)
+    Places a buy limit AT or BELOW the current bid. You are bidding for the contract.
+    Will only fill if price trades at or below your limit price.
+  - SELL LMT = EnterShortLimit(contracts, GetCurrentAsk(), signalName)
+    Places a sell limit AT or ABOVE the current ask. You are offering the contract.
+    Will only fill if price trades at or above your limit price.
+
+Use case: used when you want a specific price and are willing to wait. Common for 
+entering pullbacks or fading extended moves. May never fill if price moves away.
+
+FIX: The existing limit orders had the bid/ask reversed (now corrected per 1b above).
+These are now correctly:
+  - BUY LMT  → GetCurrentBid() (passive, below ask)
+  - SELL LMT → GetCurrentAsk() (passive, above bid)
+These are the "ROW 3" buttons (the existing BUY LMT / SELL LMT buttons).
+Arm stops in OnOrderUpdate on fill, using averageFillPrice.
+No expiry timer for passive limits (they can rest indefinitely until manually cancelled).
+
+─────────────────────────────────────────────────────────
+1d. REVERSE LOGIC (pendingReverseLong / pendingReverseShort)
+─────────────────────────────────────────────────────────
+Keep the two-step reverse flow but add a 2-tick delay guard:
+After ExecuteCloseTrade() is called for a reverse, do NOT fire the pending reverse 
+entry until Position.MarketPosition == MarketPosition.Flat is confirmed AND 
+at least 2 OnBarUpdate ticks have passed since the close was submitted.
+Add: private int reversePendingTicks = 0. Increment each tick while a reverse is 
+pending. Fire the entry only when reversePendingTicks >= 2 AND position is flat.
+Reset reversePendingTicks = 0 when the entry fires or is cancelled.
+
+─────────────────────────────────────────────────────────
+1e. OnOrderUpdate — the fill confirmation hub (new override)
+─────────────────────────────────────────────────────────
+Add: protected override void OnOrderUpdate(Order order, double limitPrice, double stopPrice,
+int quantity, int filled, double averageFillPrice, OrderState orderState, DateTime time, 
+ErrorCode error, string comment)
+
+GUARD: if (State != State.Realtime) return;
+
+When orderState == OrderState.Filled AND order.IsEntry:
+  - Calculate new averageEntryPrice using weighted average:
+    newAvg = (averageEntryPrice * priorContracts + averageFillPrice * filled) / newTotal
+  - Update totalContracts += filled
+  - Call ArmHiddenStops() with the corrected averageEntryPrice
+  - Print fill confirmation with actual price
+
+When orderState == OrderState.Filled AND order.IsExit:
+  - Log the exit fill price
+  - ResetPositionState() will be called by OnPositionUpdate when flat
+
+When orderState == OrderState.Cancelled OR OrderState.Rejected:
+  - If order.IsEntry: decrement openDcaCount, dailyTradeCount, remove last activeEntrySignals
+  - If position is flat after cancellation, call ResetPositionState()
+  - Show dashboard message: "⚠ Order rejected/cancelled — " + error.ToString()
+  - Print the rejection with error code
+
+═══════════════════════════════════════════════════════════════════════════════
+SECTION 2 — CLOSE / FLATTEN OVERHAUL
+═══════════════════════════════════════════════════════════════════════════════
+
+2a. CLOSE ALL button (ExecuteCloseTrade):
+    PRIMARY path: Account.Flatten(new[] { Instrument }) — nuclear, 100% reliable.
+    FALLBACK: ExitLong/ExitShort loop if Account.Flatten throws.
+    After calling: set stopsArmed=false, pendingExit=true immediately.
+    Remove SL/TP/trail draw objects immediately (visual cleanup on strategy thread).
+    Clear all pending entry flags (pendingLong, pendingShort, pendingLongLimit, etc.).
+
+2b. CLOSE 1 (ExecuteCloseOne — partial close):
+    Keep ExitLong(1,"Close",sig) / ExitShort(1,"Close",sig) — correct for partial.
+    BUG FIX: Move openDcaCount and totalContracts decrements to OnOrderUpdate 
+    (when partial close order reaches Filled state) to prevent state desync on rejection.
+    Add a field: private Order pendingPartialCloseOrder = null to track the partial order.
+
+2c. EMERGENCY KILL:
+    Step 1: CancelPendingOrders() — cancel ALL working orders
+    Step 2: Account.Flatten(new[] { Instrument }) — nuclear flatten
+    Step 3: Set a permanent halt flag: private bool emergencyKillActive = false → true
+    Step 4: Set dailyLimitHit = true (blocks ALL auto re-entry)
+    Step 5: Clear ALL pending* flags
+    Step 6: Disable adaptive trail and trap detector
+    Step 7: Dashboard: "⛔ EMERGENCY KILL — HALTED" in red, bold
+    Step 8: Print("*** EMERGENCY KILL ACTIVATED ***")
+    Reset emergencyKillActive = false in State.Realtime reset (re-enable clears it).
+
+═══════════════════════════════════════════════════════════════════════════════
+SECTION 3 — STEALTH ORDER NAMING (preserve + extend to all new types)
+═══════════════════════════════════════════════════════════════════════════════
+
+PRESERVE ALL EXISTING STEALTH NAMING — extend to ALL new order types:
+  - ALL entry signals (MKT, ASK, BID, LMT) = signalName = " " (single space)
+  - ALL exit signals = "Close"
+  - Emergency Kill uses Account.Flatten (no signal name — correct)
+  - No changes. This is prop-firm safety critical — do not alter.
+
+═══════════════════════════════════════════════════════════════════════════════
+SECTION 4 — HIDDEN SL/TP + ADAPTIVE TRAIL (preserve + harden)
+═══════════════════════════════════════════════════════════════════════════════
+
+4a. ArmHiddenStops() is now called ONLY from OnOrderUpdate on confirmed fill.
+    Remove ArmHiddenStops() from ALL entry execution methods.
+    Keep pendingRearm path for mid-trade +/- adjustments (unchanged).
+
+4b. MonitorHiddenStops() — keep exactly as-is.
+
+4c. MonitorAdaptiveTrail() + all profit tiers (T1-BE, T2-Strong, T3-Runner) — keep as-is.
+
+4d. NEW: VOLATILITY SPIKE GUARD
+    Field: private int volatilitySpikeGuardBars = 0;
+    In MonitorAdaptiveTrail(), before CalculateTrailDistance():
+    - Check: if (indAtr[0] > avgAtr10 * 2.5 && volatilitySpikeGuardBars == 0)
+      Set volatilitySpikeGuardBars = 3
+      Print("VOLATILITY SPIKE GUARD: ATR spike to " + indAtr[0].ToString("F2"))
+    - If volatilitySpikeGuardBars > 0: use trailMinPoints as the trail distance 
+      regardless of regime score. Decrement volatilitySpikeGuardBars each bar.
+    - avgAtr10: compute inline as average of indAtr[i] for i=1 to 10.
+    Reset volatilitySpikeGuardBars = 0 in ResetPositionState().
+
+4e. In MonitorHiddenStops(): add daily limit check at the top:
+    if (dailyLimitHit || dailyProfitHit) { ExecuteFlatten(); return; }
+    This ensures a mid-tick daily limit trigger (from a partial close) immediately 
+    triggers the flatten on the very next SL monitor call.
+
+═══════════════════════════════════════════════════════════════════════════════
+SECTION 5 — P&L + ACCOUNT DISPLAY BUGS
+═══════════════════════════════════════════════════════════════════════════════
+
+5a. INCREMENTAL P&L TRACKING (replace O(n) AllTrades loop):
+    Field: private double sessionRealizedPnL = 0; // incremental, reset on re-enable
+    In OnExecutionUpdate (GUARD: if State != State.Realtime, return):
+    When a closing fill arrives (execution.Order.IsExit && execution fills):
+      sessionRealizedPnL += (profit from this execution)
+    Use GetClosedPosition() or track via the execution quantity/price/direction.
+    Specifically: track open position direction and entry price, then on close execution
+    compute: profitThisClose = (fillPrice - avgEntry) * filled * pointValue * direction
+    where pointValue = 20.0 (NQ $20/point/contract).
+    Set dailyRealizedPnL = sessionRealizedPnL - pnlBaselineOffset.
+    Keep daily loss/profit checks AFTER updating dailyRealizedPnL.
+    SANITY CHECK: every 50 bars in OnBarUpdate, verify sessionRealizedPnL against 
+    SystemPerformance.AllTrades sum for today. If drift > $10, resync from AllTrades.
+
+5b. DISPLAY FORMAT — replace the three P&L labels with four clean rows:
+    lblUnrealized : "▶  Unrealized:   +$XXX.XX"   green/red
+    lblPnL        : "●  Realized:     +$XXX.XX  [X/Y trades]"  green/red
+    lblTotalPnL   : "Σ  Session Total: +$XXX.XX"  green/red, bold  (new label)
+    lblAccountBal : "🏦 Account Cash:  $XXX,XXX.XX"  white/gray (using CashValue)
+    Always show account cash balance live from Account.Get(AccountItem.CashValue).
+    Handle the Account.Get exception gracefully: show "N/A" on any exception.
+    Add lblTotalPnL as a new TextBlock field.
+
+5c. ON RE-ENABLE: unrealized resets to $0 (position is flat after re-enable).
+    Realized resets to $0 display (pnlBaselineOffset absorbs prior trades).
+    Account cash always shows the real live value — never reset.
+    This is the intended behavior per user requirements.
+
+═══════════════════════════════════════════════════════════════════════════════
+SECTION 6 — TRADING HOURS — FLAG + CME RULES
+═══════════════════════════════════════════════════════════════════════════════
+
+6a. NEW PARAMETER: TradingHoursEnabled (bool, default: true)
+    Group: "6 — Trading Hours", Order: 0
+    Description: "ON = auto mode respects TradingStartTime/TradingEndTime windows. 
+    OFF = auto mode trades 24/6 during CME NQ session. Manual buttons always trade 
+    at any time regardless of this setting."
+
+6b. insideTradingHours guard (auto mode only):
+    bool insideTradingHours = !tradingHoursEnabled 
+        || (currentTime >= tradingStartTime && currentTime < tradingEndTime);
+    Manual button entries bypass this check entirely.
+
+6c. CME MAINTENANCE (4:55 PM – 6:00 PM ET = 165500 to 180000):
+    Hard block for ALL new entries including manual buttons during this window.
+    Show: "⛔ CME Maintenance 4:55–6PM ET" on dashboard in orange-red.
+    This block cannot be overridden by TradingHoursEnabled.
+
+6d. AUTO-FLATTEN default: change flattenTime default from 155900 to 165000 (4:50 PM ET).
+    Update description: "Auto-flatten open positions. Default 165000 = 4:50 PM ET 
+    (5 minutes before CME 4:55 PM maintenance window). Fires regardless of TradingHoursEnabled."
+    The auto-flatten fires regardless of TradingHoursEnabled — always protects positions.
+
+6e. Dashboard hours label (lblTradeHours) updated format:
+    CME maintenance:   "⛔ CME Maintenance — no entries"          [orange-red]
+    Daily limit hit:   "■ HALTED — daily limit"                   [red]
+    Emergency killed:  "⛔ HALTED — Emergency Kill active"        [red]
+    Hours ON, active:  "● Auto active: HH:MM–HH:MM  |  Flatten: HH:MM"  [green]
+    Hours ON, outside: "○ Auto off-hours (manual OK)"             [gray]
+    Hours OFF (24H):   "⚡ Auto 24H mode (manual OK)"             [yellow]
+    Add a small "HOURS: ON" / "HOURS: 24H" toggle button (85×22px) in the same row.
+
+═══════════════════════════════════════════════════════════════════════════════
+SECTION 7 — POST-ENTRY TRAP DETECTOR (new intelligent module, on/off toggle)
+═══════════════════════════════════════════════════════════════════════════════
+
+BACKGROUND: NQ overnight (low-volume) sessions commonly exhibit MM range traps —
+bots cycle price in a tight band (often 8–20 NQ points), sweeping stops on both 
+sides repeatedly. This module detects the pattern after you are already in a trade 
+and adapts intelligently to protect your position and optionally trade the range.
+
+NEW PARAMETER: EnablePostEntryTrapDetector (bool, default: false)
+Group: "8 — Post-Entry Trap Detector"
+Description: "Detects MM range traps while in a trade. When a tight-range, high-reversal, 
+low-volume pattern is detected, Mode 1 moves SL to breakeven. After 5 bars confirmed, 
+Mode 2 targets the range edge for a quick exit. Designed for NQ overnight sessions."
+
+NEW FIELDS:
+    private bool   trapDetectorEnabled;
+    private int    trapDetectWindowBars   = 20;
+    private int    trapReverseCount       = 0;
+    private double trapRangeHigh          = 0;
+    private double trapRangeLow           = 0;
+    private bool   trapPatternActive      = false;
+    private int    trapPatternBarsActive  = 0;
+    private int    trapAdaptiveMode       = 0;   // 0=inactive, 1=protect, 2=range-trade
+    private double trapOriginalTP         = 0;   // saved TP before trap modification
+    private int    trapExpiryCandidateBars = 0;  // bars since pattern seemed to expire
+    private readonly Queue<int> trapDirectionHistory = new Queue<int>();
+    private Button btnTrapToggle;   // dashboard button
+
+NEW METHOD: private void MonitorPostEntryTrap()
+    Call from OnBarUpdate only when IsFirstTickOfBar (run once per bar, not every tick):
+    if (!trapDetectorEnabled || pendingExit || Position.MarketPosition == Flat) return;
+    if (!IsFirstTickOfBar) return;
+
+ALGORITHM:
+
+Step 1 — RECORD BAR DIRECTION:
+    int barDir = Close[0] >= Open[0] ? 1 : -1;
+    trapDirectionHistory.Enqueue(barDir);
+    while (trapDirectionHistory.Count > trapDetectWindowBars)
+        trapDirectionHistory.Dequeue();
+    if (trapDirectionHistory.Count < trapDetectWindowBars / 2) return; // not enough data
+
+Step 2 — COUNT REVERSALS:
+    var dirs = trapDirectionHistory.ToArray();
+    int reversals = 0;
+    for (int i = 1; i < dirs.Length; i++)
+        if (dirs[i] != dirs[i-1]) reversals++;
+    double priceRange = MAX(High, trapDetectWindowBars)[0] - MIN(Low, trapDetectWindowBars)[0];
+    double rangeInPoints = priceRange / (TickSize * NQ_TICKS_PER_POINT);
+
+Step 3 — COMPUTE VOLUME AVERAGE:
+    double volSum = 0;
+    int vlb = Math.Min(20, CurrentBar - 1);
+    for (int i = 1; i <= vlb; i++) volSum += Volume[i];
+    double avgVol20 = vlb > 0 ? volSum / vlb : Volume[0];
+
+Step 4 — TRAP PATTERN RECOGNITION:
+    bool highReversals  = reversals >= (int)(trapDetectWindowBars * 0.6);
+    bool tightRange     = rangeInPoints < indAtr[0] / (TickSize * NQ_TICKS_PER_POINT) * 4.0;
+    bool lowVolume      = avgVol20 > 0 && Volume[0] < avgVol20 * 0.70;
+    bool inTradeEnough  = openDcaCount > 0 && (DateTime.Now - lastEntryWallTime).TotalSeconds > 30;
+
+    if (highReversals && tightRange && lowVolume && inTradeEnough && !trapPatternActive)
+    {
+        trapPatternActive      = true;
+        trapPatternBarsActive  = 0;
+        trapAdaptiveMode       = 1;   // Mode 1: protect
+        trapRangeHigh          = MAX(High, trapDetectWindowBars)[0];
+        trapRangeLow           = MIN(Low,  trapDetectWindowBars)[0];
+        trapOriginalTP         = hiddenTargetPrice;
+        // MODE 1: Move SL to breakeven
+        double beTick          = TickSize;
+        if (openTradeDirection == 1)  hiddenStopPrice = averageEntryPrice + beTick;
+        else                          hiddenStopPrice = averageEntryPrice - beTick;
+        Print("POST-ENTRY TRAP MODE 1 ACTIVATED: " + reversals + " reversals, range=" 
+            + rangeInPoints.ToString("F1") + "pts, vol=" 
+            + (Volume[0]/avgVol20*100).ToString("F0") + "% of avg. SL→Breakeven.");
+    }
+    else if (trapPatternActive)
+    {
+        trapPatternBarsActive++;
+        
+        // MODE 2: Range trade — activate after 5 confirmed bars in trap
+        if (trapAdaptiveMode == 1 && trapPatternBarsActive >= 5)
+        {
+            trapAdaptiveMode = 2;
+            double rangeTop    = trapRangeHigh;
+            double rangeBottom = trapRangeLow;
+            double rangePct    = trapRangeHigh - trapRangeLow > 0
+                ? (Close[0] - trapRangeLow) / (trapRangeHigh - trapRangeLow) : 0.5;
+            
+            if (openTradeDirection == 1 && rangePct > 0.75)
+                hiddenTargetPrice = trapRangeHigh - 2 * TickSize;   // target range top
+            else if (openTradeDirection == -1 && rangePct < 0.25)
+                hiddenTargetPrice = trapRangeLow  + 2 * TickSize;   // target range bottom
+            Print("POST-ENTRY TRAP MODE 2: targeting range edge @ " 
+                + hiddenTargetPrice.ToString("F2"));
+        }
+        
+        // EXPIRY: if pattern weakens for 3 consecutive bars, cancel trap mode
+        if (reversals < (int)(trapDetectWindowBars * 0.4))
+        {
+            trapExpiryCandidateBars++;
+            if (trapExpiryCandidateBars >= 3)
+            {
+                trapPatternActive      = false;
+                trapAdaptiveMode       = 0;
+                trapExpiryCandidateBars = 0;
+                if (trapOriginalTP > 0) hiddenTargetPrice = trapOriginalTP;
+                Print("Post-entry trap pattern expired — TP restored to " 
+                    + hiddenTargetPrice.ToString("F2"));
+            }
+        }
+        else { trapExpiryCandidateBars = 0; }
+    }
+
+Reset trapPatternActive, trapAdaptiveMode, trapOriginalTP, trapDirectionHistory.Clear() 
+in ResetPositionState() and in the State.Realtime reset block.
+
+DASHBOARD DISPLAY for trap detector:
+    If trapDetectorEnabled && trapPatternActive && trapAdaptiveMode == 1:
+        "⚠ TRAP Mode 1 — SL at Breakeven" [yellow]
+    If trapDetectorEnabled && trapPatternActive && trapAdaptiveMode == 2:
+        "⚡ TRAP Mode 2 — Range targeting" [cyan]  
+    If trapDetectorEnabled && !trapPatternActive:
+        "Trap: scanning" [gray]
+    Show this as a new label below the trail info label.
+
+DASHBOARD TOGGLE BUTTON (btnTrapToggle):
+    Only add this button if EnablePostEntryTrapDetector parameter == true.
+    Label: "TRAP: ON" (cyan bg) or "TRAP: OFF" (dark bg), 85×22px.
+    Place in the same row as TRAIL: ON/OFF button.
+    Clicking toggles trapDetectorEnabled and updates button state.
+
+═══════════════════════════════════════════════════════════════════════════════
+SECTION 8 — DASHBOARD IMPROVEMENTS + BUG FIXES
+═══════════════════════════════════════════════════════════════════════════════
+
+8a. THREE ROWS OF ORDER BUTTONS (as defined in Section 1):
+    ROW 1: [ ▲ BUY MKT  ]  [ ▽ SELL MKT  ]   — existing, keep
+    ROW 2: [ ▲ BUY ASK  ]  [ ▽ SELL BID  ]   — new (was the LMT row, now renamed correctly)
+    ROW 3: [ ▲ BUY LMT  ]  [ ▽ SELL LMT  ]   — passive limit, keep
+    All buttons: Width=120, Height=30. BUY=lime green bg. SELL=red bg.
+    Button click routing: add btnBuyAsk, btnSellBid Button fields.
+    Pending flags: add pendingBuyAsk (bool), pendingSellBid (bool).
+    Wire them in the PreviewMouseUp handler same as other buttons.
+
+8b. P&L SECTION — four clean rows (from Section 5b):
+    lblUnrealized:  "▶  Unrealized:    +$XXX.XX"
+    lblPnL:         "●  Realized:      +$XXX.XX  [X/Y trades]"
+    lblTotalPnL:    "Σ  Session Total:  +$XXX.XX"   (new field, bold)
+    lblAccountBal:  "🏦 Account Cash:   $XXX,XXX.XX"
+
+8c. TRADING HOURS ROW: 
+    Horizontal row containing lblTradeHours (expands) + btnHoursToggle (85×22px).
+    btnHoursToggle: "HOURS: ON" [green] or "HOURS: 24H" [yellow].
+    Clicking toggles tradingHoursEnabled and refreshes the button + label.
+
+8d. TRAIL + TRAP TOGGLE ROW:
+    Horizontal row: btnTrailToggle (80×22) + btnTrapToggle (85×22, if param enabled).
+
+8e. NULL-GUARD FIX for all Dispatcher.InvokeAsync lambdas:
+    At the top of EVERY Dispatcher.InvokeAsync(() => { ... }) callback body, add:
+    if (lblPnL == null || ChartControl == null) return;
+    And before accessing each individual label: 
+    if (lbl != null) { lbl.Text = ...; lbl.Foreground = ...; }
+    This prevents NullReferenceException during rapid enable/disable cycles where 
+    the UI thread processes a queued callback after RemoveDashboard() has nulled 
+    the label references.
+
+8f. DASHBOARD REBUILD RETRY (from Section 0c):
+    private int dashBuildRetryCount = 0;
+    Attempt BuildDashboard() every 5 OnBarUpdate ticks if !dashboardAttached 
+    and dashBuildRetryCount < 10. Reset retry count in State.Realtime.
+
+8g. TRADING HOURS DISPLAY FIX:
+    Show BOTH tradingEndTime and flattenTime in the active hours label:
+    "● Auto active: 9:30AM–4:00PM  |  Flatten: 4:50PM"
+    Use FormatTime() helper for both values.
+
+8h. POSITION INFO — add unrealized P&L per contract in the position row:
+    lblPosition: "DCA: X/Y  |  Avg: XXXXX.XX  |  +$XX.XX/ct"
+    The per-contract unrealized is: unrealizedPnL / Math.Max(1, Position.Quantity)
+
+═══════════════════════════════════════════════════════════════════════════════
+SECTION 9 — CODE QUALITY + SMART ENHANCEMENTS
+═══════════════════════════════════════════════════════════════════════════════
+
+9a. REFACTOR shared entry guards into: private bool CanEnterTrade(string direction)
+    Checks: pendingExit, emergencyKillActive, dailyLimitHit, dailyProfitHit, 
+    maxTradesPerDay, CME maintenance window, entry cooldown.
+    Returns false with UpdateDashboardStatus() message if any guard fires.
+    All 6 entry methods (MKT, ASK, BID, LMT × 2 directions) call CanEnterTrade() first.
+    The direction-specific checks (DCA limits, opposite position reversal) remain in 
+    each individual method after CanEnterTrade() passes.
+
+9b. CONSTANTS (add at top of class, inside #region Fields):
+    private const double NQ_TICKS_PER_POINT  = 4.0;    // 1 NQ point = 4 ticks
+    private const double NQ_DOLLARS_PER_TICK = 5.0;    // 1 tick = $5 per contract
+    private const double NQ_DOLLARS_PER_POINT = 20.0;  // 1 NQ point = $20 per contract
+    Replace ALL hardcoded 4.0 tick multipliers and 20.0 dollar multipliers throughout 
+    the entire file with these constants. This makes the code immediately portable 
+    if you ever use this strategy on MNQ or ES.
+
+9c. NIGHT SESSION PENALTY (new smart filter #5 in ApplySmartFilters()):
+    int ct = ToTime(Time[0]);
+    bool isNightSession = ct < 83000 || ct >= 160000;  // before 8:30 AM or after 4:00 PM ET
+    if (isNightSession)
+    {
+        double volRatio = avgVol20 > 0 ? Volume[0] / avgVol20 : 1.0;
+        double penalty  = volRatio > 1.3 ? 0.85 : 0.75;   // 15% or 25% penalty
+        lastBullConfidence *= penalty;
+        lastBearConfidence *= penalty;
+    }
+    This reduces false signals during low-volume overnight NQ sessions.
+
+9d. Keep 100% unchanged:
+    - All 4 auto strategies (CalcMomentumVwap, CalcKeyLevelBreakout, 
+      CalcLiquiditySweepReversal, CalcOpeningRangeBreakout)
+    - Auto Select (strategy 4) evaluation loop
+    - Smart filters 1–4 (Volume, Conflict, Exhaustion, Wick)
+    - VWAP manual calculation (UpdateVwap, ResetVwap)
+    - ORB level tracking (UpdateOrbLevels)
+    - All chart annotation drawing (DrawChartAnnotations, DrawDcaLevels, 
+      DrawVwapLine, DrawKeyLevels, DrawSweepSignals)
+    - All dashboard helper methods (MakeLabel, MakeSeparator, MakeAdjustRow, 
+      MakeSmallButton, MakeToggleButton)
+    - FormatTime helper
+    - ResetDailyTracking
+    - All NinjaScriptProperty parameters (existing ones unchanged, new ones added)
+
+═══════════════════════════════════════════════════════════════════════════════
+SECTION 10 — COMPLETE DOCUMENTATION
+═══════════════════════════════════════════════════════════════════════════════
+
+Add a comprehensive documentation header comment block at the top of the file 
+(replacing the existing header) that covers ALL features of the v1 strategy.
+Structure it with clearly labeled sections:
+
+  SECTION A: OVERVIEW + VERSION HISTORY
+  SECTION B: ORDER TYPES (MKT, ASK/BID, LMT — explain each + use case)
+  SECTION C: STEALTH ORDER NAMING (prop-firm safety)
+  SECTION D: HIDDEN SL/TP (how it works, why no resting orders)
+  SECTION E: ADAPTIVE TRAILING STOP (regime detection, trail distance, tiers)
+  SECTION F: PROFIT-TIER TRAILING (T1-BE, T2-Strong, T3-Runner)
+  SECTION G: VOLATILITY SPIKE GUARD (when it activates, what it does)
+  SECTION H: SMART SIGNAL FILTERS (all 5 filters explained)
+  SECTION I: AUTO STRATEGIES (all 4 strategies + Auto Select)
+  SECTION J: POST-ENTRY TRAP DETECTOR (algorithm, Mode 1, Mode 2, expiry)
+  SECTION K: RISK MANAGEMENT (SL/TP, daily loss, daily profit, max trades, DCA)
+  SECTION L: TRADING HOURS (TradingHoursEnabled, CME rules, auto-flatten)
+  SECTION M: DASHBOARD GUIDE (every button, label, and control explained)
+  SECTION N: ENABLE/DISABLE BEHAVIOR (what resets, what persists)
+  SECTION O: KNOWN BEHAVIORS + PROP-FIRM NOTES
+
+Also add XML summary comments (/// <summary>) on every private method explaining:
+  - What the method does
+  - What state it reads and what state it modifies
+  - Any side effects (orders submitted, draw objects created/removed, flags set)
+
+═══════════════════════════════════════════════════════════════════════════════
+FINAL COMPILE CONSTRAINTS
+═══════════════════════════════════════════════════════════════════════════════
+
+Target: NT8 8.1.x managed strategy (IsUnmanaged = false)
+Calculate = Calculate.OnEachTick (required for tick-level SL/TP monitoring)
+EntriesPerDirection = 4, EntryHandling = EntryHandling.AllEntries (DCA support)
+IsExitOnSessionCloseStrategy = true, ExitOnSessionCloseSeconds = 30 (keep as-is)
+BarsRequiredToTrade = 25 (keep as-is)
+
+Class name:       Mm_ATM_v1
+File:             mm_ATM_v1.cs
+Name (SetDefaults): "Mm_ATM_v1"
+Description:      "Mm-ATM v1.0 — Native Order Types + Post-Entry Trap Detector + 
+                   24H Mode + Hardened Enable/Disable + Full Documentation"
+
+NO external DLLs. NO AtmStrategyCreate. NO unmanaged mode conversion.
+NO resting SL/TP orders on exchange. NO removal of existing parameters.
+ALL new parameters: [NinjaScriptProperty] [Range(...)] [Display(Name=..., Order=..., 
+GroupName=..., Description=...)] attributes required.
+
+DO NOT truncate. DO NOT use "// ... existing code ...". 
+Output every line of every method. Full file. Compile-ready.

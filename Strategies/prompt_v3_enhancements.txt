@@ -1,0 +1,377 @@
+================================================================================
+  EXPERT PROMPT — Mm_ATM_v3.cs NinjaTrader 8.1 Strategy Enhancement
+  Target model: Claude Opus 4.6
+  File: c:\Github\mrpnet-lab\Strategies\Mm_ATM_v3.cs  (~4295 lines)
+================================================================================
+
+ROLE & EXPERTISE
+----------------
+You are a senior C# software engineer with 15+ years in algorithmic trading systems,
+specializing in NinjaTrader 8.1 (NT8) managed strategies. You are simultaneously an
+expert NQ (E-mini NASDAQ-100) futures trader with deep institutional knowledge of how
+Market Makers (MMs) and HFT bots operate on the NQ — stop hunts, liquidity sweeps,
+false breakouts, iceberg orders, spread widening traps, trap-and-reverse setups,
+news-driven fake moves, and systematic targeting of visible stop clusters.
+
+You know that:
+- NQ moves in $20/point increments, 4 ticks/point ($5/tick)
+- Typical intraday ATR is 20-35 NQ points on a 1-minute chart
+- MMs specifically target round numbers, prior swing highs/lows, pre-market levels
+- The opening 30 min (9:30-10:00 ET) and news windows are highest-manipulation periods
+- VWAP reclaim/rejection is THE institutional reference for intraday direction
+- The strategy runs on: Calculate=OnEachTick, EntriesPerDirection=4
+- Default settings: SL=67pts, TP=50pts, trailActivation=8pts, minSignalConfidence=55%
+
+CONTEXT — WHAT Mm_ATM_v3.cs IS
+--------------------------------
+Mm_ATM_v3.cs is a NQ automated trading strategy evolved from Mm_ATM.cs.
+The v1 (Mm_ATM.cs) traded frequently and performed well. v3 almost never fires auto
+entries in testing. The root cause analysis (in Mm_Auto_Strategy_comp_enhancements.txt)
+has identified the following confirmed problems:
+
+  PROBLEM 1 — DOUBLE LUNCH PENALTY
+    ApplySmartFilters applies 0.85x multiplier for 11:30-14:00 (Filter 14).
+    Then CalculateSignals subtracts another 10 raw points after ApplySmartFilters.
+    The 45% floor in ApplySmartFilters fires before the -10, so the floor is bypassed.
+    Result: a score of 36 (at floor) becomes 26 after the -10, which is under the
+    55-point threshold. The lunch penalty is applied twice.
+
+  PROBLEM 2 — HTF FILTER TOO TIGHT (0.5 ATR threshold)
+    Filter 6: if |price - htfEma| > 0.5 * ATR -> 0.6x penalty (40% cut).
+    NQ intraday price is routinely 2-5 ATR from the HTF EMA during trend days.
+    This threshold fires on almost every bar of a trending NQ day, killing
+    all counter-trend signals even when a clear short-term reversal is evident.
+    Should be 1.5 ATR (meaningful structural deviation from HTF, not noise).
+
+  PROBLEM 3 — DUPLICATE POC FILTERS (Filters 10 and 13)
+    Filter 10 (near POC <0.3 ATR): 0.85x penalty.
+    Filter 13 (POC Magnetic <1.0 ATR): 0.75x penalty.
+    When Filter 10 fires, Filter 13 almost always also fires.
+    Combined: 0.85 x 0.75 = 0.64x — a 36% reduction near POC.
+    POC is the most-traded price level (institutional magnet). Aggressive
+    penalization near POC eliminates entries at exactly the highest-volume zone.
+
+  PROBLEM 4 — AUTO-SELECT STRATEGY SELECTION IS WRONG
+    v3 CalculateSignals (autoStrategy == 4) calculates raw scores for all 4
+    strategies, then picks the winner by raw score, THEN applies ApplySmartFilters
+    once. The winner by raw score may not be the winner after filtering.
+    v1 applied filters per strategy individually, then picked filtered best.
+    v3 also adds a 3-bar stability lock (require same best strategy 3 bars).
+    Combined with session overrides (force LSR 9:30-10:00, force Momentum 11:30-14:00),
+    the stability filter delays valid entries and the session override blocks
+    momentum-trending mornings (the best trade setups of the day).
+
+  PROBLEM 5 — SMART TRAIL: SPIKE WIDENING WHEN SHOULD TIGHTEN
+    CalculateTrailDistance: if (atr > atrAvg * TRAIL_SPIKE_MULT) spikeMult = 1.5.
+    During volatility spikes (when protecting gains matters most), the trail
+    WIDENS by 50%. This is backward — spikes = tighten to lock profits.
+
+  PROBLEM 6 — SMART TRAIL SPIKE GUARD FREEZES TRAIL
+    MonitorAdaptiveTrail: if (barRange > atr * 3.0) return early.
+    During the most volatile bars (gap opens, news spikes), the trail is frozen.
+    If price spikes against the position during one of these bars, hiddenSL
+    is also not updated, leading to unprotected exposure.
+
+  PROBLEM 7 — SMART TRAIL PAUSE FIRES TOO RARELY
+    Pause requires trailMaxProfitPts >= dynamicActivation * 2.
+    With dynamicActivation = max(8, atrPts * 0.4):
+    - NQ ATR=25pts -> dynActivation=10 -> need 20 pts max profit before pause eligible.
+    For tickets that reach T1-BE (15 pts) but not T2 (25 pts), S-TRAIL never pauses.
+    Change threshold to dynamicActivation * 1.5 to allow pause at T1-BE level.
+
+  PROBLEM 8 — SMART SL MODE C : BUG IN EXTENSION FORMULA
+    Code:   double extendPts = Math.Min(10, slPoints + 30 - slPoints);
+            // slPoints + 30 - slPoints = 30 always -> Math.Min(10, 30) = 10
+    Always extends by exactly 10 pts regardless of slPoints. Likely intended
+    to be proportional to SL distance.
+
+  PROBLEM 9 — S-TRAIL RESUME LOG BUG
+    smartTrailPauseBars is reset to 0 BEFORE the Print statement reads it.
+    The log always shows "after 0 bars" even after a 10-bar pause.
+
+
+CODEBASE OVERVIEW (Mm_ATM_v3.cs key sections)
+----------------------------------------------
+  Line  ~282: smartSlEntryConfidence field declaration
+  Line  ~476: DataLoaded state reset block
+  Line  ~574: Realtime state reset block
+  Line  ~836: Auto entry block (autoMode && !dailyLimitHit ...)
+  Line ~1049: MonitorAdaptiveTrail() — trail logic
+  Line ~1225: EvaluateSmartTrailPause() — S-TRAIL pause/resume
+  Line ~1312: MonitorSmartSL() — Smart SL A/B/C modes
+  Line ~1395: CalculateTrailDistance() — 5-factor trail distance formula
+  Line ~1473: GetCachedTrailDistance() — per-bar cache
+  Line ~1502: MonitorPostEntryTrap() — post-entry trap detector
+  Line ~2519: CalculateSignals() — strategy selection + ApplySmartFilters call
+  Line ~2600: CalcMomentumVwap / CalcKeyLevelBreakout / etc.
+  Line ~2709: ApplySmartFilters() — 14-filter pipeline
+  Line ~4122: [Range(10, 100)] MinSignalConfidence property (already fixed)
+
+TASK — APPLY ALL 9 FIXES DESCRIBED ABOVE
+------------------------------------------
+
+For each fix, provide the EXACT old code and new code (not pseudocode — full C# including
+surrounding context for uniqueness). Confirm line count before and after each change.
+Preserve all existing comments. Do not add extra features beyond what is listed.
+
+
+=== FIX 1: REMOVE DOUBLE LUNCH PENALTY ===
+
+Location: CalculateSignals(), after ApplySmartFilters() call (~line 2591)
+Current code (the post-filter -10 block):
+  // Session-aware: during lunch (11:30-14:00) require higher confidence
+  {
+      int ctPost = ToTime(Time[0]);
+      if (ctPost >= 113000 && ctPost < 140000)
+      {
+          // Effectively raise min confidence by 10 during lunch
+          lastBullConfidence -= 10;
+          lastBearConfidence -= 10;
+          if (lastBullConfidence < 0) lastBullConfidence = 0;
+          if (lastBearConfidence < 0) lastBearConfidence = 0;
+      }
+  }
+
+ACTION: REMOVE the entire block above. The 0.85x in ApplySmartFilters Filter 14
+is sufficient and handles lunch appropriately without bypassing the 45% floor.
+
+
+=== FIX 2: RELAX HTF FILTER THRESHOLD ===
+
+Location: ApplySmartFilters(), Filter 6 (HTF Trend Filter, ~line 2771)
+Current:
+  double htfTrend = CalcHtfTrend();
+  if (htfTrend < 0) lastBullConfidence *= 0.6;  // fighting the HTF trend
+  if (htfTrend > 0) lastBearConfidence *= 0.6;
+
+And CalcHtfTrend() (~line 2899):
+  double dist = (price - htf) / (indAtr[0] > 0 ? indAtr[0] : 1);
+  if (dist > 0.5) return 1;
+  if (dist < -0.5) return -1;
+  return 0;
+
+ACTION: Change both threshold values from 0.5 to 1.5:
+  if (dist > 1.5) return 1;
+  if (dist < -1.5) return -1;
+
+This ensures the HTF filter only fires when price is genuinely far from the
+HTF EMA (more than 1.5 ATR), not during normal intraday oscillation.
+Also change the penalty from 0.6x to 0.75x (less aggressive):
+  if (htfTrend < 0) lastBullConfidence *= 0.75;
+  if (htfTrend > 0) lastBearConfidence *= 0.75;
+
+
+=== FIX 3: REMOVE DUPLICATE POC MAGNETIC FILTER ===
+
+Location: ApplySmartFilters(), Filter 13 (POC Magnetic, ~line 2848)
+Current (entire Filter 13 block):
+  // 13. POC Magnetic Filter
+  if (useVolumeProfileFilters && pocLevel > 0 && atr > 0)
+  {
+      double distToPoc = Close[0] - pocLevel;
+      double absDist = Math.Abs(distToPoc);
+      if (absDist < atr)
+      {
+          if (distToPoc > 0) lastBullConfidence *= 0.75;
+          else lastBearConfidence *= 0.75;
+      }
+  }
+
+ACTION: REMOVE the entire Filter 13 block. Filter 10 (Near POC, 0.85x) already
+handles this condition. Remove the associated comment line as well.
+
+
+=== FIX 4: RESTORE v1-STYLE PER-STRATEGY FILTERING IN AUTO SELECT ===
+
+Location: CalculateSignals() autoStrategy==4 block (~line 2528)
+Current structure:
+  - Run all 4 strategies into bullScores[]/bearScores[]
+  - Pick winner by raw max score
+  - Apply 3-bar stability filter
+  - Apply session override
+  - Set lastBullConfidence/lastBearConfidence from winner
+  - ApplySmartFilters() called ONCE after
+
+ACTION: Change auto-select to apply filtering per-strategy (v1 approach):
+  a) After each strategy's CalcXxx() call, save lastBullConfidence/lastBearConfidence,
+     call ApplySmartFilters(), save the FILTERED scores into bullScores[s]/bearScores[s],
+     then clear lastBullConfidence/lastBearConfidence before the next strategy.
+  b) After all 4 filtered scores are computed, pick best by filtered score.
+  c) Remove the 3-bar stability lock entirely (autoStratConsecutiveBars logic).
+     The comment on stability locking explains the original intent but it is
+     causing more harm than good by delaying valid entries.
+  d) Keep session overrides but wrap in: if (enableSessionOverride) { ... }
+     Add a new bool parameter: EnableSessionOverride (default true).
+  e) Do NOT call ApplySmartFilters() again after selection — it was already
+     applied per-strategy in step a.
+
+Here is the pseudo-logic for the new auto-select:
+  for (int s = 0; s < 4; s++) {
+      lastBullConfidence = 0; lastBearConfidence = 0;
+      switch(s) { case 0: CalcMomentumVwap(...); ... }
+      ApplySmartFilters();   // filter immediately
+      bullScores[s] = lastBullConfidence;
+      bearScores[s] = lastBearConfidence;
+  }
+  // pick filtered best
+  bestIdx = 0; bestScore = 0;
+  for (int s = 0; s < 4; s++) {
+      double sc = Math.Max(bullScores[s], bearScores[s]);
+      if (sc > bestScore) { bestScore = sc; bestIdx = s; }
+  }
+  // session override (if enabled)
+  if (enableSessionOverride) {
+      if (ct >= 93000 && ct < 100000) bestIdx = 2;
+      else if (ct >= 113000 && ct < 140000) bestIdx = 0;
+  }
+  bestAutoStrategy = bestIdx;
+  lastBullConfidence = bullScores[bestIdx];
+  lastBearConfidence = bearScores[bestIdx];
+  // ApplySmartFilters already done per strategy — do NOT call again here
+
+
+=== FIX 5: REVERSE SPIKE MULTIPLIER IN TRAIL DISTANCE ===
+
+Location: CalculateTrailDistance() (~line 1453)
+Current:
+  double spikeMult = 1.0;
+  if (atrAvg > 0 && atr > atrAvg * TRAIL_SPIKE_MULT)
+      spikeMult = 1.5;
+
+ACTION: Change spikeMult to 0.8 (tighten trail during spike, not widen):
+  double spikeMult = 1.0;
+  if (atrAvg > 0 && atr > atrAvg * TRAIL_SPIKE_MULT)
+      spikeMult = 0.8;  // TIGHTEN during spike to lock profits
+
+
+=== FIX 6: REPLACE SPIKE GUARD WITH MINIMUM-DISTANCE TIGHTEN ===
+
+Location: MonitorAdaptiveTrail(), top of method (~line 1054)
+Current:
+  if (volatilitySpikeGuardBars > 0 && CurrentBar > 1)
+  {
+      double barRng = High[0] - Low[0];
+      double atrNow = indAtr[0];
+      if (atrNow > 0 && barRng > atrNow * 3.0)
+          return;
+  }
+
+ACTION: Replace the early return with trail-tighten to minimum distance:
+  if (volatilitySpikeGuardBars > 0 && CurrentBar > 1)
+  {
+      double barRng = High[0] - Low[0];
+      double atrNow = indAtr[0];
+      if (atrNow > 0 && barRng > atrNow * 3.0)
+      {
+          // Volatility spike: snap trail to minimum safe distance instead of freezing
+          // This still protects the position while not leaving it fully unguarded
+          double minOff = trailMinPoints * NQ_TICKS_PER_POINT * TickSize;
+          if (openTradeDirection == 1)
+              trailPrice = Math.Max(trailPrice, price - minOff);
+          else if (openTradeDirection == -1)
+              trailPrice = Math.Min(trailPrice, price + minOff);
+          // Continue normal trail processing (do NOT return)
+      }
+  }
+
+Note: the variable 'price' must be defined before this block. Currently it is
+defined later in MonitorAdaptiveTrail(). Move the price definition to BEFORE
+the spike guard block, at the top of the method after the initial guard checks.
+
+
+=== FIX 7: LOWER SMART TRAIL PAUSE THRESHOLD ===
+
+Location: EvaluateSmartTrailPause() (~line 1278)
+Current:
+  if (trailMaxProfitPts < dynActivation * 2) return;
+
+ACTION: Change to 1.5x:
+  if (trailMaxProfitPts < dynActivation * 1.5) return;
+
+
+=== FIX 8: FIX SMART SL MODE C EXTENSION FORMULA ===
+
+Location: MonitorSmartSL() Mode C block (~line 1374)
+Current:
+  double extendPts = Math.Min(10, slPoints + 30 - slPoints); // cap at slPoints+30
+
+ACTION: Replace with proportional formula:
+  double extendPts = Math.Min(15.0, slPoints * 0.30); // up to 30% of SL dist, max 15 pts
+
+Also update the comment on the extendOff line below to match:
+  // Extend SL by proportional amount (up to 30% of SL dist, max 15pts)
+
+
+=== FIX 9: FIX S-TRAIL RESUME LOG BUG ===
+
+Location: EvaluateSmartTrailPause() resume block (~line 1258)
+Current:
+  if (resumed)
+  {
+      smartTrailPaused = false;
+      smartTrailPauseBars = 0;
+      trailPrice = smartTrailFrozenPrice; // restore frozen trail
+      Print("[Mm-ATM v3] " + Time[0] + " | SMART TRAIL RESUMED after " + smartTrailPauseBars + " bars");
+  }
+
+ACTION: Save bar count before reset:
+  if (resumed)
+  {
+      int pausedFor = smartTrailPauseBars;
+      smartTrailPaused = false;
+      smartTrailPauseBars = 0;
+      trailPrice = smartTrailFrozenPrice; // restore frozen trail
+      Print("[Mm-ATM v3] " + Time[0] + " | SMART TRAIL RESUMED after " + pausedFor + " bars");
+  }
+
+
+=== ALSO ADD: enableSessionOverride FIELD AND PARAMETER ===
+
+Location: Fields section (near autoStrategy, ~line 260)
+Add:  private bool   enableSessionOverride  = true;
+
+Location: Properties section, Group 3 (near AutoStrategy property, ~line 4115)
+Add the following property after AutoStrategy:
+  [NinjaScriptProperty]
+  [Display(Name = "Enable Session Override", Order = 5, GroupName = "3 - Trading Mode",
+           Description = "Auto Select: force Liquidity Sweep at open (9:30-10), Momentum at lunch (11:30-14)")]
+  public bool EnableSessionOverride
+  {
+      get { return enableSessionOverride; }
+      set { enableSessionOverride = value; }
+  }
+
+Location: DataLoaded reset block (~line 476) and Realtime reset block (~line 574)
+  enableSessionOverride already defaults to true via field init. No reset needed.
+
+
+VALIDATION REQUIREMENTS
+------------------------
+After applying all 9 fixes + the new parameter:
+
+1. Confirm 0 compile errors in NinjaTrader (Import NinjaScript)
+2. Confirm brace count balanced (must be equal { and })
+3. Confirm the following behaviors in backtesting:
+   - AutoStrategy=0 (Momentum) fires buy/sell entries every few bars when conditions met
+   - AutoStrategy=4 (Auto Select) fires more entries than before (Fix 4 removes stability lock)
+   - Lunch hours (11:30-14:00) still produce fewer entries than morning (due to 0.85x filter)
+     but NOT zero entries
+   - S-TRAIL pause log now shows correct bar count
+   - Trail distance does NOT widen during ATR spikes (Fix 5)
+4. Log a few bars from the output window showing Filter 6 (HTF) triggering less often
+
+
+ADDITIONAL CONTEXT
+------------------
+- Encoding: file uses UTF-8. Use System.IO.File ReadAllText/WriteAllText with UTF8 encoding
+  for any scripted replacements involving special characters.
+- DO NOT rename any methods, fields, or properties that are not listed above.
+- DO NOT refactor surrounding code not related to the 9 fixes.
+- All existing Print() statements must be preserved (only modify the one in Fix 9).
+- The file must remain valid C# for NinjaTrader 8.1's NinjaScript compiler.
+- NQ_TICKS_PER_POINT = 4 (constant defined in the file)
+- TRAIL_SPIKE_MULT = a constant defined in the file (check its value before Fix 5)
+
+================================================================================
+  End of Enhancement Prompt
+================================================================================
