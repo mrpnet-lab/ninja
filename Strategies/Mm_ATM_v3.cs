@@ -2605,14 +2605,27 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void CalcMomentumVwap(ref double bull, ref double bear)
         {
             if (CurrentBar < emaPeriodSlow + 5) return;
-            double emaF = indEmaFast[0], emaS = indEmaSlow[0], rsi = indRsi[0];
+            int ct = ToTime(Time[0]);
+            // Block first 15 min: EMAs carry overnight bias; VWAP has too few bars to be reliable
+            if (ct >= 93000 && ct < 94500) return;
 
-            if (emaF > emaS) bull += 30;
-            if (emaF < emaS) bear += 30;
-            if (CrossAbove(Close, vwapValue, 1)) bull += 35;
-            else if (Close[0] > vwapValue) bull += 20;
-            if (CrossBelow(Close, vwapValue, 1)) bear += 35;
-            else if (Close[0] < vwapValue) bear += 20;
+            double emaF  = indEmaFast[0], emaS = indEmaSlow[0], rsi = indRsi[0];
+
+            // EMA alignment + slope: fast EMA must be actively moving in the expected direction
+            // Prevents stale overnight EMA alignment from generating false signals at open
+            bool emaFastRising  = CurrentBar > 2 && indEmaFast[0] > indEmaFast[2];
+            bool emaFastFalling = CurrentBar > 2 && indEmaFast[0] < indEmaFast[2];
+            if (emaF > emaS && emaFastRising)  bull += 30;
+            if (emaF < emaS && emaFastFalling) bear += 30;
+
+            // VWAP: crossovers always valid; continuation (+20) only after session is mature
+            // Early-session VWAP tracks price too closely to provide directional edge
+            bool vwapMature = ct >= 94500;  // 15 min into session = enough VWAP history
+            if (CrossAbove(Close, vwapValue, 1))         bull += 35;
+            else if (Close[0] > vwapValue && vwapMature) bull += 20;
+            if (CrossBelow(Close, vwapValue, 1))         bear += 35;
+            else if (Close[0] < vwapValue && vwapMature) bear += 20;
+
             if (rsi > 50 && rsi < 75) bull += 20;
             if (rsi < 50 && rsi > 25) bear += 20;
             if (Close[0] > High[1]) bull += 15;
@@ -2819,6 +2832,23 @@ namespace NinjaTrader.NinjaScript.Strategies
                 double slopeThreshold = atr * 0.05;
                 if (vwapSlope > slopeThreshold) { lastBullConfidence += 10; lastBearConfidence -= 5; }
                 else if (vwapSlope < -slopeThreshold) { lastBearConfidence += 10; lastBullConfidence -= 5; }
+            }
+
+            // 13. Recent Price Trend Direction (5-bar slope)
+            // Prevents longs in a short-term downtrend and shorts in an uptrend
+            if (CurrentBar >= 6 && atr > 0)
+            {
+                double slope5 = (Close[0] - Close[5]) / atr;  // net move in ATR units over 5 bars
+                if (slope5 < -0.8)  // declining > 0.8 ATR over 5 bars: suppress longs
+                {
+                    double pen = Math.Max(0.5, 1.0 - (Math.Abs(slope5) - 0.8) * 0.3);
+                    lastBullConfidence *= pen;
+                }
+                else if (slope5 > 0.8)  // rising > 0.8 ATR over 5 bars: suppress shorts
+                {
+                    double pen = Math.Max(0.5, 1.0 - (slope5 - 0.8) * 0.3);
+                    lastBearConfidence *= pen;
+                }
             }
 
             // 14. Lunch Doldrums (11:30-14:00 ET)
