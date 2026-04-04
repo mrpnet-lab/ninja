@@ -338,7 +338,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 dcaSuggestionPoints   = 50;
                 entryDelaySeconds     = 1;
                 autoMode              = false;
-                autoStrategy          = 4;
+                autoStrategy          = 0;  // default: Momentum+VWAP (simpler, more active for testing)
                 enableSessionOverride = true;
                 emaPeriodFast         = 9;
                 emaPeriodSlow         = 21;
@@ -371,7 +371,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 htfFilterEnabled      = true;
                 htfEmaPeriod          = 45;
                 useVolumeProfileFilters = true;
-                lossCooldownSeconds   = 120;
+                lossCooldownSeconds   = 0;   // default: disabled — avoids blocking re-entries after normal losses
 
                 smartTrailEnabled     = true;
                 smartTrailMaxPauseBars = 8;
