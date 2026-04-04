@@ -34,7 +34,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private const double NQ_DOLLARS_PER_TICK   = 5.0;
         private const double NQ_DOLLARS_PER_POINT  = 20.0;
         private const int    STALE_EXIT_TICKS      = 250;
-        private const int    FLAT_SYNC_MAX_TICKS   = 30;
+        private const int    FLAT_SYNC_MAX_TICKS   = 200; // Increased from 30: playback fills can take 100+ ticks to confirm
         private const int    DASH_UPDATE_MS         = 333;  // ~3 updates/sec max
         private const double TRAIL_SPIKE_MULT      = 2.0;
         private const double VALUE_AREA_PCT        = 0.70;
@@ -858,23 +858,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                     UpdateDashboardStatus("DAILY PROFIT TARGET \u2014 NO TRADES", Brushes.Gold);
             }
 
-            // Calculate signals  - only needed for entries; skip entirely when in position
+            // Calculate signals and auto-entry: both gated to IsFirstTickOfBar.
+            // CRITICAL: entry must only fire once per bar to prevent:
+            //   (a) double entries from the FLAT_SYNC grace-period reset mid-bar
+            //   (b) same-bar re-entry with stale signal immediately after a loss
             bool isFlat = Position.MarketPosition == MarketPosition.Flat;
             if (isFlat && IsFirstTickOfBar)
             {
                 CalculateSignals();
-            }
-            else if (!isFlat && IsFirstTickOfBar && enableDiagLog && !diagDayDone && diagWriter != null)
-            {
-                // Log in-trade bar: trap score and unrealized P&L for each bar while in position
-                double unrealPts = averageEntryPrice > 0 && openTradeDirection != 0
-                    ? (Close[0] - averageEntryPrice) * openTradeDirection : 0;
-                WriteDiagRow("TRADE_BAR", "unreal=" + unrealPts.ToString("F2") + " trap=" + trapScore.ToString("F1"));
-            }
 
-            // Auto entry (works in Historical for backtest/Strategy Analyzer and in Realtime)
-            if (isFlat)
-            {
                 int currentTime2 = ToTime(Time[0]);
                 bool insideTradingHours = !tradingHoursEnabled
                     || (currentTime2 >= tradingStartTime && currentTime2 < tradingEndTime);
@@ -912,6 +904,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                     else reason = "lowConf(Bull=" + lastBullConfidence.ToString("F0") + "% Bear=" + lastBearConfidence.ToString("F0") + "%)";
                     Print("[Mm-ATM v3] " + Time[0] + " | AUTO-SCAN: no entry \u2014 " + reason);
                 }
+            }
+            else if (!isFlat && IsFirstTickOfBar && enableDiagLog && !diagDayDone && diagWriter != null)
+            {
+                // Log in-trade bar: trap score and unrealized P&L for each bar while in position
+                double unrealPts = averageEntryPrice > 0 && openTradeDirection != 0
+                    ? (Close[0] - averageEntryPrice) * openTradeDirection : 0;
+                WriteDiagRow("TRADE_BAR", "unreal=" + unrealPts.ToString("F2") + " trap=" + trapScore.ToString("F1"));
             }
 
             // Chart & dashboard (gate draws to first tick of bar when possible)
@@ -2242,6 +2241,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             trailMaxProfitPts = 0; trailTierName = "";
             trapScore = 0; trapDetected = false; trapBarsInTrade = 0;
             lastAutoStrategyUsed = "";
+            // Clear stale signal so a freshly-exited trade cannot trigger immediate re-entry
+            // on the same bar. Signals will be recalculated at IsFirstTickOfBar when flat.
+            lastBullConfidence = 0;
+            lastBearConfidence = 0;
+            diagRawBull = 0;
+            diagRawBear = 0;
 
             if (defaultSlPoints > 0) slPoints = defaultSlPoints;
             if (defaultTpPoints > 0) tpPoints = defaultTpPoints;
@@ -2808,9 +2813,12 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             // --- Original 5 filters from v1 ---
 
-            // 1. Volume Confirmation (use cached avg volume)
+            // 1. Volume Confirmation
+            // Use Volume[1] (prior completed bar) — NOT Volume[0] which at IsFirstTickOfBar
+            // equals the volume of just the first tick (~1 contract) vs average full-bar volume
+            // (thousands), causing an erroneous 0.7x low-volume penalty on every single signal.
             double avgVol = GetCachedAvgVolume();
-            double vr = avgVol > 0 ? Volume[0] / avgVol : 1;
+            double vr = (avgVol > 0 && CurrentBar > 1) ? Volume[1] / avgVol : 1;
             if (vr < 0.5) { lastBullConfidence *= 0.7; lastBearConfidence *= 0.7; }
             else if (vr > 2.0) { lastBullConfidence *= 1.15; lastBearConfidence *= 1.15; }
 
