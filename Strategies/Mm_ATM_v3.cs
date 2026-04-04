@@ -184,6 +184,16 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int      lastLossDirection;   // 1=last loss was long, -1=short, 0=none
         private DateTime lastLossTime;
 
+        // --- Diagnostic Logging ---
+        private bool     enableDiagLog;
+        private bool     diagOneDayOnly;
+        private System.IO.StreamWriter diagWriter;
+        private bool     diagHeaderWritten;
+        private bool     diagDayDone;
+        private DateTime diagLogDate;
+        private double   diagRawBull;
+        private double   diagRawBear;
+
         // --- On-chart dashboard elements ---
         private Grid      dashboardPanel;
         private Button    btnBuyMkt;
@@ -378,6 +388,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 smartTrailMaxPauseBars = 8;
                 smartSlEnabled        = true;
                 smartSlBePct          = 40;
+
+                enableDiagLog    = false;
+                diagOneDayOnly   = true;
             }
             else if (State == State.Configure)
             {
@@ -455,6 +468,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 consecutiveLosses      = 0;
                 lastLossDirection      = 0;
                 lastLossTime           = DateTime.MinValue;
+                diagHeaderWritten      = false;
+                diagDayDone            = false;
+                diagLogDate            = DateTime.MinValue;
+                diagRawBull            = 0;
+                diagRawBear            = 0;
                 pocLevel               = 0;
                 vahLevel               = 0;
                 valLevel               = 0;
@@ -547,6 +565,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 consecutiveLosses      = 0;
                 lastLossDirection      = 0;
                 lastLossTime           = DateTime.MinValue;
+                diagHeaderWritten      = false;
+                diagDayDone            = false;
+                diagLogDate            = DateTime.MinValue;
+                if (diagWriter != null) { try { diagWriter.Close(); } catch { } diagWriter = null; }
 
                 volumeAtPrice          = new SortedDictionary<double, double>();
                 pocLevel               = 0;
@@ -618,6 +640,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             else if (State == State.Terminated)
             {
                 RemoveDashboard();
+                CloseDiagLog();
             }
         }
 
@@ -628,6 +651,22 @@ namespace NinjaTrader.NinjaScript.Strategies
         protected override void OnBarUpdate()
         {
             if (CurrentBar < BarsRequiredToTrade) return;
+
+            // Diagnostic log: open file on first bar, close after day rolls
+            if (enableDiagLog && !diagDayDone && IsFirstTickOfBar)
+            {
+                if (diagWriter == null)
+                {
+                    diagLogDate = Time[0].Date;
+                    OpenDiagLog();
+                }
+                else if (diagOneDayOnly && Time[0].Date > diagLogDate)
+                {
+                    diagDayDone = true;
+                    CloseDiagLog();
+                    Print("[Mm-ATM v3] DiagLog: one-day session complete for " + diagLogDate.ToString("yyyy-MM-dd"));
+                }
+            }
 
             // ===== CRITICAL PATH =====
             if ((State == State.Realtime || State == State.Historical) && pendingEmergencyKill)
@@ -825,6 +864,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 CalculateSignals();
             }
+            else if (!isFlat && IsFirstTickOfBar && enableDiagLog && !diagDayDone && diagWriter != null)
+            {
+                // Log in-trade bar: trap score and unrealized P&L for each bar while in position
+                double unrealPts = averageEntryPrice > 0 && openTradeDirection != 0
+                    ? (Close[0] - averageEntryPrice) * openTradeDirection : 0;
+                WriteDiagRow("TRADE_BAR", "unreal=" + unrealPts.ToString("F2") + " trap=" + trapScore.ToString("F1"));
+            }
 
             // Auto entry (works in Historical for backtest/Strategy Analyzer and in Realtime)
             if (isFlat)
@@ -844,9 +890,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                     && !cooldownActive)
                 {
                     if (lastBullConfidence >= minSignalConfidence)
+                    {
+                        if (enableDiagLog) WriteDiagRow("ENTRY_LONG", "bull=" + lastBullConfidence.ToString("F1") + " raw=" + diagRawBull.ToString("F1"));
                         ExecuteLongEntry(false);
+                    }
                     else if (lastBearConfidence >= minSignalConfidence)
+                    {
+                        if (enableDiagLog) WriteDiagRow("ENTRY_SHORT", "bear=" + lastBearConfidence.ToString("F1") + " raw=" + diagRawBear.ToString("F1"));
                         ExecuteShortEntry(false);
+                    }
                 }
                 else if (autoMode && CurrentBar % 100 == 0)
                 {
@@ -2239,11 +2291,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                             consecutiveLosses++;
                             lastLossTime = State == State.Realtime ? DateTime.Now : time;
                             lastLossDirection = lastTrade.Entry.MarketPosition == MarketPosition.Long ? 1 : -1;
+                            if (enableDiagLog) WriteDiagRow("EXIT_LOSS", "pnl=" + lastTrade.ProfitCurrency.ToString("F2") + " consec=" + consecutiveLosses);
                         }
                         else
                         {
                             consecutiveLosses = 0;
                             lastLossDirection = 0;
+                            if (enableDiagLog) WriteDiagRow("EXIT_WIN", "pnl=" + lastTrade.ProfitCurrency.ToString("F2"));
                         }
                     }
                 }
@@ -2600,6 +2654,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 lastBullConfidence = bullScores[bestAutoStrategy];
                 lastBearConfidence = bearScores[bestAutoStrategy];
                 // ApplySmartFilters already done per strategy — do NOT call again
+                diagRawBull = lastBullConfidence;  // raw unavailable separately in auto-select
+                diagRawBear = lastBearConfidence;
+                if (enableDiagLog) WriteDiagRow("SIGNAL");
             }
             else
             {
@@ -2611,7 +2668,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                     case 3: CalcOpeningRangeBreakout(ref lastBullConfidence, ref lastBearConfidence); break;
                 }
 
+                diagRawBull = lastBullConfidence;
+                diagRawBear = lastBearConfidence;
                 ApplySmartFilters();
+                if (enableDiagLog) WriteDiagRow("SIGNAL");
             }
         }
 
@@ -4108,6 +4168,91 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         #endregion
 
+        #region Diagnostic Logging
+
+        private void OpenDiagLog()
+        {
+            try
+            {
+                string docPath = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+                string dirPath = System.IO.Path.Combine(docPath, "NinjaTrader 8");
+                if (!System.IO.Directory.Exists(dirPath))
+                    System.IO.Directory.CreateDirectory(dirPath);
+                string fileName = "MmATM_DiagLog_" + (Time.Count > 0 ? Time[0].ToString("yyyyMMdd") : DateTime.Now.ToString("yyyyMMdd")) + ".csv";
+                string fullPath = System.IO.Path.Combine(dirPath, fileName);
+                diagWriter = new System.IO.StreamWriter(fullPath, false, System.Text.Encoding.UTF8);
+                diagWriter.AutoFlush = true;
+                diagHeaderWritten = false;
+                Print("[Mm-ATM v3] DiagLog opened: " + fullPath);
+            }
+            catch (Exception ex) { Print("[Mm-ATM v3] DiagLog open failed: " + ex.Message); }
+        }
+
+        private void CloseDiagLog()
+        {
+            if (diagWriter != null)
+            {
+                try { diagWriter.Flush(); diagWriter.Close(); }
+                catch { }
+                diagWriter = null;
+                Print("[Mm-ATM v3] DiagLog closed.");
+            }
+        }
+
+        private void WriteDiagHeader()
+        {
+            if (diagWriter == null || diagHeaderWritten) return;
+            diagWriter.WriteLine(
+                "DateTime,Bar,Open,High,Low,Close,Volume," +
+                "VWAP,EmaFast,EmaSlow,EmaFSlope,RSI,RSISlope,ATR,POC,VAH,VAL," +
+                "RawBull,RawBear,FiltBull,FiltBear," +
+                "EmaAlign,RSIDir,Slope5ATR,ConsecLoss,LastLossDir," +
+                "AutoStrat,Position,OpenDir,TrapScore,UnrealPts,Action,Detail");
+            diagHeaderWritten = true;
+        }
+
+        private void WriteDiagRow(string action, string detail = "")
+        {
+            if (!enableDiagLog || diagDayDone || diagWriter == null) return;
+            if (!diagHeaderWritten) WriteDiagHeader();
+            try
+            {
+                double emaFast  = CurrentBar > 1 && indEmaFast != null ? indEmaFast[0] : 0;
+                double emaSlow  = CurrentBar > 1 && indEmaSlow != null ? indEmaSlow[0] : 0;
+                double emaSlope = CurrentBar > 1 && indEmaFast != null ? indEmaFast[0] - indEmaFast[1] : 0;
+                double rsiVal   = CurrentBar > 3 && indRsi    != null ? indRsi[0]    : 0;
+                double rsiSlope = CurrentBar > 3 && indRsi    != null ? indRsi[0] - indRsi[2] : 0;
+                double atrVal   = indAtr != null ? indAtr[0] : 0;
+                double slope5   = CurrentBar >= 6 && atrVal > 0 ? (Close[0] - Close[5]) / atrVal : 0;
+                string emaAlign = emaFast > emaSlow ? "BULL" : "BEAR";
+                string rsiDir   = rsiSlope >  0.5 ? "UP" : (rsiSlope < -0.5 ? "DOWN" : "FLAT");
+                string pos      = Position.MarketPosition == MarketPosition.Long  ? "LONG"
+                                : Position.MarketPosition == MarketPosition.Short ? "SHORT" : "FLAT";
+                double unrealPts = averageEntryPrice > 0 && openTradeDirection != 0
+                    ? (Close[0] - averageEntryPrice) * openTradeDirection : 0;
+                diagWriter.WriteLine(string.Format(
+                    "{0},{1},{2:F2},{3:F2},{4:F2},{5:F2},{6}," +
+                    "{7:F2},{8:F2},{9:F2},{10:F4},{11:F2},{12:F4},{13:F2},{14:F2},{15:F2},{16:F2}," +
+                    "{17:F1},{18:F1},{19:F1},{20:F1}," +
+                    "{21},{22},{23:F3},{24},{25}," +
+                    "{26},{27},{28},{29:F1},{30:F2},{31},{32}",
+                    Time[0].ToString("yyyy-MM-dd HH:mm:ss"),
+                    CurrentBar,
+                    Open[0], High[0], Low[0], Close[0], (long)Volume[0],
+                    vwapValue, emaFast, emaSlow, emaSlope,
+                    rsiVal, rsiSlope, atrVal,
+                    pocLevel, vahLevel, valLevel,
+                    diagRawBull, diagRawBear, lastBullConfidence, lastBearConfidence,
+                    emaAlign, rsiDir, slope5, consecutiveLosses, lastLossDirection,
+                    autoStrategy, pos, openTradeDirection,
+                    trapScore, unrealPts,
+                    action, detail));
+            }
+            catch (Exception ex) { Print("[Mm-ATM v3] DiagLog write failed: " + ex.Message); }
+        }
+
+        #endregion
+
         // ==========================================================
         //  PROPERTIES  (9 groups per v3 spec)
         // ==========================================================
@@ -4348,6 +4493,17 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "Smart SL Break-Even % of TP", Order = 2, GroupName = "11 - Smart SL",
                  Description = "Move SL to break-even when profit reaches this % of TP target.")]
         public int SmartSlBePct { get { return smartSlBePct; } set { smartSlBePct = value; } }
+
+        // Group 12 - Diagnostics
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Diagnostic Log", Order = 1, GroupName = "12 - Diagnostics",
+                 Description = "Write CSV log of every bar's signals/filters/trades to Documents\\NinjaTrader 8\\MmATM_DiagLog_YYYYMMDD.csv. Use in playback to analyze strategy decisions.")]
+        public bool EnableDiagLog { get { return enableDiagLog; } set { enableDiagLog = value; } }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Diag Log One Day Only", Order = 2, GroupName = "12 - Diagnostics",
+                 Description = "Stop logging after the first trading date completes. Prevents large files during extended playback runs.")]
+        public bool DiagOneDayOnly { get { return diagOneDayOnly; } set { diagOneDayOnly = value; } }
 
         #endregion
     }
