@@ -183,6 +183,12 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int      consecutiveLosses;
         private int      lastLossDirection;   // 1=last loss was long, -1=short, 0=none
         private DateTime lastLossTime;
+        private int      lastLossBarNumber;   // bar# of most recent loss, for post-loss cooldown
+
+        // --- Chop detection (Filter 17) ---
+        private int      lastSignalDirBar;    // +1=bull, -1=bear from prior bar
+        private int      dirChanges8;         // direction changes in last 8 signal bars
+        private int      trapEscapeBars;      // consecutive bars with trapScore > 50 while underwater
 
         // --- Diagnostic Logging ---
         private bool     enableDiagLog;
@@ -374,7 +380,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 autoSelectStabilityBars = 2;
 
                 trailEnabled          = true;
-                trailActivationPoints = 8;
+                trailActivationPoints = 14;
                 trailMinPoints        = 3;
                 trailMaxPoints        = 25;
                 trailAtrMultiplier    = 1.5;
@@ -876,10 +882,16 @@ namespace NinjaTrader.NinjaScript.Strategies
                     && consecutiveLosses > 0
                     && (timeNow - lastLossTime).TotalSeconds < lossCooldownSeconds;
 
+                // Post-loss bar cooldown: after 2+ consecutive losses within 10 bars, skip 3 bars.
+                // Prevents rapid-fire re-entries during morning chop whipsaws.
+                bool postLossCooldown = consecutiveLosses >= 2
+                    && lastLossBarNumber > 0
+                    && (CurrentBar - lastLossBarNumber) < 3;
+
                 if (autoMode && !dailyLimitHit && !dailyProfitHit && !emergencyKillActive
                     && insideTradingHours && openTradeDirection == 0
                     && (maxTradesPerDay <= 0 || dailyTradeCount < maxTradesPerDay)
-                    && !cooldownActive)
+                    && !cooldownActive && !postLossCooldown)
                 {
                     if (lastBullConfidence >= minSignalConfidence)
                     {
@@ -1430,6 +1442,26 @@ namespace NinjaTrader.NinjaScript.Strategies
                         Print("[Mm-ATM v3] " + Time[0] + " | SMART SL: TIGHTENED (trap) @ " + hiddenStopPrice.ToString("F2"));
                     }
                 }
+            }
+
+            // B2) Trap Escape: force immediate exit when trapped for 3+ consecutive bars
+            // and position is underwater. Prevents holding through extended MM traps (see T20 analysis).
+            if (trapScore >= 50 && profitPts < -5)
+            {
+                trapEscapeBars++;
+                if (trapEscapeBars >= 3)
+                {
+                    Print("[Mm-ATM v3] " + Time[0] + " | SMART SL: TRAP ESCAPE — forced exit after " + trapEscapeBars + " bars trapped, unrealPts=" + profitPts.ToString("F1"));
+                    if (openTradeDirection == 1)
+                        ExitLong();
+                    else
+                        ExitShort();
+                    return;
+                }
+            }
+            else
+            {
+                trapEscapeBars = 0;
             }
 
             // C) Loosen on high-confidence entry (once per trade, if BE not yet locked)
@@ -2242,6 +2274,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             trailPrice = 0; trailActive = false; trailTrendScore = 0;
             trailMaxProfitPts = 0; trailTierName = "";
             trapScore = 0; trapDetected = false; trapBarsInTrade = 0;
+            trapEscapeBars = 0;
             lastAutoStrategyUsed = "";
             // Clear stale signal so a freshly-exited trade cannot trigger immediate re-entry
             // on the same bar. Signals will be recalculated at IsFirstTickOfBar when flat.
@@ -2298,6 +2331,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                             consecutiveLosses++;
                             lastLossTime = State == State.Realtime ? DateTime.Now : time;
                             lastLossDirection = lastTrade.Entry.MarketPosition == MarketPosition.Long ? 1 : -1;
+                            lastLossBarNumber = CurrentBar;
                             if (enableDiagLog) WriteDiagRow("EXIT_LOSS", "pnl=" + lastTrade.ProfitCurrency.ToString("F2") + " consec=" + consecutiveLosses);
                         }
                         else
@@ -2446,6 +2480,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             consecutiveLosses    = 0;
             lastLossTime         = DateTime.MinValue;
             lastLossDirection    = 0;  // BUG FIX: prevent yesterday's loss direction from penalizing today's first trade
+            lastLossBarNumber    = 0;
+            lastSignalDirBar     = 0;
+            dirChanges8          = 0;
+            trapEscapeBars       = 0;
             autoStratConsecutiveBars = 0;
             lastBestAutoStrategy = -1;
             lastBullConfidence   = 0;
@@ -2676,6 +2714,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                     case 3: CalcOpeningRangeBreakout(ref lastBullConfidence, ref lastBearConfidence); break;
                 }
 
+                // Capture raw scores AFTER strategy calc (includes VWAP continuation bonus)
+                // but BEFORE ApplySmartFilters, so FiltBull ≤ RawBull always holds in DiagLog
                 diagRawBull = lastBullConfidence;
                 diagRawBear = lastBearConfidence;
                 ApplySmartFilters();
@@ -2966,6 +3006,32 @@ namespace NinjaTrader.NinjaScript.Strategies
                 double lossPen = Math.Max(0.6, 1.0 - (consecutiveLosses - 1) * 0.12);
                 if (lastLossDirection ==  1) lastBullConfidence *= lossPen;
                 else if (lastLossDirection == -1) lastBearConfidence *= lossPen;
+            }
+
+            // 17. Chop / Range-Bound Detection
+            // When EMAs are converging (spread < 0.5 ATR), RSI is neutral (40-60),
+            // and price has changed direction 2+ times in 8 bars → this is a chop zone.
+            // Apply 0.4x penalty which effectively blocks all entries (raw 100 → 40 < 45 threshold).
+            if (atr > 0 && CurrentBar > emaPeriodSlow + 5)
+            {
+                double emaSpread = Math.Abs(indEmaFast[0] - indEmaSlow[0]);
+                bool emasConverging = emaSpread < atr * 0.5;
+                bool rsiNeutral = indRsi[0] >= 40 && indRsi[0] <= 60;
+                // Track direction changes: compare current dominant direction vs previous
+                int curDir = lastBullConfidence > lastBearConfidence ? 1 : (lastBearConfidence > lastBullConfidence ? -1 : 0);
+                if (curDir != 0 && curDir != lastSignalDirBar)
+                {
+                    if (lastSignalDirBar != 0) dirChanges8++;
+                    lastSignalDirBar = curDir;
+                }
+                // Decay the counter: approximate 8-bar window by decrementing every 8 bars
+                if (CurrentBar % 8 == 0 && dirChanges8 > 0) dirChanges8--;
+
+                if (emasConverging && rsiNeutral && dirChanges8 >= 2)
+                {
+                    lastBullConfidence *= 0.40;
+                    lastBearConfidence *= 0.40;
+                }
             }
 
             // Penalty floor: never reduce below 50% of raw score
