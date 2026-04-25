@@ -723,7 +723,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             // Calculate signals â€” only needed for entries; skip entirely when in position
-            bool isFlat = Position.MarketPosition == MarketPosition.Flat;
+            bool isFlat = Position == null || Position.MarketPosition == MarketPosition.Flat;
             if (isFlat && IsFirstTickOfBar)
             {
                 CalculateSignals();
