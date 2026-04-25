@@ -735,3 +735,73 @@ if (enteredThisBar && !allowMultiEntryPerBar) return false;
 | Open-type | Not classified | RTH Open-Drive classification |
 | Properties | ~30 / 12 groups | ~28 / 8 groups |
 | Code lines | ~4,700 | ~1,800 |
+
+
+
+---
+
+## 14.7 — Live Manual-Trader Hardening (Apr 25, 2026)
+
+Set of fixes after live NQ paper-trading exposed UX + correctness gaps.
+
+### Daily Profit / Loss — DOES NOT KILL THE STRATEGY
+**Behavior:** When the live or realized PnL crosses `MaxDailyProfitDollars` or `-MaxDailyLossDollars`, the strategy:
+1. Closes the open trade (`ExecuteFlatten`)
+2. Sets `dailyProfitHit` / `dailyLimitHit` so further entry attempts are *blocked*
+3. Displays a prominent banner on the dashboard:
+   - Profit: ?? gold "DAILY PROFIT TARGET $X — trade closed. Disable+Enable to resume."
+   - Loss:   ? red  "DAILY LOSS LIMIT $X — trade closed. Disable+Enable to resume."
+4. Logs a clarifying line: "closing trade, NOT killing strategy. Disable+Enable to resume."
+
+The strategy itself stays in `State.Realtime` — `Print` and dashboard still update. To resume trading the same session, the user toggles the strategy off/on (which re-runs `State.DataLoaded` and resets `dailyLimitHit / dailyProfitHit / emergencyKillActive` to `false`).
+
+### TP draw distance + TP-not-firing-in-runner-mode (FIX)
+**Bug observed:** Label "TP 50pt | 200tk | $1000" but the green horizontal line was actually at `entry + 18pt`. Price walked through it without triggering exit; only the trail eventually closed the trade.
+
+**Root cause:**
+1. `ArmHiddenStops` clamps `hiddenTargetPrice` to `prevDayHigh - 1tk` (or `prevDayLow + 1tk`) when the prev-day level sits between entry and the configured TP. The visual line moved, but the label was reading the *original* `tpPoints` setting (50), not the actual line.
+2. In runner mode (HTF agrees), `MonitorHiddenStops` uses `effTp = 500pt` and **bypasses the TP comparison entirely** (`&& !runnerModeActive`). So when the prevDay clamp pulled the runner's TP back to entry+18, the line existed but the gate was off.
+
+**Fix:**
+- New field `tpClampedByPrevDay` set in `ArmHiddenStops` and `ResizeHiddenStops` whenever a prevDay level pulls TP in.
+- TP exit gate now: `priceLong >= hiddenTargetPrice && (!runnerModeActive || tpClampedByPrevDay)`. So a clamped runner TP fires; an un-clamped 500pt runner TP still rides the trail.
+- `DrawChartAnnotations` rewritten to compute `slDistPts` and `tpDistPts` from the **actual** `hiddenStopPrice` / `hiddenTargetPrice`, not from `slPoints` / `tpPoints` properties. Adds `— PD` suffix on the TP label when prev-day-clamped, and `+` sign on SL label when SL is in profit (post-Jump SL).
+
+### SL +/- after Jump SL (FIX)
+**Bug:** After `JUMP SL` moved the SL into profit, pressing the SL `-` button on the dashboard did nothing.
+
+**Root cause:** Old buttons did `slPoints -= step; ResizeHiddenStops()`. `ResizeHiddenStops` recomputes from `entry - slPoints*tickPt`. After Jump SL had stored `slPoints` as a *price-distance* (not entry-distance), the formula produced a target either nonsensical or below the current SL — and `breakevenLocked = true` (set by Jump SL) blocked any relaxation.
+
+**Fix:**
+- New thread-safe handler `RequestSlNudgePoints(int dPts)` enqueues `pendingSlNudge` (signed); `ProcessPendingButtons` calls `NudgeSlPricePoints(n)`.
+- `NudgeSlPricePoints` operates **directly on `hiddenStopPrice`** in price space:
+  - `-` (`dPts < 0`): WIDEN — SL moves further from price (more breathing room). Allowed regardless of `breakevenLocked`. Also widens `originalSlPrice` so trail backtrack respects the new floor.
+  - `+` (`dPts > 0`): TIGHTEN — SL moves toward price. Clamped to `price - 1tk`. Sets `breakevenLocked = true` so auto-BE doesn't undo it.
+- After move, `slPoints` is reset to the actual distance from current price (matches Jump SL's convention) and dashboard refreshes immediately via `DrawChartAnnotations`.
+- Sanity floor: SL never beyond `entry ± 200pt` from current trade.
+
+### Trail — extra-aggressive on huge profit
+Two new ladder rungs added to `MonitorAdaptiveTrail`:
+
+| `trailMaxProfitPts` vs activation | Multiplier on `curDist` | Tier name |
+|---|---|---|
+| `= 4× activation` | `× 0.70` | T3-Runner (existing) |
+| `= 6× activation` | additional `× 0.75` (cumulative ˜ 0.525) | T4-Big (new) |
+| `= 8× activation` | hard cap `min(curDist, max(1pt, ATR×0.25))` | T4-Big |
+
+Tier-floor table now includes `T4-Big` at **65 % of `trailMaxProfitPts`** (vs 50 % for T3). On a 60-pt runner this locks ~39pt instead of 30pt.
+
+Manual nudges (`Trail ±pt`) keep flowing through the same ratchet — `manualTrailOffsetPoints` is added every pass, and tightening (`-`) takes effect *immediately* in the same handler.
+
+### Spec doc + .md as living history
+**Convention going forward:** every behavioral or property change appends a numbered subsection here (14.x). Future-recommended enhancements are listed with status `[planned]` so they survive across sessions.
+
+### [planned] Future improvements derived from this session's log analysis
+- Persist daily PnL across NinjaTrader restarts (currently resets on `DataLoaded`)
+- Add `RESET DAILY` button on dashboard that flips `dailyLimitHit / dailyProfitHit / emergencyKillActive` to false without requiring strategy re-enable
+- Add `auto-tighten on N consecutive losses` (e.g. after 2 losses, halve `aggressiveTrailMaxAtrFactor` for 1 hour)
+- Add `auto-widen on N consecutive wins` (let winners run further)
+- Add `partial profit at 1R` toggle — close half at `1× slPoints` so worst case is BE on remainder
+- Add a `DOUBLE` button that doubles current `Qty` on conviction signal (already throttled by `MaxContracts`)
+- Heuristic to skip TP-clamping by prevDay during high-ADX trend days (clamp wastes profit when trend is breaking through)
+- Live diagnostic CSV: include `hiddenTargetPrice`, `hiddenStopPrice`, `trailPrice`, `tier`, `manualTrailOffsetPoints` per row — for post-trade replay

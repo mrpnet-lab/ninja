@@ -99,6 +99,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int      processedTradeCount;
         private bool     dailyLimitHit;
         private bool     dailyProfitHit;
+        // True when ArmHiddenStops/ResizeHiddenStops had to pull the hidden TP in to a prevDay
+        // level. Used to FORCE the TP check to honor the hidden target even in runner mode
+        // (otherwise the visible green line is at e.g. entry+18pt while the runner-mode bypass
+        // skips the comparison and the price flies past it).
+        private bool     tpClampedByPrevDay;
         private bool     emergencyKillActive;
         private bool     flattenFired;
         private bool     rthStartedToday;
@@ -144,6 +149,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private volatile bool pendingJumpSL, pendingRearm, pendingSlTpResize, pendingEmergencyKill;
         private volatile bool pendingTrailActivate;
         private volatile int  pendingTrailNudgePoints;          // signed: + = looser (away from price), − = tighter
+        private volatile int  pendingSlNudge;                    // signed: + = TIGHTEN (toward price), − = WIDEN (away from price)
         private double        trailNudgeStepPoints = 1.0;       // 1 NQ point = 4 ticks = $20
         private double        aggressiveTrailMaxAtrFactor = 0.5; // TRL NOW initial distance = max(2pt, factor×ATR)
         private double        beSafeAtrFactor             = 0.35; // Smart BE: SL must stay >= max(beSafeMinTicks, factor×ATR) below price
@@ -626,6 +632,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (pendingSlTpResize) { pendingSlTpResize = false; if (stopsArmed) ResizeHiddenStops(); }
             if (pendingTrailActivate) { pendingTrailActivate = false; ActivateTrailManual(); }
             if (pendingTrailNudgePoints != 0) { int n = pendingTrailNudgePoints; pendingTrailNudgePoints = 0; NudgeTrailDistancePoints(n); }
+            if (pendingSlNudge != 0) { int n = pendingSlNudge; pendingSlNudge = 0; if (stopsArmed) NudgeSlPricePoints(n); }
         }
 
         private void SyncPositionState()
@@ -699,16 +706,16 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (live <= -maxDailyLossDollars)
             {
                 dailyLimitHit = true;
-                Print(TAG + "LIVE LOSS LIMIT " + live.ToString("C0"));
+                Print(TAG + "LIVE LOSS LIMIT " + live.ToString("C0") + " — closing trade, NOT killing strategy. Disable+Enable to resume.");
                 ExecuteFlatten();
-                UpdateDashboardStatus("DAILY LOSS LIMIT (" + live.ToString("C0") + ")", Brushes.OrangeRed);
+                UpdateDashboardStatus("⛔ DAILY LOSS LIMIT " + live.ToString("C0") + " — trade closed. Disable+Enable to resume.", Brushes.Red);
             }
             else if (live >= maxDailyProfitDollars)
             {
                 dailyProfitHit = true;
-                Print(TAG + "LIVE PROFIT TARGET " + live.ToString("C0"));
+                Print(TAG + "LIVE PROFIT TARGET " + live.ToString("C0") + " — closing trade, NOT killing strategy. Disable+Enable to resume.");
                 ExecuteFlatten();
-                UpdateDashboardStatus("PROFIT TARGET (" + live.ToString("C0") + ")", Brushes.Gold);
+                UpdateDashboardStatus("💰 DAILY PROFIT TARGET " + live.ToString("C0") + " — trade closed. Disable+Enable to resume.", Brushes.Gold);
             }
         }
         #endregion
@@ -807,9 +814,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                     Print(TAG + "HIDDEN SL LONG @ " + priceLong.ToString("F2"));
                     ExitLong(" ", " "); stopsArmed = false; pendingExit = true;
                 }
-                else if (priceLong >= hiddenTargetPrice && !runnerModeActive)
+                else if (priceLong >= hiddenTargetPrice && (!runnerModeActive || tpClampedByPrevDay))
                 {
-                    Print(TAG + "HIDDEN TP LONG @ " + priceLong.ToString("F2"));
+                    Print(TAG + "HIDDEN TP LONG @ " + priceLong.ToString("F2") + (tpClampedByPrevDay ? " (prevDay-clamp)" : ""));
                     ExitLong(" ", " "); stopsArmed = false; pendingExit = true;
                 }
             }
@@ -820,9 +827,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                     Print(TAG + "HIDDEN SL SHORT @ " + priceShort.ToString("F2"));
                     ExitShort(" ", " "); stopsArmed = false; pendingExit = true;
                 }
-                else if (priceShort <= hiddenTargetPrice && !runnerModeActive)
+                else if (priceShort <= hiddenTargetPrice && (!runnerModeActive || tpClampedByPrevDay))
                 {
-                    Print(TAG + "HIDDEN TP SHORT @ " + priceShort.ToString("F2"));
+                    Print(TAG + "HIDDEN TP SHORT @ " + priceShort.ToString("F2") + (tpClampedByPrevDay ? " (prevDay-clamp)" : ""));
                     ExitShort(" ", " "); stopsArmed = false; pendingExit = true;
                 }
             }
@@ -908,6 +915,17 @@ namespace NinjaTrader.NinjaScript.Strategies
             int barsInTrade = CurrentBar - entryBar;
             if (barsInTrade > 0 && barsInTrade % 5 == 0 && profitPts > dynamicActivation * 1.5)
                 curDist *= 0.90;
+            // PROFIT-AGGRESSION ladder — the more we're up, the tighter we follow.
+            //  >= activation * 4  → 30% extra tighten (lock big profits)
+            //  >= activation * 6  → additional 25% tighten (very big — protect strongly)
+            //  >= activation * 8  → cap distance at max(1pt, ATR*0.25) regardless of base calc
+            if (trailMaxProfitPts >= dynamicActivation * 4) curDist *= 0.70;
+            if (trailMaxProfitPts >= dynamicActivation * 6) curDist *= 0.75;
+            if (trailMaxProfitPts >= dynamicActivation * 8)
+            {
+                double hardCap = Math.Max(1.0, atrPts * 0.25);
+                if (curDist > hardCap) curDist = hardCap;
+            }
             // Trap tighten
             if (trapDetected && stopHuntSuspendBars <= 0) curDist *= 0.60;
             // EMA against → tighter
@@ -916,7 +934,9 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             // Profit tier floors
             double tierFloor = 0;
-            if (trailMaxProfitPts >= dynamicActivation * 4)
+            if (trailMaxProfitPts >= dynamicActivation * 6)
+            { tierFloor = 0.65 * trailMaxProfitPts * tickPt; trailTierName = "T4-Big"; }
+            else if (trailMaxProfitPts >= dynamicActivation * 4)
             { tierFloor = (htfAgrees ? 0.50 : 0.45) * trailMaxProfitPts * tickPt; trailTierName = "T3-Runner"; }
             else if (trailMaxProfitPts >= dynamicActivation * 2.5)
             { tierFloor = 0.40 * trailMaxProfitPts * tickPt; trailTierName = "T2-Strong"; }
@@ -1384,15 +1404,16 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             originalSlPrice = hiddenStopPrice;
             // Clamp TP to prevDay levels if relevant
+            tpClampedByPrevDay = false;
             double minTpDist = 8 * tickPt;
             if (prevDayHigh > 0 && openTradeDirection == 1
                 && prevDayHigh > averageEntryPrice + minTpDist
                 && prevDayHigh < hiddenTargetPrice)
-                hiddenTargetPrice = prevDayHigh - TickSize;
+            { hiddenTargetPrice = prevDayHigh - TickSize; tpClampedByPrevDay = true; }
             if (prevDayLow > 0 && openTradeDirection == -1
                 && prevDayLow < averageEntryPrice - minTpDist
                 && prevDayLow > hiddenTargetPrice)
-                hiddenTargetPrice = prevDayLow + TickSize;
+            { hiddenTargetPrice = prevDayLow + TickSize; tpClampedByPrevDay = true; }
             stopsArmed = true;
             if (runnerModeActive) Print(TAG + "RUNNER mode armed dir=" + openTradeDirection);
         }
@@ -1415,13 +1436,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                 newTp = averageEntryPrice - ((runnerModeActive ? 500 : tpPoints) * tickPt);
             }
             // PrevDay clamp on TP
+            tpClampedByPrevDay = false;
             double minTpDist = 8 * tickPt;
             if (prevDayHigh > 0 && openTradeDirection == 1
                 && prevDayHigh > averageEntryPrice + minTpDist && prevDayHigh < newTp)
-                newTp = prevDayHigh - TickSize;
+            { newTp = prevDayHigh - TickSize; tpClampedByPrevDay = true; }
             if (prevDayLow > 0 && openTradeDirection == -1
                 && prevDayLow < averageEntryPrice - minTpDist && prevDayLow > newTp)
-                newTp = prevDayLow + TickSize;
+            { newTp = prevDayLow + TickSize; tpClampedByPrevDay = true; }
 
             // SL: if breakeven is locked OR trail has already moved SL favorable,
             // never RELAX SL backwards (would expose more risk than user expects).
@@ -1441,6 +1463,70 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         // Thread-safe trigger from WPF UI thread.
         private void RequestSlTpResize() { pendingSlTpResize = true; if (ChartControl != null) ChartControl.Dispatcher.InvokeAsync(() => DrawChartAnnotations()); }
+
+        // Direct SL nudge (price-space). Negative dPts = WIDEN (move away from price), positive = TIGHTEN.
+        // Works correctly after JumpSL/BE-lock because it operates on hiddenStopPrice, not slPoints.
+        private void RequestSlNudgePoints(int dPts)
+        {
+            pendingSlNudge += dPts;
+            if (ChartControl != null) ChartControl.Dispatcher.InvokeAsync(() => DrawChartAnnotations());
+        }
+
+        private void NudgeSlPricePoints(int dPts)
+        {
+            if (!stopsArmed || averageEntryPrice <= 0 || openTradeDirection == 0)
+            { UpdateDashboardStatus("SL nudge ignored (flat)", Brushes.Orange); return; }
+            double price = Close[0];
+            if (State == State.Realtime)
+            {
+                double v = openTradeDirection == 1 ? GetCurrentBid(0) : GetCurrentAsk(0);
+                if (v > 0) price = v;
+            }
+            double tickPt = NQ_TICKS_PER_POINT * TickSize;
+            double delta = Math.Abs(dPts) * tickPt;
+            double oldSl = hiddenStopPrice;
+            if (openTradeDirection == 1)
+            {
+                // dPts > 0 (TIGHTEN): SL moves UP (closer to price)
+                // dPts < 0 (WIDEN):   SL moves DOWN (further from price)
+                hiddenStopPrice += dPts > 0 ? +delta : -delta;
+                // Clamp: never above price-1tk (would self-stop), never below originalSl-200pt (sanity floor)
+                double maxSl = price - TickSize;
+                if (hiddenStopPrice > maxSl) hiddenStopPrice = maxSl;
+                double sanityFloor = averageEntryPrice - 200 * tickPt;
+                if (hiddenStopPrice < sanityFloor) hiddenStopPrice = sanityFloor;
+            }
+            else
+            {
+                // SHORT: dPts > 0 (TIGHTEN) → SL moves DOWN (closer to price)
+                //        dPts < 0 (WIDEN)   → SL moves UP   (further from price)
+                hiddenStopPrice += dPts > 0 ? -delta : +delta;
+                double minSl = price + TickSize;
+                if (hiddenStopPrice < minSl) hiddenStopPrice = minSl;
+                double sanityCap = averageEntryPrice + 200 * tickPt;
+                if (hiddenStopPrice > sanityCap) hiddenStopPrice = sanityCap;
+            }
+            hiddenStopPrice = Math.Round(hiddenStopPrice / TickSize) * TickSize;
+            // Keep slPoints in sync with the ACTUAL distance from price (so dashboard reads correctly).
+            double slDistPts = openTradeDirection == 1
+                ? (price - hiddenStopPrice) / tickPt
+                : (hiddenStopPrice - price) / tickPt;
+            slPoints = Math.Max(1, (int)Math.Round(Math.Abs(slDistPts)));
+            // Tightening = manual lock; matches Jump SL behavior and prevents auto-BE from undoing it.
+            if (dPts > 0) breakevenLocked = true;
+            // Update originalSlPrice if we widened (so trail backtrack respects new floor).
+            if (dPts < 0)
+            {
+                if (openTradeDirection == 1 && hiddenStopPrice < originalSlPrice) originalSlPrice = hiddenStopPrice;
+                if (openTradeDirection == -1 && hiddenStopPrice > originalSlPrice) originalSlPrice = hiddenStopPrice;
+            }
+            if (ChartControl != null) ChartControl.Dispatcher.InvokeAsync(() => UpdateAdjustLabels());
+            DrawChartAnnotations();
+            Print(TAG + "SL NUDGE " + (dPts > 0 ? "+" : "") + dPts + "pt  " + oldSl.ToString("F2") + " -> " + hiddenStopPrice.ToString("F2")
+                + "  (price=" + price.ToString("F2") + " dist=" + slDistPts.ToString("F1") + "pt)");
+            UpdateDashboardStatus("SL " + (dPts > 0 ? "tightened" : "widened") + " " + Math.Abs(dPts) + "pt -> " + hiddenStopPrice.ToString("F2"),
+                dPts > 0 ? Brushes.LimeGreen : Brushes.Yellow);
+        }
 
         // -----------------------------------------------------------
         //  MANUAL TRAIL CONTROL — invoked from dashboard buttons.
@@ -1704,6 +1790,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             flatSyncGraceTicks = 0; openTradeDirection = 0;
             openDcaCount = 0; totalContracts = 0; averageEntryPrice = 0;
             hiddenStopPrice = 0; hiddenTargetPrice = 0; originalSlPrice = 0;
+            tpClampedByPrevDay = false;
             aggressiveLimitSubmitTime = DateTime.MinValue;
             activeEntrySignals.Clear();
             trailPrice = 0; trailActive = false; trailMaxProfitPts = 0; trailTierName = "";
@@ -1828,9 +1915,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                     }
                 }
                 if (dailyRealizedPnL <= -maxDailyLossDollars && !dailyLimitHit)
-                { dailyLimitHit = true; ExecuteFlatten(); Print(TAG + "DAILY LOSS LIMIT " + dailyRealizedPnL.ToString("C0")); }
+                { dailyLimitHit = true; ExecuteFlatten(); Print(TAG + "DAILY LOSS LIMIT " + dailyRealizedPnL.ToString("C0") + " — closing trade, NOT killing strategy. Disable+Enable to resume."); UpdateDashboardStatus("⛔ DAILY LOSS LIMIT " + dailyRealizedPnL.ToString("C0") + " — trade closed. Disable+Enable to resume.", Brushes.Red); }
                 if (dailyRealizedPnL >= maxDailyProfitDollars && !dailyProfitHit)
-                { dailyProfitHit = true; ExecuteFlatten(); Print(TAG + "DAILY PROFIT TARGET " + dailyRealizedPnL.ToString("C0")); }
+                { dailyProfitHit = true; ExecuteFlatten(); Print(TAG + "DAILY PROFIT TARGET " + dailyRealizedPnL.ToString("C0") + " — closing trade, NOT killing strategy. Disable+Enable to resume."); UpdateDashboardStatus("💰 DAILY PROFIT TARGET " + dailyRealizedPnL.ToString("C0") + " — trade closed. Disable+Enable to resume.", Brushes.Gold); }
             }
             catch (Exception ex) { Print(TAG + "OnExecutionUpdate EX: " + ex.Message); }
         }
@@ -2271,15 +2358,26 @@ namespace NinjaTrader.NinjaScript.Strategies
             Draw.HorizontalLine(this, "hiddenSL", false, hiddenStopPrice, Brushes.OrangeRed, DashStyleHelper.DashDotDot, 2);
             Draw.HorizontalLine(this, "hiddenTP", false, hiddenTargetPrice, Brushes.LimeGreen, DashStyleHelper.DashDotDot, 2);
             Draw.HorizontalLine(this, "avgEntryLine", false, averageEntryPrice, Brushes.DodgerBlue, DashStyleHelper.Dot, 1);
-            int slTk = slPoints * 4;
-            int tpTk = tpPoints * 4;
-            double slDol = slPoints * NQ_DOLLARS_PER_POINT * totalContracts;
-            double tpDol = tpPoints * NQ_DOLLARS_PER_POINT * totalContracts;
+            // ALWAYS compute label distances from the ACTUAL hidden line price (not the
+            // entry-based slPoints/tpPoints settings), so prevDay clamp + manual SL nudges
+            // and Jump SL show the truth on the chart.
+            double tickPtX = TickSize * NQ_TICKS_PER_POINT;
+            double slDistPts = openTradeDirection == 1
+                ? (averageEntryPrice - hiddenStopPrice) / tickPtX
+                : (hiddenStopPrice - averageEntryPrice) / tickPtX;
+            double tpDistPts = openTradeDirection == 1
+                ? (hiddenTargetPrice - averageEntryPrice) / tickPtX
+                : (averageEntryPrice - hiddenTargetPrice) / tickPtX;
+            int slTk = (int)Math.Round(Math.Abs(slDistPts) * NQ_TICKS_PER_POINT);
+            int tpTk = (int)Math.Round(Math.Abs(tpDistPts) * NQ_TICKS_PER_POINT);
+            double slDol = Math.Abs(slDistPts) * NQ_DOLLARS_PER_POINT * totalContracts;
+            double tpDol = Math.Abs(tpDistPts) * NQ_DOLLARS_PER_POINT * totalContracts;
+            string slSign = slDistPts < 0 ? "+" : ""; // negative = SL is in profit (after Jump SL)
             Draw.Text(this, "slLabel",
-                "SL " + hiddenStopPrice.ToString("F2") + "  (" + slPoints + "pt | " + slTk + "tk | " + slDol.ToString("C0") + ")",
+                "SL " + hiddenStopPrice.ToString("F2") + "  (" + slSign + slDistPts.ToString("F1") + "pt | " + slTk + "tk | " + slDol.ToString("C0") + ")",
                 0, hiddenStopPrice + (openTradeDirection == 1 ? -2 * TickSize : 2 * TickSize), Brushes.OrangeRed);
             Draw.Text(this, "tpLabel",
-                "TP " + hiddenTargetPrice.ToString("F2") + "  (" + tpPoints + "pt | " + tpTk + "tk | " + tpDol.ToString("C0") + ")",
+                "TP " + hiddenTargetPrice.ToString("F2") + "  (" + tpDistPts.ToString("F1") + "pt | " + tpTk + "tk | " + tpDol.ToString("C0") + (tpClampedByPrevDay ? " — PD" : "") + ")",
                 0, hiddenTargetPrice + (openTradeDirection == 1 ? 2 * TickSize : -2 * TickSize), Brushes.LimeGreen);
             if (trailEnabled && trailActive && trailPrice > 0)
             {
@@ -2544,8 +2642,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                         (s, e) => { int nv = contracts + 1; contracts = Math.Min(maxContracts, nv); UpdateAdjustLabels(); },
                         out lblQtyVal));
                     stack.Children.Add(MakeAdjustRow("SL:", slPoints + "pt | $" + (slPoints * 20),
-                        (s, e) => { int nv = slPoints - slTpAdjustStep; slPoints = Math.Max(1, nv); UpdateAdjustLabels(); RequestSlTpResize(); },
-                        (s, e) => { int nv = slPoints + slTpAdjustStep; slPoints = Math.Min(500, nv); UpdateAdjustLabels(); RequestSlTpResize(); },
+                        // − = WIDEN (move SL FURTHER from price = give more room).
+                        // + = TIGHTEN (move SL CLOSER to price = lock more profit / reduce risk).
+                        // Operates on hiddenStopPrice DIRECTLY so it works correctly even after
+                        // Jump SL has moved SL into profit (where slPoints/entry-math becomes ambiguous).
+                        (s, e) => { RequestSlNudgePoints(-slTpAdjustStep); },
+                        (s, e) => { RequestSlNudgePoints(+slTpAdjustStep); },
                         out lblSlVal));
                     stack.Children.Add(MakeAdjustRow("TP:", tpPoints + "pt | $" + (tpPoints * 20),
                         (s, e) => { int nv = tpPoints - slTpAdjustStep; tpPoints = Math.Max(1, nv); UpdateAdjustLabels(); RequestSlTpResize(); },
