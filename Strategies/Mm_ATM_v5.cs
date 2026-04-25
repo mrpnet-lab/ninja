@@ -126,6 +126,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         private DateTime lastEntryWallTime;
         private DateTime aggressiveLimitSubmitTime;
         private bool     enteredThisBar;           // single-shot guard per bar
+        // Originals snapshotted at DataLoaded so each new arm RESETS to user-configured values
+        // (not the previous trade's nudged values).
+        private int      origSlPoints, origTpPoints, origJumpSlPercent;
+        private bool     originalsSnapshotted;
         private readonly List<string> activeEntrySignals = new List<string>();
         #endregion
 
@@ -141,6 +145,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         private volatile bool pendingTrailActivate;
         private volatile int  pendingTrailNudgePoints;          // signed: + = looser (away from price), − = tighter
         private double        trailNudgeStepPoints = 1.0;       // 1 NQ point = 4 ticks = $20
+        private double        aggressiveTrailMaxAtrFactor = 0.5; // TRL NOW initial distance = max(2pt, factor×ATR)
+        private double        beSafeAtrFactor             = 0.35; // Smart BE: SL must stay >= max(beSafeMinTicks, factor×ATR) below price
+        private int           beSafeMinTicks              = 6;    // Hard floor in ticks (1.5pt on NQ) so MM stop-hunts can't tag us
         private volatile bool pendingPositionFlat;
         private volatile bool pendingExit;
         private int  pendingExitTicks;
@@ -152,7 +159,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         // ===========================================================
         #region Trail state
         private bool   trailActive;
-        private bool   manualTrailMode;        // when true, auto-ratchet paused (user is in control)
+        private bool   manualTrailMode;        // legacy flag (kept for backward refs); no longer pauses ratchet
+        private bool   manualTrailEarlyStart;  // TRL NOW set this -> activation profit threshold bypassed
+        private double manualTrailOffsetPoints; // signed offset added to auto trail distance (− = tighter, + = looser)
         private double trailPrice;
         private double trailMaxProfitPts;
         private double trailTrendScore;
@@ -347,9 +356,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                     trailActivationPoints = 5;
                     trailAtrMultiplier    = 1.5;
                     smartTrailBacktrackTicks = 4;
+                    aggressiveTrailMaxAtrFactor = 0.5;
 
                     // SmartSL / JumpSL
                     breakevenAtPoints     = 8;
+                    beSafeAtrFactor       = 0.35;
+                    beSafeMinTicks        = 6;
                     breakevenEnabled      = true;
                     allowMultiEntryPerBar = true;     // default ALLOW
                     jumpSlPercent         = 50;
@@ -395,6 +407,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                     volumeAtPrice = new SortedDictionary<double, double>();
                     ResetSessionFlags();
                     ResetPositionStateInternal(true);
+                    // Snapshot user's property-panel values so each new arm restores them
+                    if (!originalsSnapshotted)
+                    {
+                        origSlPoints      = slPoints;
+                        origTpPoints      = tpPoints;
+                        origJumpSlPercent = jumpSlPercent;
+                        originalsSnapshotted = true;
+                    }
                 }
                 else if (State == State.Realtime)
                 {
@@ -710,21 +730,73 @@ namespace NinjaTrader.NinjaScript.Strategies
                 double ask = GetCurrentAsk(0); if (ask > 0) priceShort = ask;
             }
 
-            // BE lock at breakevenAtPoints (only when not runner, and only if BE master switch is ON)
-            if (breakevenEnabled && !breakevenLocked && !runnerModeActive)
+            // SMART BE — dynamic trigger and ratcheting micro-BE
+            //  Trigger = max(BreakevenAtPoints, 0.5×ATR, 0.4×TP)  — prevents firing too early on volatile NQ
+            //  Lock 1: at trigger → SL = entry + 2 ticks (locks $10 + commission cushion)
+            //  Lock 2+: every additional 5 pts of profit → SL ratchets +2 ticks above entry
+            //  Capped at TP-2pt to never get stopped out at TP-mark
+            if (breakevenEnabled && !runnerModeActive)
             {
-                double profitPx = openTradeDirection == 1 ? priceLong : priceShort;
-                double profitPts = openTradeDirection == 1
-                    ? (profitPx - averageEntryPrice) / (TickSize * NQ_TICKS_PER_POINT)
-                    : (averageEntryPrice - profitPx) / (TickSize * NQ_TICKS_PER_POINT);
-                if (profitPts >= breakevenAtPoints)
+                double profitPx2 = openTradeDirection == 1 ? priceLong : priceShort;
+                double tickPt2 = TickSize * NQ_TICKS_PER_POINT;
+                double profitPts2 = openTradeDirection == 1
+                    ? (profitPx2 - averageEntryPrice) / tickPt2
+                    : (averageEntryPrice - profitPx2) / tickPt2;
+                double atrPts2 = indAtr[0] / tickPt2;
+                double smartTrigger = Math.Max(breakevenAtPoints, Math.Max(atrPts2 * 0.5, tpPoints * 0.4));
+                if (profitPts2 >= smartTrigger)
                 {
-                    if (openTradeDirection == 1 && averageEntryPrice > hiddenStopPrice)
-                        hiddenStopPrice = averageEntryPrice;
-                    else if (openTradeDirection == -1 && averageEntryPrice < hiddenStopPrice)
-                        hiddenStopPrice = averageEntryPrice;
-                    breakevenLocked = true;
-                    Print(TAG + "BREAKEVEN LOCK @ " + hiddenStopPrice.ToString("F2") + " profit=" + profitPts.ToString("F1"));
+                    // Compute target BE-stop: entry + (2tk + extra ratchet from profit beyond trigger)
+                    int extraTicks = 2 + (int)Math.Floor(Math.Max(0, profitPts2 - smartTrigger) / 5.0) * 2;
+                    double beOffset = extraTicks * TickSize;
+                    double targetBe = openTradeDirection == 1
+                        ? averageEntryPrice + beOffset
+                        : averageEntryPrice - beOffset;
+                    // Cap at TP - 2pt so we don't camp at TP
+                    double tpCap = openTradeDirection == 1
+                        ? hiddenTargetPrice - 2 * tickPt2
+                        : hiddenTargetPrice + 2 * tickPt2;
+                    if (openTradeDirection == 1 && targetBe > tpCap) targetBe = tpCap;
+                    if (openTradeDirection == -1 && targetBe < tpCap) targetBe = tpCap;
+                    targetBe = Math.Round(targetBe / TickSize) * TickSize;
+                    // ANTI-STOP-HUNT SAFETY: never let SL sit too close to current price.
+                    //  MM algos love to wick 4-8 ticks past obvious BE/round-number levels then reverse.
+                    //  Force a buffer = max(BeSafeMinTicks, BeSafeAtrFactor×ATR_ticks) below price.
+                    double safeBufTicks = Math.Max(beSafeMinTicks, atrPts2 * NQ_TICKS_PER_POINT * beSafeAtrFactor);
+                    double safeBufPx = safeBufTicks * TickSize;
+                    if (openTradeDirection == 1)
+                    {
+                        double maxAllowed = profitPx2 - safeBufPx;
+                        if (targetBe > maxAllowed) targetBe = Math.Round(maxAllowed / TickSize) * TickSize;
+                        // Skip if safety capped the SL below profitable BE \u2014 wait for more room.
+                        if (targetBe < averageEntryPrice + TickSize) goto SkipBe;
+                    }
+                    else
+                    {
+                        double minAllowed = profitPx2 + safeBufPx;
+                        if (targetBe < minAllowed) targetBe = Math.Round(minAllowed / TickSize) * TickSize;
+                        if (targetBe > averageEntryPrice - TickSize) goto SkipBe;
+                    }
+                    // Ratchet only — never weaken SL
+                    bool moved = false;
+                    if (openTradeDirection == 1 && targetBe > hiddenStopPrice)
+                    { hiddenStopPrice = targetBe; moved = true; }
+                    else if (openTradeDirection == -1 && targetBe < hiddenStopPrice)
+                    { hiddenStopPrice = targetBe; moved = true; }
+                    if (moved)
+                    {
+                        if (!breakevenLocked)
+                        {
+                            breakevenLocked = true;
+                            Print(TAG + "BREAKEVEN LOCK (smart) @ " + hiddenStopPrice.ToString("F2")
+                                + " profit=" + profitPts2.ToString("F1") + "pt trigger=" + smartTrigger.ToString("F1") + "pt");
+                        }
+                        else
+                        {
+                            Print(TAG + "BE RATCHET +" + extraTicks + "tk @ " + hiddenStopPrice.ToString("F2") + " profit=" + profitPts2.ToString("F1") + "pt");
+                        }
+                    }
+                    SkipBe:;
                 }
             }
 
@@ -788,7 +860,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                     { lastTrailDiagTime = DateTime.Now; Print(TAG + "TRAIL diag: waiting bar-guard barsSinceEntry=" + (CurrentBar - entryBar)); }
                     return;
                 }
-                if (profitPts < dynamicActivation)
+                // Profit-activation gate — BYPASSED if user pressed TRL NOW (early-start)
+                if (!manualTrailEarlyStart && profitPts < dynamicActivation)
                 {
                     if (enableDiagLog && (DateTime.Now - lastTrailDiagTime).TotalSeconds >= 5)
                     {
@@ -799,34 +872,38 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 trailActive = true;
                 manualTrailMode = false;
-                double dist = htfAgrees
-                    ? Math.Max(GetTrailDistance() * 1.8, atrPts * 0.8)
-                    : GetTrailDistance();
+                // Distance choice:
+                //  - Early-start (TRL NOW): aggressive lock = max(2pt, 0.5×ATR) — protect profit fast
+                //  - HTF-agreeing runner:    GetTrailDistance() × 1.8
+                //  - Default:                GetTrailDistance()
+                double dist;
+                if (manualTrailEarlyStart)
+                {
+                    dist = Math.Max(2.0, atrPts * aggressiveTrailMaxAtrFactor);
+                    trailTierName = "Aggr";
+                }
+                else if (htfAgrees)
+                {
+                    dist = Math.Max(GetTrailDistance() * 1.8, atrPts * 0.8);
+                    trailTierName = "Runner";
+                }
+                else
+                {
+                    dist = GetTrailDistance();
+                    trailTierName = "Active";
+                }
+                dist = Math.Max(1.0, dist + manualTrailOffsetPoints);
                 trailPrice = openTradeDirection == 1
                     ? Math.Round((price - dist * tickPt) / TickSize) * TickSize
                     : Math.Round((price + dist * tickPt) / TickSize) * TickSize;
-                trailTierName = htfAgrees ? "Runner" : "Active";
-                Print(TAG + "TRAIL ACTIVATED profit=" + profitPts.ToString("F1") + " dist=" + dist.ToString("F1") + " tier=" + trailTierName);
+                Print(TAG + "TRAIL ACTIVATED " + (manualTrailEarlyStart ? "(TRL NOW — aggressive) " : "")
+                    + "profit=" + profitPts.ToString("F1") + " dist=" + dist.ToString("F1") + " tier=" + trailTierName);
                 return;
             }
 
             // ----- compute candidate new trail price -----
-            // Manual override: skip auto-ratchet, only run hit-detection below.
-            if (manualTrailMode)
-            {
-                if (openTradeDirection == 1 && price <= trailPrice)
-                {
-                    Print(TAG + "TRAIL HIT LONG (manual) @ " + price.ToString("F2") + " trail=" + trailPrice.ToString("F2"));
-                    ExitLong(" ", " "); stopsArmed = false; pendingExit = true;
-                }
-                else if (openTradeDirection == -1 && price >= trailPrice)
-                {
-                    Print(TAG + "TRAIL HIT SHORT (manual) @ " + price.ToString("F2") + " trail=" + trailPrice.ToString("F2"));
-                    ExitShort(" ", " "); stopsArmed = false; pendingExit = true;
-                }
-                return;
-            }
-            double curDist = GetTrailDistance();
+            // Manual offset applied every pass so user nudges persist through auto-ratchet.
+            double curDist = Math.Max(1.0, GetTrailDistance() + manualTrailOffsetPoints);
             // Time-based ratchet: every 5 bars in profit, tighten 10%
             int barsInTrade = CurrentBar - entryBar;
             if (barsInTrade > 0 && barsInTrade % 5 == 0 && profitPts > dynamicActivation * 1.5)
@@ -1270,6 +1347,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Print(TAG + "ArmHiddenStops skipped — avgEntry=0 (will arm on fill)");
                 return;
             }
+            // -------- RESET to ORIGINAL config (never carry-over from previous trade) --------
+            // Manual nudges from prior trade are wiped here so each new trade starts clean.
+            if (originalsSnapshotted)
+            {
+                if (slPoints      != origSlPoints)      { slPoints      = origSlPoints;      Print(TAG + "SL reset to original " + slPoints + "pt"); }
+                if (tpPoints      != origTpPoints)      { tpPoints      = origTpPoints;      Print(TAG + "TP reset to original " + tpPoints + "pt"); }
+                if (jumpSlPercent != origJumpSlPercent) { jumpSlPercent = origJumpSlPercent; Print(TAG + "Jump% reset to original " + jumpSlPercent + "%"); }
+                if (ChartControl != null) ChartControl.Dispatcher.InvokeAsync(() => { UpdateAdjustLabels(); UpdateJumpLabel(); });
+            }
             runnerModeActive = (openTradeDirection == 1 && htfBias > 0)
                             || (openTradeDirection == -1 && htfBias < 0);
             int effTp = runnerModeActive ? 500 : tpPoints;
@@ -1278,9 +1364,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             double tpOff = effTp * tickPt;
             breakevenLocked = false;
             entryBar = CurrentBar;
-            // reset trail state on every arm
+            // reset trail state on every arm — user nudges from prior trade are CLEARED
             trailActive = false; trailPrice = 0; trailMaxProfitPts = 0; trailTierName = "";
             manualTrailMode = false;
+            manualTrailEarlyStart = false;
+            manualTrailOffsetPoints = 0;
             trapScore = 0; trapDetected = false; trapBarsInTrade = 0; trapEscapeBars = 0;
             stopHuntSuspendBars = 0;
 
@@ -1352,14 +1440,16 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         // Thread-safe trigger from WPF UI thread.
-        private void RequestSlTpResize() { pendingSlTpResize = true; }
+        private void RequestSlTpResize() { pendingSlTpResize = true; if (ChartControl != null) ChartControl.Dispatcher.InvokeAsync(() => DrawChartAnnotations()); }
 
         // -----------------------------------------------------------
         //  MANUAL TRAIL CONTROL — invoked from dashboard buttons.
-        //  ActivateTrailManual : turn trail on RIGHT NOW at GetTrailDistance() from price.
-        //  NudgeTrailDistanceTicks(+n)  : loosen by n ticks (move trail away from price)
-        //  NudgeTrailDistanceTicks(-n)  : tighten by n ticks (lock in more profit)
-        //  Both methods set manualTrailMode=true so auto-ratchet stops overwriting user edits.
+        //  ActivateTrailManual : set manualTrailEarlyStart=true so MonitorAdaptiveTrail
+        //                        activates trail IMMEDIATELY on next tick using AGGRESSIVE
+        //                        distance (max(2pt, 0.5×ATR)). Auto-ratchet then continues.
+        //  NudgeTrailDistancePoints(±n) : adjust manualTrailOffsetPoints; auto-trail honors
+        //                        the offset on every subsequent ratchet, so user adjustment
+        //                        STICKS even as trail moves.
         // -----------------------------------------------------------
         private void ActivateTrailManual()
         {
@@ -1368,68 +1458,93 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Print(TAG + "TRAIL manual-activate skipped (no live position)");
                 return;
             }
-            double price = Close[0];
-            if (State == State.Realtime)
+            // If trail already active, just lock it tighter NOW (re-anchor at aggressive distance).
+            // If not active, set the early-start flag — next tick of MonitorAdaptiveTrail will arm it.
+            manualTrailEarlyStart = true;
+            if (trailActive)
             {
-                double v = openTradeDirection == 1 ? GetCurrentBid(0) : GetCurrentAsk(0);
-                if (v > 0) price = v;
+                // Re-anchor immediately at aggressive distance.
+                double price = Close[0];
+                if (State == State.Realtime)
+                {
+                    double v = openTradeDirection == 1 ? GetCurrentBid(0) : GetCurrentAsk(0);
+                    if (v > 0) price = v;
+                }
+                double tickPt = NQ_TICKS_PER_POINT * TickSize;
+                double atrPts = indAtr[0] / tickPt;
+                double dist = Math.Max(2.0, atrPts * aggressiveTrailMaxAtrFactor) + manualTrailOffsetPoints;
+                if (dist < 1.0) dist = 1.0;
+                double newTrail = openTradeDirection == 1
+                    ? Math.Round((price - dist * tickPt) / TickSize) * TickSize
+                    : Math.Round((price + dist * tickPt) / TickSize) * TickSize;
+                // Safety: never beyond originalSL (no extra risk), never past current price (no self-stop).
+                if (originalSlPrice > 0)
+                {
+                    if (openTradeDirection == 1 && newTrail < originalSlPrice) newTrail = originalSlPrice;
+                    if (openTradeDirection == -1 && newTrail > originalSlPrice) newTrail = originalSlPrice;
+                }
+                if (openTradeDirection == 1 && newTrail >= price - TickSize) newTrail = price - TickSize;
+                if (openTradeDirection == -1 && newTrail <= price + TickSize) newTrail = price + TickSize;
+                // RATCHET-only: never relax during re-anchor (use the more favorable of old vs new)
+                if (openTradeDirection == 1)  trailPrice = Math.Max(trailPrice, newTrail);
+                else                          trailPrice = Math.Min(trailPrice, newTrail);
+                trailTierName = "Aggr";
+                Print(TAG + "TRAIL RE-ANCHOR (TRL NOW) @ " + trailPrice.ToString("F2") + " dist=" + dist.ToString("F1") + "pt");
             }
-            double tickPt = NQ_TICKS_PER_POINT * TickSize;
-            double dist = GetTrailDistance();   // points
-            double off  = dist * tickPt;
-            double newTrail = openTradeDirection == 1
-                ? Math.Round((price - off) / TickSize) * TickSize
-                : Math.Round((price + off) / TickSize) * TickSize;
-            // Don't put trail beyond the original SL — that would INCREASE risk.
-            if (openTradeDirection == 1 && originalSlPrice > 0 && newTrail < originalSlPrice) newTrail = originalSlPrice;
-            else if (openTradeDirection == -1 && originalSlPrice > 0 && newTrail > originalSlPrice) newTrail = originalSlPrice;
-            // Also lock in any current profit: if breakeven or better is reachable, bias to entry+1tk.
-            double profitPts = openTradeDirection == 1
-                ? (price - averageEntryPrice) / tickPt
-                : (averageEntryPrice - price) / tickPt;
-            trailPrice = newTrail;
-            trailActive = true;
-            manualTrailMode = true;
-            trailTierName = "Manual";
-            Print(TAG + "TRAIL ACTIVATED MANUAL @ " + trailPrice.ToString("F2")
-                + " (price=" + price.ToString("F2") + " dist=" + dist.ToString("F1") + "pt profit=" + profitPts.ToString("F2") + "pt)");
-            UpdateDashboardStatus("Trail ON (manual) @ " + trailPrice.ToString("F2"), Brushes.Magenta);
+            else
+            {
+                Print(TAG + "TRAIL EARLY-START armed (TRL NOW) — will activate on next monitor tick");
+            }
+            UpdateDashboardStatus("TRL NOW armed (aggressive)", Brushes.Magenta);
         }
 
         private void NudgeTrailDistancePoints(int dPoints)
         {
             if (!stopsArmed || openTradeDirection == 0) { Print(TAG + "TRAIL nudge ignored (flat)"); return; }
-            // If trail not yet active, activating it first gives the user something to nudge.
-            if (!trailActive) ActivateTrailManual();
-            if (!trailActive) return;
-            // For LONG: trail = price - distance.  Increasing distance => trail price DECREASES.
-            // For SHORT: trail = price + distance. Increasing distance => trail price INCREASES.
-            // dPoints > 0 means LOOSER (more distance), dPoints < 0 means TIGHTER.
-            double tickPt = TickSize * NQ_TICKS_PER_POINT;
-            double delta = dPoints * tickPt * (openTradeDirection == 1 ? -1 : +1);
-            double newTrail = Math.Round((trailPrice + delta) / TickSize) * TickSize;
-            // Safety clamps:
-            double price = Close[0];
-            if (State == State.Realtime)
+            // First nudge auto-arms trail (so user doesn't have to press TRL NOW separately).
+            if (!trailActive) { manualTrailEarlyStart = true; ActivateTrailManual(); }
+            // Add to the persistent offset — auto-ratchet honors this on every pass.
+            manualTrailOffsetPoints += dPoints;
+            // Apply the offset IMMEDIATELY by recomputing trail (don't wait for next monitor tick).
+            if (trailActive)
             {
-                double v = openTradeDirection == 1 ? GetCurrentBid(0) : GetCurrentAsk(0);
-                if (v > 0) price = v;
+                double tickPt = NQ_TICKS_PER_POINT * TickSize;
+                double price = Close[0];
+                if (State == State.Realtime)
+                {
+                    double v = openTradeDirection == 1 ? GetCurrentBid(0) : GetCurrentAsk(0);
+                    if (v > 0) price = v;
+                }
+                double dist = Math.Max(1.0, GetTrailDistance() + manualTrailOffsetPoints);
+                double newTrail = openTradeDirection == 1
+                    ? Math.Round((price - dist * tickPt) / TickSize) * TickSize
+                    : Math.Round((price + dist * tickPt) / TickSize) * TickSize;
+                // Safety clamps:
+                if (openTradeDirection == 1 && newTrail >= price - TickSize) newTrail = price - TickSize;
+                if (openTradeDirection == -1 && newTrail <= price + TickSize) newTrail = price + TickSize;
+                if (originalSlPrice > 0)
+                {
+                    if (openTradeDirection == 1 && newTrail < originalSlPrice) newTrail = originalSlPrice;
+                    if (openTradeDirection == -1 && newTrail > originalSlPrice) newTrail = originalSlPrice;
+                }
+                // Tightening (−): ALWAYS move trail to the new tighter price (locks profit immediately).
+                // Loosening (+): only allowed if it doesn't move trail BACK against current trail (ratchet-safe).
+                double oldTrail = trailPrice;
+                if (dPoints < 0)
+                {
+                    // Tighten: take the more favorable of new vs current
+                    if (openTradeDirection == 1)  trailPrice = Math.Max(trailPrice, newTrail);
+                    else                          trailPrice = Math.Min(trailPrice, newTrail);
+                }
+                else
+                {
+                    // Loosen: only if not yet ratcheted past this point
+                    if (openTradeDirection == 1  && newTrail < trailPrice) trailPrice = newTrail;
+                    if (openTradeDirection == -1 && newTrail > trailPrice) trailPrice = newTrail;
+                }
+                Print(TAG + "TRAIL NUDGE " + (dPoints > 0 ? "+" : "") + dPoints + "pt  offset=" + manualTrailOffsetPoints.ToString("F1") + "pt  "
+                    + oldTrail.ToString("F2") + " -> " + trailPrice.ToString("F2"));
             }
-            // Tighten clamp: never put trail at-or-past current price (would self-stop).
-            if (openTradeDirection == 1 && newTrail >= price - TickSize) newTrail = price - TickSize;
-            if (openTradeDirection == -1 && newTrail <= price + TickSize) newTrail = price + TickSize;
-            // Loosen clamp: never widen past original SL (would increase risk above user's setting).
-            if (originalSlPrice > 0)
-            {
-                if (openTradeDirection == 1 && newTrail < originalSlPrice) newTrail = originalSlPrice;
-                if (openTradeDirection == -1 && newTrail > originalSlPrice) newTrail = originalSlPrice;
-            }
-            double oldTrail = trailPrice;
-            trailPrice = newTrail;
-            manualTrailMode = true;
-            trailTierName = "Manual";
-            Print(TAG + "TRAIL NUDGE " + (dPoints > 0 ? "+" : "") + dPoints + "pt  "
-                + oldTrail.ToString("F2") + " -> " + trailPrice.ToString("F2"));
         }
 
         private void RequestTrailActivate() { pendingTrailActivate = true; }
@@ -1507,7 +1622,13 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (!stopsArmed || Position.MarketPosition == MarketPosition.Flat)
             { UpdateDashboardStatus("No SL to jump", Brushes.Orange); return; }
+            // Use bid/ask in realtime for FAST, accurate SL placement (was using stale Close[0]).
             double price = Close[0];
+            if (State == State.Realtime)
+            {
+                double v = openTradeDirection == 1 ? GetCurrentBid(0) : GetCurrentAsk(0);
+                if (v > 0) price = v;
+            }
             double pct = jumpSlPercent / 100.0;
             double tickPt = NQ_TICKS_PER_POINT * TickSize;
             if (openTradeDirection == 1)
@@ -1530,7 +1651,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 hiddenStopPrice = Math.Round(newSl / TickSize) * TickSize;
                 slPoints = Math.Max(1, (int)Math.Round((hiddenStopPrice - price) / tickPt));
             }
+            // Treat manual SL move as a BE-equivalent lock so auto-BE doesn't undo it.
+            if (slPoints > 0) breakevenLocked = true;
+            // Force-redraw the chart annotations immediately so user sees the new line on next paint.
             if (ChartControl != null) ChartControl.Dispatcher.InvokeAsync(() => UpdateAdjustLabels());
+            DrawChartAnnotations();
+            Print(TAG + "JUMP SL -> " + hiddenStopPrice.ToString("F2") + " (" + slPoints + "pt) price=" + price.ToString("F2"));
             UpdateDashboardStatus("SL jumped to " + hiddenStopPrice.ToString("F2"), Brushes.Yellow);
         }
 
@@ -2394,6 +2520,22 @@ namespace NinjaTrader.NinjaScript.Strategies
                     row3.Children.Add(btnSellLmt);
                     stack.Children.Add(row3);
 
+                    // CLOSE / FLATTEN row — directly under BUY/SELL block for fast access
+                    var rowClose = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 2, 0, 2) };
+                    btnCloseTrade = MakeBtn("CLOSE",   Brushes.Goldenrod, (s, e) => pendingCloseTrade = true);
+                    btnFlatten    = MakeBtn("FLATTEN", Brushes.OrangeRed, (s, e) => pendingFlatten = true);
+                    rowClose.Children.Add(btnCloseTrade);
+                    rowClose.Children.Add(btnFlatten);
+                    stack.Children.Add(rowClose);
+
+                    // CLOSE 1 / KILL row
+                    var rowKill = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 2, 0, 2) };
+                    btnCloseOne = MakeBtn("CLOSE 1", Brushes.DarkGoldenrod, (s, e) => pendingCloseOne = true);
+                    btnKill     = MakeBtn("KILL",    Brushes.DarkRed,        (s, e) => pendingEmergencyKill = true);
+                    rowKill.Children.Add(btnCloseOne);
+                    rowKill.Children.Add(btnKill);
+                    stack.Children.Add(rowKill);
+
                     stack.Children.Add(MakeSep());
 
                     // Adjust rows — symmetric +/-; SL/TP nudge does NOT reset trail/BE
@@ -2423,20 +2565,18 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                     stack.Children.Add(MakeSep());
 
-                    // Action buttons row 4: CLOSE / JUMP / FLATTEN / KILL
-                    var row4 = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 2, 0, 2) };
-                    btnCloseTrade = MakeBtn("CLOSE", Brushes.Goldenrod, (s, e) => pendingCloseTrade = true);
-                    btnCloseOne   = MakeBtn("CLOSE 1", Brushes.DarkGoldenrod, (s, e) => pendingCloseOne = true);
-                    btnJumpSL     = MakeBtn("JUMP SL", Brushes.DodgerBlue, (s, e) => pendingJumpSL = true);
-                    row4.Children.Add(btnCloseTrade);
-                    row4.Children.Add(btnCloseOne);
-                    row4.Children.Add(btnJumpSL);
-                    stack.Children.Add(row4);
+                    // Bottom action row 1: TRL NOW + JUMP SL (the two FAST profit-protection actions)
+                    var rowTrailJump = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 2, 0, 2) };
+                    btnTrailNow = MakeBtn("TRL NOW", Brushes.Magenta,    (s, e) => RequestTrailActivate());
+                    btnJumpSL   = MakeBtn("JUMP SL", Brushes.DodgerBlue, (s, e) => pendingJumpSL = true);
+                    btnTrailNow.ToolTip = "Activate the hidden trail RIGHT NOW with aggressive distance (max 2pt or 0.5×ATR). Auto-ratchet continues afterward; nudges via Trail ±pt persist.";
+                    btnJumpSL.ToolTip   = "Move SL closer to current price by Jump% of the current SL gap. Uses live bid/ask.";
+                    rowTrailJump.Children.Add(btnTrailNow);
+                    rowTrailJump.Children.Add(btnJumpSL);
+                    stack.Children.Add(rowTrailJump);
 
-                    var row5 = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 2, 0, 2) };
-                    btnFlatten = MakeBtn("FLATTEN", Brushes.OrangeRed, (s, e) => pendingFlatten = true);
-                    btnKill    = MakeBtn("KILL",    Brushes.DarkRed,    (s, e) => pendingEmergencyKill = true);
-                    btnTrailNow = MakeBtn("TRL NOW", Brushes.Magenta, (s, e) => RequestTrailActivate());
+                    // Bottom action row 2: TRL ON / TRP ON / BE ON master toggles
+                    var rowToggles = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 2, 0, 2) };
                     btnTrailToggle = MakeToggle(trailEnabled ? "TRL ON" : "TRL OFF", trailEnabled, (s, e) =>
                     { trailEnabled = !trailEnabled;
                       btnTrailToggle.Content = trailEnabled ? "TRL ON" : "TRL OFF";
@@ -2450,14 +2590,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                     { breakevenEnabled = !breakevenEnabled;
                       btnBeToggle.Content = breakevenEnabled ? "BE ON" : "BE OFF";
                       btnBeToggle.Background = breakevenEnabled ? Brushes.DarkSlateGray : Brushes.DarkRed; });
-                    btnBeToggle.ToolTip = "Break-Even lock — when ON, moves SL to entry once profit reaches the BE-Trigger setting (Group 3). Turn OFF to let the trade run without auto-BE.";
-                    row5.Children.Add(btnFlatten);
-                    row5.Children.Add(btnKill);
-                    row5.Children.Add(btnTrailNow);
-                    row5.Children.Add(btnTrailToggle);
-                    row5.Children.Add(btnTrapToggle);
-                    row5.Children.Add(btnBeToggle);
-                    stack.Children.Add(row5);
+                    btnBeToggle.ToolTip = "Smart Break-Even — trigger = max(BE-pts, 0.5×ATR, 0.4×TP). First lock at entry+2tk, then ratchets +2tk per 5pt of further profit.";
+                    rowToggles.Children.Add(btnTrailToggle);
+                    rowToggles.Children.Add(btnTrapToggle);
+                    rowToggles.Children.Add(btnBeToggle);
+                    stack.Children.Add(rowToggles);
 
                     dashScroller = new ScrollViewer { Content = stack, MaxHeight = dashHeight, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled };
                     outer.Children.Add(dashScroller);
@@ -2748,7 +2885,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                         ? (price - trailPrice) / tickPt
                         : (trailPrice - price) / tickPt;
                     int distTk = (int)Math.Round(distPt * NQ_TICKS_PER_POINT);
-                    lblTrailDistVal.Text = distPt.ToString("F1") + "pt | " + distTk + "tk" + (manualTrailMode ? "  M" : "");
+                    string flag = manualTrailEarlyStart ? " *" : "";
+                    string offTxt = Math.Abs(manualTrailOffsetPoints) > 0.01
+                        ? "  off=" + (manualTrailOffsetPoints > 0 ? "+" : "") + manualTrailOffsetPoints.ToString("F0") + "pt"
+                        : "";
+                    lblTrailDistVal.Text = distPt.ToString("F1") + "pt | " + distTk + "tk" + flag + offTxt;
                 }
                 else lblTrailDistVal.Text = trailEnabled ? "— (waiting)" : "OFF";
             }
@@ -3010,9 +3151,24 @@ namespace NinjaTrader.NinjaScript.Strategies
             Description = "When MM stop-hunt detected, allow trail to RELAX up to this many ticks (anti-MM avoidance). 0 = disabled. Default 4.")]
         public int SmartTrailBacktrackTicks { get { return smartTrailBacktrackTicks; } set { smartTrailBacktrackTicks = value; } }
 
+        [NinjaScriptProperty][Range(0.1, 2.0)]
+        [Display(Name = "TRL NOW Aggr ATR Factor", Order = 41, GroupName = "3 - Trail / SL",
+            Description = "TRL NOW initial trail distance = max(2pt, factor × ATR). Lower = tighter / locks more profit faster but riskier on noise. Default 0.5.")]
+        public double AggressiveTrailMaxAtrFactor { get { return aggressiveTrailMaxAtrFactor; } set { aggressiveTrailMaxAtrFactor = value; } }
+
         [NinjaScriptProperty][Range(2, 50)]
         [Display(Name = "Breakeven At (pts)", Order = 5, GroupName = "3 - Trail / SL")]
         public int BreakevenAtPoints { get { return breakevenAtPoints; } set { breakevenAtPoints = value; } }
+
+        [NinjaScriptProperty][Range(0.0, 1.5)]
+        [Display(Name = "BE Safe ATR Factor", Order = 51, GroupName = "3 - Trail / SL",
+            Description = "Smart BE safety: SL is forced to stay at least (factor×ATR) below current price so MM stop-hunts can't tag it. Default 0.35.")]
+        public double BeSafeAtrFactor { get { return beSafeAtrFactor; } set { beSafeAtrFactor = value; } }
+
+        [NinjaScriptProperty][Range(2, 40)]
+        [Display(Name = "BE Safe Min Ticks", Order = 52, GroupName = "3 - Trail / SL",
+            Description = "Hard floor for BE distance from current price (in ticks). Even if ATR is tiny, SL stays at least this far. Default 6 ticks (1.5pt).")]
+        public int BeSafeMinTicks { get { return beSafeMinTicks; } set { beSafeMinTicks = value; } }
 
         [NinjaScriptProperty]
         [Display(Name = "Breakeven Lock Enabled", Order = 5, GroupName = "3 - Trail / SL",
