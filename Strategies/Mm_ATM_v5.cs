@@ -182,6 +182,34 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int           fastReversalMaxBars         = 4;     // only within first N bars after entry
         private double        fastReversalAdverseMinPts   = 4.0;   // hard floor: ignore tiny adverse moves
         private int           lastFastReversalBar         = -1;    // throttle so we only fire once per trade
+        // ----- Aggressive Exits Mode (manual + auto, default OFF) -----
+        // When ON: BE locks earlier, trail starts faster + tighter, pullback after peak triggers exit.
+        private bool          aggressiveExitsEnabled      = false;
+        private int           aggrBeAtPoints              = 3;     // BE locks at +3pt instead of breakevenAtPoints
+        private double        aggrTrailActivationPts      = 4.0;   // Trail activates at +4pt
+        private double        aggrTrailDistPts            = 2.0;   // Trail distance 2pt
+        private double        aggrPullbackAtrFactor       = 0.4;   // Adverse 0.4xATR after peak -> exit
+        private int           aggrPullbackMaxBars         = 2;     // Pullback exit valid within N bars after entry
+        // ----- Chop filter (default ON, applies to manual + auto) -----
+        private bool          chopFilterEnabled           = true;
+        private double        chopAdxMin                  = 18.0;  // ADX below this is considered chop
+        private int           chopAdxFallingBars          = 3;     // ADX must be falling for this many bars
+        private double        chopEmaSepMinAtr            = 0.30;  // EmaFast-EmaSlow gap < this x ATR -> no trend
+        private int           chopRangeBars               = 5;     // Last N closes range
+        private double        chopRangeMaxAtr             = 1.0;   // If close-range < this x ATR -> chop
+        private bool          chopBlockOppositeTape       = true;  // Block when tape sign opposite to entry direction
+        private double        chopOppositeTapeMin         = 0.05;  // Min |tape| to count as opposite
+        // ----- Adaptive intra-day window (default ON) -----
+        // Tracks last N trade outcomes; if losses >= threshold, tightens entries until cleared.
+        private bool          adaptiveWindowEnabled       = true;
+        private int           adaptiveWindowSize          = 5;
+        private int           adaptiveWindowLossThreshold = 3;
+        private int           adaptiveWindowClearWins     = 2;     // N consecutive wins clears tightening
+        private int           adaptiveConfBoost           = 5;     // +N min-confidence while tightened
+        private int[]         recentTradeOutcomes;                  // ring buffer: 1=win, -1=loss, 0=empty
+        private int           recentTradeIndex;
+        private bool          adaptiveTightenActive;                // true while window is in protect-mode
+        private int           adaptiveWinsSinceTighten;             // consecutive wins after tighten activated
         // ----- Time-of-day SL sizing (item: customizable) -----
         // SL = baseSlPoints × multiplier_for_current_window. Three customizable windows.
         // If multiple overlap, FIRST match wins (Open > Close > Midday in eval order).
@@ -358,6 +386,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private Button btnHoursToggle;
         private Button btnTrailToggle, btnTrapToggle;
         private Button btnBeToggle;
+        private Button btnAggrToggle, btnChopToggle, btnAdaptToggle;
         private Button btnStratPrev, btnStratNext;
         #endregion
 
@@ -434,6 +463,25 @@ namespace NinjaTrader.NinjaScript.Strategies
                     fastReversalAtrFactor       = 0.6;
                     fastReversalMaxBars         = 4;
                     fastReversalAdverseMinPts   = 4.0;
+                    aggressiveExitsEnabled      = false;
+                    aggrBeAtPoints              = 3;
+                    aggrTrailActivationPts      = 4.0;
+                    aggrTrailDistPts            = 2.0;
+                    aggrPullbackAtrFactor       = 0.4;
+                    aggrPullbackMaxBars         = 2;
+                    chopFilterEnabled           = true;
+                    chopAdxMin                  = 18.0;
+                    chopAdxFallingBars          = 3;
+                    chopEmaSepMinAtr            = 0.30;
+                    chopRangeBars               = 5;
+                    chopRangeMaxAtr             = 1.0;
+                    chopBlockOppositeTape       = true;
+                    chopOppositeTapeMin         = 0.05;
+                    adaptiveWindowEnabled       = true;
+                    adaptiveWindowSize          = 5;
+                    adaptiveWindowLossThreshold = 3;
+                    adaptiveWindowClearWins     = 2;
+                    adaptiveConfBoost           = 5;
                     timeOfDaySlSizingEnabled    = false;
                     sodOpenStart                = 93000;
                     sodOpenEnd                  = 103000;
@@ -871,7 +919,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                     ? (profitPx2 - averageEntryPrice) / tickPt2
                     : (averageEntryPrice - profitPx2) / tickPt2;
                 double atrPts2 = indAtr[0] / tickPt2;
-                double smartTrigger = Math.Max(breakevenAtPoints, Math.Max(atrPts2 * 0.5, tpPoints * 0.4));
+                int    effBeAt = aggressiveExitsEnabled ? Math.Min(breakevenAtPoints, aggrBeAtPoints) : breakevenAtPoints;
+                double smartTrigger = aggressiveExitsEnabled
+                    ? effBeAt   // AGGR: lock BE strictly at user-defined small offset, ignore ATR/TP floors
+                    : Math.Max(effBeAt, Math.Max(atrPts2 * 0.5, tpPoints * 0.4));
                 if (profitPts2 >= smartTrigger)
                 {
                     // Compute target BE-stop: entry + (2tk + extra ratchet from profit beyond trigger)
@@ -993,8 +1044,31 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (profitPts > trailMaxProfitPts) trailMaxProfitPts = profitPts;
 
             double atrPts = indAtr[0] / tickPt;
-            double dynamicActivation = Math.Max(trailActivationPoints, atrPts * 0.4);
+            double dynamicActivation = aggressiveExitsEnabled
+                ? aggrTrailActivationPts
+                : Math.Max(trailActivationPoints, atrPts * 0.4);
             bool htfAgrees = (openTradeDirection == 1 && htfBias > 0) || (openTradeDirection == -1 && htfBias < 0);
+
+            // AGGRESSIVE PULLBACK EXIT (anti-MM-trap): once we've been in profit beyond activation,
+            // any retracement >= aggrPullbackAtrFactor*ATR within aggrPullbackMaxBars of entry
+            // forces a market exit so MM stop-runs can't flip a winner into a loser.
+            if (aggressiveExitsEnabled && trailMaxProfitPts >= dynamicActivation
+                && (CurrentBar - entryBar) <= aggrPullbackMaxBars
+                && lastFastReversalBar != CurrentBar)
+            {
+                double pullback = trailMaxProfitPts - profitPts;
+                if (pullback >= aggrPullbackAtrFactor * atrPts && pullback >= 1.0)
+                {
+                    lastFastReversalBar = CurrentBar;
+                    lastExitReason = "AGGR_PULLBACK";
+                    if (enableDiagLog) WriteDiagRow("AGGR_PULLBACK_EXIT", "peak=" + trailMaxProfitPts.ToString("F1") + " cur=" + profitPts.ToString("F1") + " pb=" + pullback.ToString("F1"));
+                    Print(TAG + "AGGR PULLBACK EXIT  peak=" + trailMaxProfitPts.ToString("F1") + " cur=" + profitPts.ToString("F1"));
+                    if (openTradeDirection == 1) ExitLong();
+                    else if (openTradeDirection == -1) ExitShort();
+                    pendingExit = true;
+                    return;
+                }
+            }
 
             if (!trailActive)
             {
@@ -1022,7 +1096,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 //  - HTF-agreeing runner:    GetTrailDistance() × 1.8
                 //  - Default:                GetTrailDistance()
                 double dist;
-                if (manualTrailEarlyStart)
+                if (aggressiveExitsEnabled)
+                {
+                    dist = Math.Max(1.0, aggrTrailDistPts);
+                    trailTierName = "Aggr-Mode";
+                }
+                else if (manualTrailEarlyStart)
                 {
                     dist = Math.Max(2.0, atrPts * aggressiveTrailMaxAtrFactor);
                     trailTierName = "Aggr";
@@ -1388,6 +1467,88 @@ namespace NinjaTrader.NinjaScript.Strategies
             return High[1] > prevHigh && Close[1] <= prevHigh - 0.3 * atr;
         }
 
+        // ===========================================================
+        //  CHOP DETECTOR — protect capital in low-trend conditions
+        // ===========================================================
+        // Returns true if ANY of these are true:
+        //   1) ADX < chopAdxMin AND falling N bars in a row
+        //   2) |EmaFast - EmaSlow| < chopEmaSepMinAtr × ATR  (no separation = no trend)
+        //   3) Close range over last N bars < chopRangeMaxAtr × ATR  (visual chop)
+        //   4) Tape sign opposite to entry direction by at least chopOppositeTapeMin
+        // direction: +1=long attempt, -1=short attempt.
+        private bool IsChoppy(int direction, out string reason)
+        {
+            reason = "";
+            if (CurrentBar < Math.Max(chopRangeBars, chopAdxFallingBars) + 2 || indAtr == null || indAtr[0] <= 0) return false;
+            double atr = indAtr[0];
+            // 1) ADX collapse
+            if (indAdx != null && indAdx[0] < chopAdxMin)
+            {
+                bool falling = true;
+                for (int i = 0; i < chopAdxFallingBars; i++)
+                    if (indAdx[i] >= indAdx[i + 1]) { falling = false; break; }
+                if (falling) { reason = "ADX<" + chopAdxMin.ToString("F0") + " falling " + chopAdxFallingBars + "b (" + indAdx[0].ToString("F1") + ")"; return true; }
+            }
+            // 2) EMA convergence
+            if (indEmaFast != null && indEmaSlow != null)
+            {
+                double sep = Math.Abs(indEmaFast[0] - indEmaSlow[0]);
+                if (sep < chopEmaSepMinAtr * atr) { reason = "EMA gap " + sep.ToString("F2") + " < " + (chopEmaSepMinAtr * atr).ToString("F2"); return true; }
+            }
+            // 3) Close-range collapse
+            double hi = double.MinValue, lo = double.MaxValue;
+            for (int i = 0; i < chopRangeBars; i++)
+            { if (Close[i] > hi) hi = Close[i]; if (Close[i] < lo) lo = Close[i]; }
+            if ((hi - lo) < chopRangeMaxAtr * atr) { reason = "range " + (hi - lo).ToString("F2") + " < " + (chopRangeMaxAtr * atr).ToString("F2") + " over " + chopRangeBars + "b"; return true; }
+            // 4) Opposite tape — only when tape data is meaningful
+            if (chopBlockOppositeTape && orderFlowFilterEnabled && Math.Abs(cachedTapeDelta) >= chopOppositeTapeMin)
+            {
+                if (direction == 1 && cachedTapeDelta < -chopOppositeTapeMin) { reason = "tape against long " + cachedTapeDelta.ToString("F2"); return true; }
+                if (direction == -1 && cachedTapeDelta >  chopOppositeTapeMin) { reason = "tape against short " + cachedTapeDelta.ToString("F2"); return true; }
+            }
+            return false;
+        }
+
+        // ===========================================================
+        //  ADAPTIVE INTRA-DAY WINDOW — tighten after loss cluster
+        // ===========================================================
+        // Called from OnExecutionUpdate when a trade closes (win=true if profit > 0).
+        private void RecordTradeOutcome(bool win)
+        {
+            if (recentTradeOutcomes == null || recentTradeOutcomes.Length != adaptiveWindowSize)
+                recentTradeOutcomes = new int[Math.Max(2, adaptiveWindowSize)];
+            recentTradeOutcomes[recentTradeIndex % recentTradeOutcomes.Length] = win ? 1 : -1;
+            recentTradeIndex++;
+            // Count losses in window
+            int losses = 0, wins = 0, filled = 0;
+            for (int i = 0; i < recentTradeOutcomes.Length; i++)
+            { if (recentTradeOutcomes[i] == 0) continue; filled++; if (recentTradeOutcomes[i] < 0) losses++; else wins++; }
+            if (!adaptiveWindowEnabled) { adaptiveTightenActive = false; return; }
+            if (!adaptiveTightenActive)
+            {
+                // Activate tighten when threshold is hit
+                if (filled >= adaptiveWindowLossThreshold && losses >= adaptiveWindowLossThreshold)
+                {
+                    adaptiveTightenActive = true;
+                    adaptiveWinsSinceTighten = 0;
+                    if (enableDiagLog) WriteDiagRow("ADAPT_WINDOW_ON", "losses=" + losses + "/" + filled + " thr=" + adaptiveWindowLossThreshold);
+                    Print(TAG + "ADAPTIVE TIGHTEN active (losses=" + losses + "/" + filled + ")");
+                }
+            }
+            else
+            {
+                // Clear tighten after N consecutive wins
+                if (win) adaptiveWinsSinceTighten++; else adaptiveWinsSinceTighten = 0;
+                if (adaptiveWinsSinceTighten >= adaptiveWindowClearWins)
+                {
+                    adaptiveTightenActive = false;
+                    adaptiveWinsSinceTighten = 0;
+                    if (enableDiagLog) WriteDiagRow("ADAPT_WINDOW_OFF", "wins=" + adaptiveWindowClearWins);
+                    Print(TAG + "ADAPTIVE TIGHTEN cleared after " + adaptiveWindowClearWins + " wins");
+                }
+            }
+        }
+
 
         // ===========================================================
         //  TRAP DETECTOR + STOP-HUNT
@@ -1490,6 +1651,18 @@ namespace NinjaTrader.NinjaScript.Strategies
             // News blackout (manual + auto)
             if (newsBlackoutEnabled && IsInNewsBlackout())
             { UpdateDashboardStatus(label + " blocked: NEWS blackout ±" + newsBlackoutWindowMin + "min", Brushes.Orange); if (enableDiagLog) WriteDiagRow("BLOCK_NEWS", label); return false; }
+            // Chop filter (manual + auto): protect capital when ADX collapses, EMAs converge,
+            // close-range collapses, OR tape is fighting the entry direction.
+            if (chopFilterEnabled)
+            {
+                string chopReason;
+                if (IsChoppy(direction, out chopReason))
+                {
+                    UpdateDashboardStatus(label + " blocked: CHOP " + chopReason, Brushes.Orange);
+                    if (enableDiagLog) WriteDiagRow("BLOCK_CHOP", chopReason);
+                    return false;
+                }
+            }
             if (enteredThisBar && !allowMultiEntryPerBar) { UpdateDashboardStatus(label + " blocked: already entered this bar", Brushes.Orange); return false; }
             if (maxTradesPerDay > 0 && !isManual && dailyTradeCount >= maxTradesPerDay
                 && Position.MarketPosition == MarketPosition.Flat)
@@ -1539,6 +1712,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             int hour = ct / 10000;
             bool isMidday = hour >= 11 && hour < 14;
             double effMin = isMidday ? Math.Max(minSignalConfidence, minSignalConfidence + 5) : minSignalConfidence;
+            // Adaptive intra-day window: while tighten is active (3+ losses in last 5), require +N conf
+            if (adaptiveWindowEnabled && adaptiveTightenActive)
+            {
+                effMin += adaptiveConfBoost;
+                if (enableDiagLog && IsFirstTickOfBar) WriteDiagRow("ADAPT_TIGHTEN_ACTIVE", "effMin=" + effMin.ToString("F1"));
+            }
 
             // Volatility spike block
             double atrNow = indAtr[0];
@@ -2263,6 +2442,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 consecutiveWins = 0;
                                 lastLossDirection = last.Entry.MarketPosition == MarketPosition.Long ? 1 : -1;
                                 lastLossBarNumber = CurrentBar;
+                                RecordTradeOutcome(false);
                                 if (enableDiagLog) WriteDiagRow("EXIT_LOSS_" + reason, "pnl=" + last.ProfitCurrency.ToString("F2") + " consec=" + consecutiveLosses);
                                 // Auto-tighten on N consecutive losses
                                 if (autoTightenOnLossesEnabled && consecutiveLosses >= autoTightenLossN && baseAggressiveTrailFactor > 0)
@@ -2281,6 +2461,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 consecutiveLosses = 0;
                                 consecutiveWins++;
                                 lastLossDirection = 0;
+                                RecordTradeOutcome(true);
                                 if (enableDiagLog) WriteDiagRow("EXIT_WIN_" + reason, "pnl=" + last.ProfitCurrency.ToString("F2") + " consec=" + consecutiveWins);
                                 // Auto-widen on N consecutive wins
                                 if (autoWidenOnWinsEnabled && consecutiveWins >= autoWidenWinN && baseAggressiveTrailFactor > 0)
@@ -3086,6 +3267,32 @@ namespace NinjaTrader.NinjaScript.Strategies
                     rowToggles.Children.Add(btnBeToggle);
                     stack.Children.Add(rowToggles);
 
+                    // Bottom action row 3: AGGR / CHOP / ADAPT smart-mode toggles
+                    var rowSmart = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 2, 0, 2) };
+                    btnAggrToggle = MakeToggle(aggressiveExitsEnabled ? "AGGR ON" : "AGGR OFF", aggressiveExitsEnabled, (s, e) =>
+                    { aggressiveExitsEnabled = !aggressiveExitsEnabled;
+                      btnAggrToggle.Content = aggressiveExitsEnabled ? "AGGR ON" : "AGGR OFF";
+                      btnAggrToggle.Background = aggressiveExitsEnabled ? Brushes.DarkOrange : Brushes.DarkRed;
+                      UpdateDashboardStatus("Aggressive exits " + (aggressiveExitsEnabled ? "ON" : "OFF"), Brushes.LightGoldenrodYellow); });
+                    btnAggrToggle.ToolTip = "AGGRESSIVE Exits  BE locks at +" + aggrBeAtPoints + "pt, trail starts at +" + aggrTrailActivationPts + "pt with " + aggrTrailDistPts + "pt distance, and pullback >= " + aggrPullbackAtrFactor + "×ATR within " + aggrPullbackMaxBars + " bars after entry forces a market exit. Default OFF.";
+                    btnChopToggle = MakeToggle(chopFilterEnabled ? "CHOP ON" : "CHOP OFF", chopFilterEnabled, (s, e) =>
+                    { chopFilterEnabled = !chopFilterEnabled;
+                      btnChopToggle.Content = chopFilterEnabled ? "CHOP ON" : "CHOP OFF";
+                      btnChopToggle.Background = chopFilterEnabled ? Brushes.DarkSlateGray : Brushes.DarkRed;
+                      UpdateDashboardStatus("Chop filter " + (chopFilterEnabled ? "ON" : "OFF"), Brushes.LightGoldenrodYellow); });
+                    btnChopToggle.ToolTip = "CHOP filter  blocks BOTH manual and auto entries when ADX collapses, EMAs converge, recent close-range tightens, or tape fights the entry direction. Default ON.";
+                    btnAdaptToggle = MakeToggle(adaptiveWindowEnabled ? "ADAPT ON" : "ADAPT OFF", adaptiveWindowEnabled, (s, e) =>
+                    { adaptiveWindowEnabled = !adaptiveWindowEnabled;
+                      if (!adaptiveWindowEnabled) adaptiveTightenActive = false;
+                      btnAdaptToggle.Content = adaptiveWindowEnabled ? "ADAPT ON" : "ADAPT OFF";
+                      btnAdaptToggle.Background = adaptiveWindowEnabled ? Brushes.DarkSlateGray : Brushes.DarkRed;
+                      UpdateDashboardStatus("Adaptive window " + (adaptiveWindowEnabled ? "ON" : "OFF"), Brushes.LightGoldenrodYellow); });
+                    btnAdaptToggle.ToolTip = "ADAPTIVE intra-day window  rolling " + adaptiveWindowSize + "-trade tracker. After " + adaptiveWindowLossThreshold + " losses in window, requires +" + adaptiveConfBoost + " min-confidence; clears after " + adaptiveWindowClearWins + " wins. Default ON.";
+                    rowSmart.Children.Add(btnAggrToggle);
+                    rowSmart.Children.Add(btnChopToggle);
+                    rowSmart.Children.Add(btnAdaptToggle);
+                    stack.Children.Add(rowSmart);
+
                     dashScroller = new ScrollViewer { Content = stack, MaxHeight = dashHeight, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled };
                     outer.Children.Add(dashScroller);
 
@@ -3811,7 +4018,111 @@ namespace NinjaTrader.NinjaScript.Strategies
         [NinjaScriptProperty][Range(1, 10)]
         [Display(Name = "Suppress DCA After N Losses", Order = 2, GroupName = "11 - DCA Suppression",
             Description = "Consecutive-loss threshold above which DCA adds are blocked. Default 2.")]
-        public int SuppressDcaLossN { get { return suppressDcaLossN; } set { suppressDcaLossN = value; } }        [NinjaScriptProperty][Range(2, 50)]
+        public int SuppressDcaLossN { get { return suppressDcaLossN; } set { suppressDcaLossN = value; } }
+
+        // ===== Group 12 — Aggressive Exits Mode (manual + auto) =====
+        [NinjaScriptProperty]
+        [Display(Name = "Aggressive Exits Enabled", Order = 1, GroupName = "12 - Aggressive Exits",
+            Description = "When ON: BE locks at +AggrBeAtPoints, trail starts at +AggrTrailActivationPts with AggrTrailDistPts distance, and any pullback >= AggrPullbackAtrFactor x ATR within AggrPullbackMaxBars of entry forces a market exit. Default OFF (mirrors AGGR dashboard button).")]
+        public bool AggressiveExitsEnabled { get { return aggressiveExitsEnabled; } set { aggressiveExitsEnabled = value; } }
+
+        [NinjaScriptProperty][Range(1, 30)]
+        [Display(Name = "Aggr BE At Points", Order = 2, GroupName = "12 - Aggressive Exits",
+            Description = "While AGGR ON, lock breakeven once profit >= this many points. Default 3.")]
+        public int AggrBeAtPoints { get { return aggrBeAtPoints; } set { aggrBeAtPoints = value; } }
+
+        [NinjaScriptProperty][Range(1.0, 30.0)]
+        [Display(Name = "Aggr Trail Activation (pts)", Order = 3, GroupName = "12 - Aggressive Exits",
+            Description = "While AGGR ON, trail activates once profit >= this many points. Default 4.")]
+        public double AggrTrailActivationPts { get { return aggrTrailActivationPts; } set { aggrTrailActivationPts = value; } }
+
+        [NinjaScriptProperty][Range(0.5, 20.0)]
+        [Display(Name = "Aggr Trail Distance (pts)", Order = 4, GroupName = "12 - Aggressive Exits",
+            Description = "While AGGR ON, trail follows price by this many points. Default 2.")]
+        public double AggrTrailDistPts { get { return aggrTrailDistPts; } set { aggrTrailDistPts = value; } }
+
+        [NinjaScriptProperty][Range(0.1, 2.0)]
+        [Display(Name = "Aggr Pullback (x ATR)", Order = 5, GroupName = "12 - Aggressive Exits",
+            Description = "While AGGR ON, if profit pulls back this many x ATR from peak (within AggrPullbackMaxBars), exit at market. Default 0.4.")]
+        public double AggrPullbackAtrFactor { get { return aggrPullbackAtrFactor; } set { aggrPullbackAtrFactor = value; } }
+
+        [NinjaScriptProperty][Range(1, 30)]
+        [Display(Name = "Aggr Pullback Max Bars", Order = 6, GroupName = "12 - Aggressive Exits",
+            Description = "Pullback exit only fires within this many bars after entry. Default 2.")]
+        public int AggrPullbackMaxBars { get { return aggrPullbackMaxBars; } set { aggrPullbackMaxBars = value; } }
+
+        // ===== Group 13 — Chop Filter (manual + auto) =====
+        [NinjaScriptProperty]
+        [Display(Name = "Chop Filter Enabled", Order = 1, GroupName = "13 - Chop Filter",
+            Description = "Block ALL entries when ADX collapses, EMAs converge, close-range tightens, or tape opposes direction. Applies to manual AND auto. Default ON (mirrors CHOP dashboard button).")]
+        public bool ChopFilterEnabled { get { return chopFilterEnabled; } set { chopFilterEnabled = value; } }
+
+        [NinjaScriptProperty][Range(5.0, 40.0)]
+        [Display(Name = "Chop ADX Min", Order = 2, GroupName = "13 - Chop Filter",
+            Description = "ADX below this threshold counts as chop. Default 18.")]
+        public double ChopAdxMin { get { return chopAdxMin; } set { chopAdxMin = value; } }
+
+        [NinjaScriptProperty][Range(1, 10)]
+        [Display(Name = "Chop ADX Falling Bars", Order = 3, GroupName = "13 - Chop Filter",
+            Description = "ADX must be falling for this many consecutive bars to trigger ADX-based chop. Default 3.")]
+        public int ChopAdxFallingBars { get { return chopAdxFallingBars; } set { chopAdxFallingBars = value; } }
+
+        [NinjaScriptProperty][Range(0.05, 2.0)]
+        [Display(Name = "Chop EMA Sep Min (x ATR)", Order = 4, GroupName = "13 - Chop Filter",
+            Description = "If |EmaFast - EmaSlow| < this x ATR, no trend separation = chop. Default 0.30.")]
+        public double ChopEmaSepMinAtr { get { return chopEmaSepMinAtr; } set { chopEmaSepMinAtr = value; } }
+
+        [NinjaScriptProperty][Range(2, 30)]
+        [Display(Name = "Chop Range Bars", Order = 5, GroupName = "13 - Chop Filter",
+            Description = "How many bars to measure close-range over. Default 5.")]
+        public int ChopRangeBars { get { return chopRangeBars; } set { chopRangeBars = value; } }
+
+        [NinjaScriptProperty][Range(0.2, 5.0)]
+        [Display(Name = "Chop Range Max (x ATR)", Order = 6, GroupName = "13 - Chop Filter",
+            Description = "If close-range over ChopRangeBars < this x ATR, market is choppy. Default 1.0.")]
+        public double ChopRangeMaxAtr { get { return chopRangeMaxAtr; } set { chopRangeMaxAtr = value; } }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Chop Block Opposite Tape", Order = 7, GroupName = "13 - Chop Filter",
+            Description = "Block entry when realtime tape sign opposes the entry direction by >= ChopOppositeTapeMin. Default ON.")]
+        public bool ChopBlockOppositeTape { get { return chopBlockOppositeTape; } set { chopBlockOppositeTape = value; } }
+
+        [NinjaScriptProperty][Range(0.0, 1.0)]
+        [Display(Name = "Chop Opposite Tape Min |delta|", Order = 8, GroupName = "13 - Chop Filter",
+            Description = "Minimum |tape delta| to count as opposite-direction tape. Default 0.05.")]
+        public double ChopOppositeTapeMin { get { return chopOppositeTapeMin; } set { chopOppositeTapeMin = value; } }
+
+        // ===== Group 14 — Adaptive Intra-Day Window =====
+        [NinjaScriptProperty]
+        [Display(Name = "Adaptive Window Enabled", Order = 1, GroupName = "14 - Adaptive Window",
+            Description = "Track last N trade outcomes; if >= LossThreshold losses, require AdaptiveConfBoost more confidence until cleared by N wins. Default ON (mirrors ADAPT dashboard button).")]
+        public bool AdaptiveWindowEnabled { get { return adaptiveWindowEnabled; } set { adaptiveWindowEnabled = value; if (!value) adaptiveTightenActive = false; } }
+
+        [NinjaScriptProperty][Range(2, 20)]
+        [Display(Name = "Adaptive Window Size", Order = 2, GroupName = "14 - Adaptive Window",
+            Description = "Rolling number of trade outcomes to track. Default 5.")]
+        public int AdaptiveWindowSize
+        {
+            get { return adaptiveWindowSize; }
+            set { adaptiveWindowSize = value; recentTradeOutcomes = null; }
+        }
+
+        [NinjaScriptProperty][Range(1, 20)]
+        [Display(Name = "Adaptive Loss Threshold", Order = 3, GroupName = "14 - Adaptive Window",
+            Description = "Activate tighten mode when losses-in-window reach this count. Default 3.")]
+        public int AdaptiveWindowLossThreshold { get { return adaptiveWindowLossThreshold; } set { adaptiveWindowLossThreshold = value; } }
+
+        [NinjaScriptProperty][Range(1, 20)]
+        [Display(Name = "Adaptive Clear-Wins Required", Order = 4, GroupName = "14 - Adaptive Window",
+            Description = "How many consecutive wins clear tighten mode. Default 2.")]
+        public int AdaptiveWindowClearWins { get { return adaptiveWindowClearWins; } set { adaptiveWindowClearWins = value; } }
+
+        [NinjaScriptProperty][Range(0, 50)]
+        [Display(Name = "Adaptive Confidence Boost", Order = 5, GroupName = "14 - Adaptive Window",
+            Description = "Points added to required min-confidence while tighten is active. Default 5.")]
+        public int AdaptiveConfBoost { get { return adaptiveConfBoost; } set { adaptiveConfBoost = value; } }
+
+        [NinjaScriptProperty][Range(2, 50)]
         [Display(Name = "Breakeven At (pts)", Order = 5, GroupName = "3 - Trail / SL")]
         public int BreakevenAtPoints { get { return breakevenAtPoints; } set { breakevenAtPoints = value; } }
 

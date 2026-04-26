@@ -1048,3 +1048,71 @@ New `Action` tags introduced this revision:
 - `SWEEP_BOOST` ï¿½ sweep detected and boost active for this bar.
 
 (Existing 29-column header is unchanged; these tags use the existing `Action,Detail` slots.)
+
+---
+
+## 14.11 — Anti-MM smarts: Aggressive Exits, Chop filter, Adaptive intra-day window
+
+Three new behavioral layers driven by the 2026-03-20 chop-spiral autopsy: morning produced +`,640` of clean trend wins (09:50–10:16), then a low-ADX whipsaw chop window (10:24–11:34) gave back `-,070` in seven losing shorts where ADX had collapsed below 18 and the order-flow tape was actually buying. All three layers ship as both **NinjaScript properties** AND **dashboard toggles**.
+
+### 14.11.1 Aggressive Exits Mode  (Group `12 - Aggressive Exits`, dashboard button `AGGR`, default OFF)
+
+When ON, applies to **both manual and auto** trades:
+- **BE locks early** at `+AggrBeAtPoints` (default 3pt) — the smart-BE ATR/TP floors are bypassed in this mode.
+- **Trail starts fast** at `+AggrTrailActivationPts` (default 4pt) with distance `AggrTrailDistPts` (default 2pt). Tier name in CSV is `Aggr-Mode`.
+- **Pullback exit** — once profit = activation, if it pulls back = `AggrPullbackAtrFactor × ATR` (default 0.4) **AND** we're within `AggrPullbackMaxBars` (default 2) of entry, fire a market exit (`ExitLong/ExitShort`) tagged `AGGR_PULLBACK`. This is the anti-MM-trap defense — once they've started reversing your fast scalp, get out before the round-trip becomes a loss.
+
+Properties: `AggressiveExitsEnabled`, `AggrBeAtPoints`, `AggrTrailActivationPts`, `AggrTrailDistPts`, `AggrPullbackAtrFactor`, `AggrPullbackMaxBars`.
+
+### 14.11.2 Chop Filter  (Group `13 - Chop Filter`, dashboard button `CHOP`, default ON)
+
+Veto layer in `CanEnterTrade` — fires for **manual AND auto**. Helper `IsChoppy(direction, out reason)` returns true if ANY of:
+
+| # | Test | Default trigger |
+|---|---|---|
+| 1 | ADX-collapse | `indAdx[0] < ChopAdxMin (18)` AND ADX falling for `ChopAdxFallingBars (3)` consecutive bars |
+| 2 | EMA convergence | `|EmaFast - EmaSlow| < ChopEmaSepMinAtr × ATR (0.30 × ATR)` |
+| 3 | Close-range collapse | range of last `ChopRangeBars (5)` closes `< ChopRangeMaxAtr × ATR (1.0 × ATR)` |
+| 4 | Opposite tape | `ChopBlockOppositeTape` ON AND `|cachedTapeDelta| = ChopOppositeTapeMin (0.05)` AND sign opposes entry direction |
+
+Diag CSV row `BLOCK_CHOP` written with the trigger reason. Test #4 is what would have caught most of today's losing shorts (tape was buying while strategy was selling stop-runs).
+
+Properties: `ChopFilterEnabled`, `ChopAdxMin`, `ChopAdxFallingBars`, `ChopEmaSepMinAtr`, `ChopRangeBars`, `ChopRangeMaxAtr`, `ChopBlockOppositeTape`, `ChopOppositeTapeMin`.
+
+### 14.11.3 Adaptive Intra-Day Window  (Group `14 - Adaptive Window`, dashboard button `ADAPT`, default ON)
+
+Rolling ring buffer of last `AdaptiveWindowSize` (default 5) trade outcomes. Updated on every closed trade via `RecordTradeOutcome(win)` from `OnExecutionUpdate`.
+
+State machine:
+- **Off ? Tighten**: when losses-in-window = `AdaptiveWindowLossThreshold` (default 3). Logs `ADAPT_WINDOW_ON`.
+- While tightened: `effMin += AdaptiveConfBoost` (default +5) inside `TryAutoEntry`, requiring stronger signals before firing. The tightened state is also surfaced once per bar via the `ADAPT_TIGHTEN_ACTIVE` diag row.
+- **Tighten ? Off**: after `AdaptiveWindowClearWins` (default 2) consecutive wins. Logs `ADAPT_WINDOW_OFF`.
+
+The ring buffer auto-resizes when `AdaptiveWindowSize` is changed via the property setter (cache nulled, rebuilt on next trade).
+
+Properties: `AdaptiveWindowEnabled`, `AdaptiveWindowSize`, `AdaptiveWindowLossThreshold`, `AdaptiveWindowClearWins`, `AdaptiveConfBoost`.
+
+### 14.11.4 Dashboard
+
+Three new toggle buttons on a third action row below the existing TRL/TRP/BE row:
+- `AGGR ON/OFF` — DarkOrange when active, DarkRed when off. Tooltip shows current Aggr thresholds.
+- `CHOP ON/OFF` — DarkSlateGray when active. Tooltip describes the four chop tests.
+- `ADAPT ON/OFF` — DarkSlateGray when active. Tooltip shows window size + thresholds. Toggling OFF also clears any active tighten state.
+
+### 14.11.5 Diagnostic CSV additions
+
+New `Action` tags introduced this revision:
+- `BLOCK_CHOP` — entry blocked by chop filter (`Detail` = trigger reason).
+- `AGGR_PULLBACK_EXIT` — Aggressive Exits market exit fired (`Detail` shows peak / current / pullback in pts).
+- `ADAPT_WINDOW_ON` / `ADAPT_WINDOW_OFF` — adaptive tighten state transitions.
+- `ADAPT_TIGHTEN_ACTIVE` — heartbeat row each bar while tighten is active (shows boosted `effMin`).
+
+(Header unchanged at 29 columns — these tags use the existing `Action,Detail` slots.)
+
+### 14.11.6 Why this addresses the 2026-03-20 chop-spiral autopsy
+
+Today's seven losing shorts had every chop signature simultaneously: ADX 9–18, EMAs flat, tape positive (buyers) while strategy fired shorts at price-wick lows. The chop filter alone (test #1 + #4) would have blocked all seven. The adaptive window would have additionally raised the bar after the first 3 losses. Aggressive exits would have flipped the few trades that *did* move our way (e.g. 11:21, 11:24) from `-` trail-stop losses into small wins by exiting on the first 0.4×ATR pullback.
+
+Future work (deferred to 14.12):
+- Fib-retracement + candle-pattern reversal scalp setup (separate toggle, default OFF).
+- Per-hour outcome heat-map for self-tuning best/worst hours.
