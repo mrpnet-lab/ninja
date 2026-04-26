@@ -239,6 +239,16 @@ namespace NinjaTrader.NinjaScript.Strategies
         private System.Collections.Generic.List<DateTime> dirLossTimesShort = new System.Collections.Generic.List<DateTime>();
         private DateTime      longLockoutUntil              = DateTime.MinValue;
         private DateTime      shortLockoutUntil             = DateTime.MinValue;
+        // ----- Extension filter (don't chase late entries far from VWAP) -----
+        // Empirically on 2026-03-20: every losing entry was at |close-vwap|/ATR > 6.0; the only big
+        // winner (+$1,125) was taken at -4.5×ATR — the breakout, not the chase. After ~5×ATR
+        // extension, MM has plenty of room to ramp price for a stop-run before the trend resumes,
+        // and our 18pt SL is too tight to absorb that bounce. This filter blocks entries when price
+        // is already over-extended from VWAP relative to current ATR, allowing the strategy to wait
+        // for either a pullback or fresh consolidation — not chase the move.
+        private bool          extensionFilterEnabled        = true;
+        private double        extensionMaxAtrFromVwap       = 5.0;   // block entry if |close-vwap| > N × ATR
+        private double        extensionMinAtrPoints         = 8.0;   // only enforce when ATR >= this (avoids over-blocking quiet sessions)
         // ----- Chop filter (default ON, applies to manual + auto) -----
         private bool          chopFilterEnabled           = true;
         private double        chopAdxMin                  = 18.0;  // ADX below this is considered chop
@@ -539,6 +549,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                     if (dirLossTimesShort != null) dirLossTimesShort.Clear();
                     longLockoutUntil  = DateTime.MinValue;
                     shortLockoutUntil = DateTime.MinValue;
+                    extensionFilterEnabled        = true;
+                    extensionMaxAtrFromVwap       = 5.0;
+                    extensionMinAtrPoints         = 8.0;
                     chopFilterEnabled           = true;
                     chopAdxMin                  = 18.0;
                     chopAdxFallingBars          = 3;
@@ -1839,6 +1852,25 @@ namespace NinjaTrader.NinjaScript.Strategies
                     UpdateDashboardStatus(label + " blocked: DIR LOCKOUT " + remainMin + "m", Brushes.OrangeRed);
                     if (enableDiagLog) WriteDiagRow("BLOCK_DIR_LOCKOUT", "dir=" + direction + " remain_min=" + remainMin);
                     return false;
+                }
+            }
+            // Extension filter: block late chases. When price is over-extended from VWAP relative
+            // to ATR, the move has likely already moved enough that MM stop-runs become high-probability.
+            // Only enforced when ATR is meaningful (>= extensionMinAtrPoints) so we don't over-block in
+            // quiet midday sessions where 5×ATR is a normal distance.
+            if (extensionFilterEnabled && vwapValue > 0 && indAtr != null && indAtr.IsValidDataPoint(0))
+            {
+                double atrNow = indAtr[0];
+                if (atrNow >= extensionMinAtrPoints)
+                {
+                    double dist = Math.Abs(Close[0] - vwapValue);
+                    double ratio = dist / atrNow;
+                    if (ratio > extensionMaxAtrFromVwap)
+                    {
+                        UpdateDashboardStatus(label + " blocked: EXTENSION " + ratio.ToString("F1") + "xATR", Brushes.Orange);
+                        if (enableDiagLog) WriteDiagRow("BLOCK_EXTENSION", "dir=" + direction + " dist=" + dist.ToString("F1") + " atr=" + atrNow.ToString("F1") + " ratio=" + ratio.ToString("F2") + " max=" + extensionMaxAtrFromVwap.ToString("F2"));
+                        return false;
+                    }
                 }
             }
             if (enteredThisBar && !allowMultiEntryPerBar) { UpdateDashboardStatus(label + " blocked: already entered this bar", Brushes.Orange); return false; }
@@ -4425,6 +4457,22 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "Dir Lockout Cooldown (min)", Order = 4, GroupName = "17 - Directional Lockout",
             Description = "Block this direction for this many minutes after the lockout fires. Default 30.")]
         public int DirLockoutCooldownMin { get { return dirLockoutCooldownMin; } set { dirLockoutCooldownMin = value; } }
+
+        // ===== Group 18 — Extension Filter (don't chase late entries) =====
+        [NinjaScriptProperty]
+        [Display(Name = "Extension Filter Enabled", Order = 1, GroupName = "18 - Extension Filter",
+            Description = "Block new entries when price is already over-extended from VWAP relative to ATR. Empirically the best entries on trend days are taken at 2-5×ATR from VWAP (the breakout); entries at >5×ATR are late chases that the MM stop-runs before the trend resumes. Default ON.")]
+        public bool ExtensionFilterEnabled { get { return extensionFilterEnabled; } set { extensionFilterEnabled = value; } }
+
+        [NinjaScriptProperty][Range(2.0, 15.0)]
+        [Display(Name = "Extension Max (xATR from VWAP)", Order = 2, GroupName = "18 - Extension Filter",
+            Description = "Block entry when |close - VWAP| / ATR exceeds this ratio. Lower = more conservative (skips more late chases but may also skip strong trend continuations). Default 5.0.")]
+        public double ExtensionMaxAtrFromVwap { get { return extensionMaxAtrFromVwap; } set { extensionMaxAtrFromVwap = value; } }
+
+        [NinjaScriptProperty][Range(1.0, 50.0)]
+        [Display(Name = "Extension Min ATR (pts)", Order = 3, GroupName = "18 - Extension Filter",
+            Description = "Only enforce extension filter when ATR is at least this many points. Avoids over-blocking quiet midday sessions where 5×ATR is a normal price distance from VWAP. Default 8.0.")]
+        public double ExtensionMinAtrPoints { get { return extensionMinAtrPoints; } set { extensionMinAtrPoints = value; } }
 
         [NinjaScriptProperty][Range(2, 50)]
         [Display(Name = "Breakeven At (pts)", Order = 5, GroupName = "3 - Trail / SL")]
