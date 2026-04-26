@@ -199,6 +199,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double        chopRangeMaxAtr             = 1.0;   // If close-range < this x ATR -> chop
         private bool          chopBlockOppositeTape       = true;  // Block when tape sign opposite to entry direction
         private double        chopOppositeTapeMin         = 0.05;  // Min |tape| to count as opposite
+        private double        chopTrendAdxGate            = 22.0;  // If ADX >= this, skip EMA-gap & range tests (consolidation in trend)
         // ----- Adaptive intra-day window (default ON) -----
         // Tracks last N trade outcomes; if losses >= threshold, tightens entries until cleared.
         private bool          adaptiveWindowEnabled       = true;
@@ -477,6 +478,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     chopRangeMaxAtr             = 1.0;
                     chopBlockOppositeTape       = true;
                     chopOppositeTapeMin         = 0.05;
+                    chopTrendAdxGate            = 22.0;
                     adaptiveWindowEnabled       = true;
                     adaptiveWindowSize          = 5;
                     adaptiveWindowLossThreshold = 3;
@@ -1472,8 +1474,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         // ===========================================================
         // Returns true if ANY of these are true:
         //   1) ADX < chopAdxMin AND falling N bars in a row
-        //   2) |EmaFast - EmaSlow| < chopEmaSepMinAtr × ATR  (no separation = no trend)
-        //   3) Close range over last N bars < chopRangeMaxAtr × ATR  (visual chop)
+        //   2) |EmaFast - EmaSlow| < chopEmaSepMinAtr × ATR  (no separation = no trend)  [GATED: skipped when ADX >= chopTrendAdxGate]
+        //   3) Close range over last N bars < chopRangeMaxAtr × ATR  (visual chop)         [GATED: skipped when ADX >= chopTrendAdxGate]
         //   4) Tape sign opposite to entry direction by at least chopOppositeTapeMin
         // direction: +1=long attempt, -1=short attempt.
         private bool IsChoppy(int direction, out string reason)
@@ -1489,17 +1491,23 @@ namespace NinjaTrader.NinjaScript.Strategies
                     if (indAdx[i] >= indAdx[i + 1]) { falling = false; break; }
                 if (falling) { reason = "ADX<" + chopAdxMin.ToString("F0") + " falling " + chopAdxFallingBars + "b (" + indAdx[0].ToString("F1") + ")"; return true; }
             }
-            // 2) EMA convergence
-            if (indEmaFast != null && indEmaSlow != null)
+            // ADX trend gate: when ADX is strong, EMAs riding close together and small close-ranges are
+            // consolidations inside a trend — NOT chop. Skip tests #2 and #3 in that regime.
+            bool trendStrong = (indAdx != null && indAdx[0] >= chopTrendAdxGate);
+            // 2) EMA convergence (skipped in strong trend)
+            if (!trendStrong && indEmaFast != null && indEmaSlow != null)
             {
                 double sep = Math.Abs(indEmaFast[0] - indEmaSlow[0]);
-                if (sep < chopEmaSepMinAtr * atr) { reason = "EMA gap " + sep.ToString("F2") + " < " + (chopEmaSepMinAtr * atr).ToString("F2"); return true; }
+                if (sep < chopEmaSepMinAtr * atr) { reason = "EMA gap " + sep.ToString("F2") + " < " + (chopEmaSepMinAtr * atr).ToString("F2") + " (ADX " + (indAdx != null ? indAdx[0].ToString("F1") : "?") + ")"; return true; }
             }
-            // 3) Close-range collapse
-            double hi = double.MinValue, lo = double.MaxValue;
-            for (int i = 0; i < chopRangeBars; i++)
-            { if (Close[i] > hi) hi = Close[i]; if (Close[i] < lo) lo = Close[i]; }
-            if ((hi - lo) < chopRangeMaxAtr * atr) { reason = "range " + (hi - lo).ToString("F2") + " < " + (chopRangeMaxAtr * atr).ToString("F2") + " over " + chopRangeBars + "b"; return true; }
+            // 3) Close-range collapse (skipped in strong trend)
+            if (!trendStrong)
+            {
+                double hi = double.MinValue, lo = double.MaxValue;
+                for (int i = 0; i < chopRangeBars; i++)
+                { if (Close[i] > hi) hi = Close[i]; if (Close[i] < lo) lo = Close[i]; }
+                if ((hi - lo) < chopRangeMaxAtr * atr) { reason = "range " + (hi - lo).ToString("F2") + " < " + (chopRangeMaxAtr * atr).ToString("F2") + " over " + chopRangeBars + "b (ADX " + (indAdx != null ? indAdx[0].ToString("F1") : "?") + ")"; return true; }
+            }
             // 4) Opposite tape — only when tape data is meaningful
             if (chopBlockOppositeTape && orderFlowFilterEnabled && Math.Abs(cachedTapeDelta) >= chopOppositeTapeMin)
             {
@@ -4091,6 +4099,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "Chop Opposite Tape Min |delta|", Order = 8, GroupName = "13 - Chop Filter",
             Description = "Minimum |tape delta| to count as opposite-direction tape. Default 0.05.")]
         public double ChopOppositeTapeMin { get { return chopOppositeTapeMin; } set { chopOppositeTapeMin = value; } }
+
+        [NinjaScriptProperty][Range(10.0, 60.0)]
+        [Display(Name = "Chop Trend ADX Gate", Order = 9, GroupName = "13 - Chop Filter",
+            Description = "When ADX >= this value, the EMA-gap and close-range chop tests are SKIPPED (treats tight EMAs / small ranges as consolidation inside a trend, not chop). The ADX-collapse and opposite-tape tests still apply. Default 22 — set higher (e.g. 30) to be more cautious in weak trends, lower (e.g. 18) to allow more entries.")]
+        public double ChopTrendAdxGate { get { return chopTrendAdxGate; } set { chopTrendAdxGate = value; } }
 
         // ===== Group 14 — Adaptive Intra-Day Window =====
         [NinjaScriptProperty]
