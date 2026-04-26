@@ -185,7 +185,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         // ----- Time-of-day SL sizing (item: customizable) -----
         // SL = baseSlPoints × multiplier_for_current_window. Three customizable windows.
         // If multiple overlap, FIRST match wins (Open > Close > Midday in eval order).
-        private bool          timeOfDaySlSizingEnabled    = true;
+        private bool          timeOfDaySlSizingEnabled    = false;
         private int           sodOpenStart                = 93000;
         private int           sodOpenEnd                  = 103000;
         private double        sodOpenSlMult               = 1.30;   // wider on the open (volatile)
@@ -434,7 +434,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     fastReversalAtrFactor       = 0.6;
                     fastReversalMaxBars         = 4;
                     fastReversalAdverseMinPts   = 4.0;
-                    timeOfDaySlSizingEnabled    = true;
+                    timeOfDaySlSizingEnabled    = false;
                     sodOpenStart                = 93000;
                     sodOpenEnd                  = 103000;
                     sodOpenSlMult               = 1.30;
@@ -3724,7 +3724,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         // ===== Group 8 — Time-of-day SL sizing (customizable windows) =====
         [NinjaScriptProperty]
         [Display(Name = "Enable Time-of-Day SL Sizing", Order = 1, GroupName = "8 - Time-of-Day SL",
-            Description = "Multiply base SL by per-window factor. Open/Close = wider, Midday = tighter. Default ON.")]
+            Description = "Multiply base SL by per-window factor. Open/Close = wider, Midday = tighter. Default OFF (uses base SL).")]
         public bool TimeOfDaySlSizingEnabled { get { return timeOfDaySlSizingEnabled; } set { timeOfDaySlSizingEnabled = value; } }
 
         [NinjaScriptProperty][Range(0, 235959)]
