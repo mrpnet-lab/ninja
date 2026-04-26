@@ -184,7 +184,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int           lastFastReversalBar         = -1;    // throttle so we only fire once per trade
         // ----- Aggressive Exits Mode (manual + auto, default OFF) -----
         // When ON: BE locks earlier, trail starts faster + tighter, pullback after peak triggers exit.
-        private bool          aggressiveExitsEnabled      = false;
+        private bool          aggressiveExitsEnabled      = true;
         private int           aggrBeAtPoints              = 3;     // BE locks at +3pt instead of breakevenAtPoints
         private double        aggrTrailActivationPts      = 4.0;   // Trail activates at +4pt
         private double        aggrTrailDistPts            = 2.0;   // Trail distance 2pt
@@ -479,7 +479,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     fastReversalAtrFactor       = 0.6;
                     fastReversalMaxBars         = 4;
                     fastReversalAdverseMinPts   = 4.0;
-                    aggressiveExitsEnabled      = false;
+                    aggressiveExitsEnabled      = true;
                     aggrBeAtPoints              = 3;
                     aggrTrailActivationPts      = 4.0;
                     aggrTrailDistPts            = 2.0;
@@ -3368,7 +3368,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                       btnAggrToggle.Content = aggressiveExitsEnabled ? "AGGR ON" : "AGGR OFF";
                       btnAggrToggle.Background = aggressiveExitsEnabled ? Brushes.DarkOrange : Brushes.DarkRed;
                       UpdateDashboardStatus("Aggressive exits " + (aggressiveExitsEnabled ? "ON" : "OFF"), Brushes.LightGoldenrodYellow); });
-                    btnAggrToggle.ToolTip = "AGGRESSIVE Exits  BE locks at +" + aggrBeAtPoints + "pt, trail starts at +" + aggrTrailActivationPts + "pt with " + aggrTrailDistPts + "pt distance, and pullback >= " + aggrPullbackAtrFactor + "×ATR within " + aggrPullbackMaxBars + " bars after entry forces a market exit. Default OFF.";
+                    btnAggrToggle.ToolTip = "AGGRESSIVE Exits  BE locks at +" + aggrBeAtPoints + "pt, trail starts at +" + aggrTrailActivationPts + "pt with " + aggrTrailDistPts + "pt distance, and pullback >= " + aggrPullbackAtrFactor + "×ATR within " + aggrPullbackMaxBars + " bars after entry forces a market exit. Default ON.";
                     btnChopToggle = MakeToggle(chopFilterEnabled ? "CHOP ON" : "CHOP OFF", chopFilterEnabled, (s, e) =>
                     { chopFilterEnabled = !chopFilterEnabled;
                       btnChopToggle.Content = chopFilterEnabled ? "CHOP ON" : "CHOP OFF";
@@ -4117,7 +4117,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         // ===== Group 12 — Aggressive Exits Mode (manual + auto) =====
         [NinjaScriptProperty]
         [Display(Name = "Aggressive Exits Enabled", Order = 1, GroupName = "12 - Aggressive Exits",
-            Description = "When ON: BE locks at +AggrBeAtPoints, trail starts at +AggrTrailActivationPts with AggrTrailDistPts distance, and any pullback >= AggrPullbackAtrFactor x ATR within AggrPullbackMaxBars of entry forces a market exit. Default OFF (mirrors AGGR dashboard button).")]
+            Description = "When ON: BE locks at +AggrBeAtPoints, trail starts at +AggrTrailActivationPts with AggrTrailDistPts distance, and any pullback >= AggrPullbackAtrFactor x ATR within AggrPullbackMaxBars of entry forces a market exit. Default ON (mirrors AGGR dashboard button).")]
         public bool AggressiveExitsEnabled { get { return aggressiveExitsEnabled; } set { aggressiveExitsEnabled = value; } }
 
         [NinjaScriptProperty][Range(1, 30)]
