@@ -224,6 +224,21 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int           postWinSameDirCooldownMin     = 5;     // minutes to block same-direction re-entry after a win
         private DateTime      lastWinExitTime               = DateTime.MinValue;
         private int           lastWinExitDirection          = 0;     // +1=long win, -1=short win
+        // ----- Directional lockout (per-direction loss-streak block) -----
+        // After N losing SL/AGGR_ADVERSE exits in the SAME direction within a sliding window, lock
+        // that direction for L minutes. Defends the pattern seen on 2026-03-20 PM where the strategy
+        // kept short-entering at fresh local lows (3 consecutive SL losses 10:05/10:29/10:56) — each
+        // entry was caught by a stop-running up-wick before the trend resumed. SL_CLUSTER is direction
+        // agnostic and fires too late; this layer surgically blocks repeat losers in one direction
+        // while still allowing the OPPOSITE direction (so a true reversal can be taken).
+        private bool          dirLockoutEnabled             = true;
+        private int           dirLockoutLossN               = 2;     // number of same-direction SL/ADVERSE losses to trigger
+        private int           dirLockoutWindowMin           = 30;    // sliding window in minutes
+        private int           dirLockoutCooldownMin         = 30;    // block that direction for this many minutes
+        private System.Collections.Generic.List<DateTime> dirLossTimesLong = new System.Collections.Generic.List<DateTime>();
+        private System.Collections.Generic.List<DateTime> dirLossTimesShort = new System.Collections.Generic.List<DateTime>();
+        private DateTime      longLockoutUntil              = DateTime.MinValue;
+        private DateTime      shortLockoutUntil             = DateTime.MinValue;
         // ----- Chop filter (default ON, applies to manual + auto) -----
         private bool          chopFilterEnabled           = true;
         private double        chopAdxMin                  = 18.0;  // ADX below this is considered chop
@@ -516,6 +531,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                     slClusterCooldownMin        = 25;
                     postWinSameDirCooldownEnabled = true;
                     postWinSameDirCooldownMin     = 5;
+                    dirLockoutEnabled             = true;
+                    dirLockoutLossN               = 2;
+                    dirLockoutWindowMin           = 30;
+                    dirLockoutCooldownMin         = 30;
+                    if (dirLossTimesLong != null)  dirLossTimesLong.Clear();
+                    if (dirLossTimesShort != null) dirLossTimesShort.Clear();
+                    longLockoutUntil  = DateTime.MinValue;
+                    shortLockoutUntil = DateTime.MinValue;
                     chopFilterEnabled           = true;
                     chopAdxMin                  = 18.0;
                     chopAdxFallingBars          = 3;
@@ -1804,6 +1827,20 @@ namespace NinjaTrader.NinjaScript.Strategies
                     return false;
                 }
             }
+            // Directional lockout: block this direction if it has been losing repeatedly. Opposite
+            // direction is still allowed (so a real reversal can be taken). Surgical fix for the
+            // pattern of 3 consecutive same-direction SL losses chasing fresh local extremes.
+            if (dirLockoutEnabled)
+            {
+                DateTime lockoutEnd = direction == 1 ? longLockoutUntil : (direction == -1 ? shortLockoutUntil : DateTime.MinValue);
+                if (Time[0] < lockoutEnd)
+                {
+                    int remainMin = (int)Math.Ceiling((lockoutEnd - Time[0]).TotalMinutes);
+                    UpdateDashboardStatus(label + " blocked: DIR LOCKOUT " + remainMin + "m", Brushes.OrangeRed);
+                    if (enableDiagLog) WriteDiagRow("BLOCK_DIR_LOCKOUT", "dir=" + direction + " remain_min=" + remainMin);
+                    return false;
+                }
+            }
             if (enteredThisBar && !allowMultiEntryPerBar) { UpdateDashboardStatus(label + " blocked: already entered this bar", Brushes.Orange); return false; }
             if (maxTradesPerDay > 0 && !isManual && dailyTradeCount >= maxTradesPerDay
                 && Position.MarketPosition == MarketPosition.Flat)
@@ -2602,6 +2639,21 @@ namespace NinjaTrader.NinjaScript.Strategies
                                         slClusterCooldownUntil = Time[0].AddMinutes(slClusterCooldownMin);
                                         if (enableDiagLog) WriteDiagRow("SL_CLUSTER_COOLDOWN", "count=" + slClusterCount + " window=" + slClusterWindowMin + "m cooldown=" + slClusterCooldownMin + "m until=" + slClusterCooldownUntil.ToString("HH:mm"));
                                         Print(TAG + "SL CLUSTER -> cooldown until " + slClusterCooldownUntil.ToString("HH:mm"));
+                                    }
+                                }
+                                // Directional lockout tracker: per-direction loss list, prune to window, trigger lockout if N+ losses.
+                                if (dirLockoutEnabled && (reason == "SL" || reason == "AGGR_ADVERSE") && lastLossDirection != 0)
+                                {
+                                    var list = lastLossDirection == 1 ? dirLossTimesLong : dirLossTimesShort;
+                                    list.Add(Time[0]);
+                                    DateTime cutoff = Time[0].AddMinutes(-dirLockoutWindowMin);
+                                    list.RemoveAll(d => d < cutoff);
+                                    if (list.Count >= dirLockoutLossN)
+                                    {
+                                        DateTime until = Time[0].AddMinutes(dirLockoutCooldownMin);
+                                        if (lastLossDirection == 1) longLockoutUntil = until; else shortLockoutUntil = until;
+                                        if (enableDiagLog) WriteDiagRow("DIR_LOCKOUT_TRIGGER", "dir=" + lastLossDirection + " losses=" + list.Count + " window=" + dirLockoutWindowMin + "m lockout=" + dirLockoutCooldownMin + "m until=" + until.ToString("HH:mm"));
+                                        Print(TAG + "DIR LOCKOUT -> dir=" + lastLossDirection + " until " + until.ToString("HH:mm"));
                                     }
                                 }
                                 if (enableDiagLog) WriteDiagRow("EXIT_LOSS_" + reason, "pnl=" + last.ProfitCurrency.ToString("F2") + " consec=" + consecutiveLosses);
@@ -4352,6 +4404,27 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "Post-Win Cooldown (min)", Order = 2, GroupName = "16 - Post-Win Cooldown",
             Description = "Minutes to block same-direction re-entry after a winning exit. Default 5.")]
         public int PostWinSameDirCooldownMin { get { return postWinSameDirCooldownMin; } set { postWinSameDirCooldownMin = value; } }
+
+        // ===== Group 17 — Directional Lockout (per-direction loss-streak block) =====
+        [NinjaScriptProperty]
+        [Display(Name = "Directional Lockout Enabled", Order = 1, GroupName = "17 - Directional Lockout",
+            Description = "After N losing SL/AGGR_ADVERSE exits in the SAME direction within DirLockoutWindowMin minutes, block that direction for DirLockoutCooldownMin minutes. Opposite direction stays allowed (so a true reversal can be taken). Surgical defense against the MM pattern of stop-running repeated continuation entries chasing fresh local extremes. Default ON.")]
+        public bool DirLockoutEnabled { get { return dirLockoutEnabled; } set { dirLockoutEnabled = value; } }
+
+        [NinjaScriptProperty][Range(2, 10)]
+        [Display(Name = "Dir Lockout Loss N", Order = 2, GroupName = "17 - Directional Lockout",
+            Description = "Number of same-direction SL/AGGR_ADVERSE losses within window that triggers lockout. Default 2.")]
+        public int DirLockoutLossN { get { return dirLockoutLossN; } set { dirLockoutLossN = value; } }
+
+        [NinjaScriptProperty][Range(5, 240)]
+        [Display(Name = "Dir Lockout Window (min)", Order = 3, GroupName = "17 - Directional Lockout",
+            Description = "Sliding window in minutes used to count same-direction losses. Default 30.")]
+        public int DirLockoutWindowMin { get { return dirLockoutWindowMin; } set { dirLockoutWindowMin = value; } }
+
+        [NinjaScriptProperty][Range(5, 240)]
+        [Display(Name = "Dir Lockout Cooldown (min)", Order = 4, GroupName = "17 - Directional Lockout",
+            Description = "Block this direction for this many minutes after the lockout fires. Default 30.")]
+        public int DirLockoutCooldownMin { get { return dirLockoutCooldownMin; } set { dirLockoutCooldownMin = value; } }
 
         [NinjaScriptProperty][Range(2, 50)]
         [Display(Name = "Breakeven At (pts)", Order = 5, GroupName = "3 - Trail / SL")]
