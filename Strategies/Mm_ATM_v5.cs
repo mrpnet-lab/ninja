@@ -95,6 +95,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         // ===========================================================
         #region Session state
         private DateTime sessionDate;
+        private DateTime lastFuturesSessionResetDate;  // tracks the 18:00 ET futures session boundary
         private double   dailyRealizedPnL;
         private int      dailyTradeCount;
         private int      processedTradeCount;
@@ -173,6 +174,14 @@ namespace NinjaTrader.NinjaScript.Strategies
         private string        lastExitReason              = "UNKNOWN";
         // ----- Reset-daily-on-restart -----
         private bool          resetDailyOnRestart         = true;
+        // ----- Fast reversal exit (item 4: smarter than MM/algo sweep) -----
+        // Within first N bars after entry, if adverse move > factor×ATR AND tape/EMA confirm
+        // the reversal, exit at market BEFORE hidden SL would trigger — cuts loss in half.
+        private bool          fastReversalExitEnabled     = true;
+        private double        fastReversalAtrFactor       = 0.6;   // adverse > 0.6×ATR triggers consideration
+        private int           fastReversalMaxBars         = 4;     // only within first N bars after entry
+        private double        fastReversalAdverseMinPts   = 4.0;   // hard floor: ignore tiny adverse moves
+        private int           lastFastReversalBar         = -1;    // throttle so we only fire once per trade
         private volatile bool pendingPositionFlat;
         private volatile bool pendingExit;
         private int  pendingExitTicks;
@@ -359,7 +368,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     tpPoints              = 50;
                     maxDailyLossDollars   = 1000;
                     maxDailyProfitDollars = 1000;
-                    maxTradesPerDay       = 4;
+                    maxTradesPerDay       = 20;
                     contracts             = 1;
                     maxContracts          = 4;
 
@@ -392,11 +401,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                     skipPrevDayClampOnHighAdx   = true;
                     highAdxThreshold            = 28.0;
                     resetDailyOnRestart         = true;
+                    fastReversalExitEnabled     = true;
+                    fastReversalAtrFactor       = 0.6;
+                    fastReversalMaxBars         = 4;
+                    fastReversalAdverseMinPts   = 4.0;
 
                     // SmartSL / JumpSL
                     breakevenAtPoints     = 8;
-                    beSafeAtrFactor       = 0.35;
-                    beSafeMinTicks        = 6;
+                    beSafeAtrFactor       = 0.20;   // was 0.35 — less restrictive so BE actually fires on small profitable trades
+                    beSafeMinTicks        = 4;      // was 6 (1pt floor instead of 1.5pt)
                     breakevenEnabled      = true;
                     allowMultiEntryPerBar = true;     // default ALLOW
                     jumpSlPercent         = 50;
@@ -545,9 +558,16 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     firstBarSeen = true;
                     sessionDate  = Time[0].Date;
+                    lastFuturesSessionResetDate = Time[0].Date;
                     Print(TAG + "OnBarUpdate ALIVE first bar @ " + Time[0]);
                 }
                 if (IsFirstTickOfBar) enteredThisBar = false;
+
+                // -------- New futures session rollover (~18:00 ET) --------
+                // CME futures (NQ/ES/etc) session starts 18:00 ET on the prior calendar day.
+                // If we cross 18:00 on a NEW calendar date AND we have not yet reset for it,
+                // wipe daily-counter state so manual / auto trading is not blocked by yesterday's flags.
+                MaybeFuturesSessionRollover();
 
                 // -------- DiagLog daily file --------
                 if (enableDiagLog && IsFirstTickOfBar)
@@ -594,8 +614,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (Position.MarketPosition != MarketPosition.Flat && stopsArmed && !pendingExit)
                 {
                     MonitorHiddenStops();
-                    if (trailEnabled) MonitorAdaptiveTrail();
+                    if (trailEnabled || trailActive || manualTrailEarlyStart) MonitorAdaptiveTrail();
                     if (IsFirstTickOfBar && enableTrapDetector) MonitorTrapDetector();
+                    if (fastReversalExitEnabled && IsFirstTickOfBar) MonitorFastReversalExit();
                     LiveDailyPnLCheck();
                 }
 
@@ -757,18 +778,18 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (live <= -maxDailyLossDollars)
             {
                 dailyLimitHit = true;
-                Print(TAG + "LIVE LOSS LIMIT " + live.ToString("C0") + " — closing trade, NOT killing strategy. Disable+Enable to resume.");
+                Print(TAG + "LIVE LOSS LIMIT " + live.ToString("C0") + " — closing position. Strategy stays ENABLED. Press RESET or wait for 18:00 ET session rollover to resume.");
                 lastExitReason = "DAILY_LOSS";
                 ExecuteFlatten();
-                UpdateDashboardStatus("⛔ DAILY LOSS LIMIT " + live.ToString("C0") + " — trade closed. Disable+Enable to resume.", Brushes.Red);
+                UpdateDashboardStatus("⛔ DAILY LOSS LIMIT " + live.ToString("C0") + " — position closed. Strategy STILL ENABLED. Press RESET to resume.", Brushes.Red);
             }
             else if (live >= maxDailyProfitDollars)
             {
                 dailyProfitHit = true;
-                Print(TAG + "LIVE PROFIT TARGET " + live.ToString("C0") + " — closing trade, NOT killing strategy. Disable+Enable to resume.");
+                Print(TAG + "LIVE PROFIT TARGET " + live.ToString("C0") + " — closing position. Strategy stays ENABLED. Press RESET or wait for 18:00 ET session rollover to resume.");
                 lastExitReason = "DAILY_PROFIT";
                 ExecuteFlatten();
-                UpdateDashboardStatus("💰 DAILY PROFIT TARGET " + live.ToString("C0") + " — trade closed. Disable+Enable to resume.", Brushes.Gold);
+                UpdateDashboardStatus("💰 DAILY PROFIT TARGET " + live.ToString("C0") + " — position closed. Strategy STILL ENABLED. Press RESET to resume.", Brushes.Gold);
             }
         }
         #endregion
@@ -828,14 +849,23 @@ namespace NinjaTrader.NinjaScript.Strategies
                     {
                         double maxAllowed = profitPx2 - safeBufPx;
                         if (targetBe > maxAllowed) targetBe = Math.Round(maxAllowed / TickSize) * TickSize;
-                        // Skip if safety capped the SL below profitable BE \u2014 wait for more room.
-                        if (targetBe < averageEntryPrice + TickSize) goto SkipBe;
+                        // FALLBACK: if buffer pushed SL below entry+1tk, lock at entry+1tk anyway
+                        // (true risk-free BE — better than leaving full SL exposed).
+                        if (targetBe < averageEntryPrice + TickSize) targetBe = averageEntryPrice + TickSize;
+                        // But never above maxAllowed (so MM can't tag it 1tk past)
+                        if (targetBe > maxAllowed && maxAllowed > averageEntryPrice) targetBe = Math.Round(maxAllowed / TickSize) * TickSize;
+                        // Final guard: if even entry+1tk is closer than 1 tick to price, defer.
+                        if (targetBe >= profitPx2 - TickSize)
+                        { if (enableDiagLog) WriteDiagRow("BE_DEFER", "too-close px=" + profitPx2.ToString("F2") + " target=" + targetBe.ToString("F2")); goto SkipBe; }
                     }
                     else
                     {
                         double minAllowed = profitPx2 + safeBufPx;
                         if (targetBe < minAllowed) targetBe = Math.Round(minAllowed / TickSize) * TickSize;
-                        if (targetBe > averageEntryPrice - TickSize) goto SkipBe;
+                        if (targetBe > averageEntryPrice - TickSize) targetBe = averageEntryPrice - TickSize;
+                        if (targetBe < minAllowed && minAllowed < averageEntryPrice) targetBe = Math.Round(minAllowed / TickSize) * TickSize;
+                        if (targetBe <= profitPx2 + TickSize)
+                        { if (enableDiagLog) WriteDiagRow("BE_DEFER", "too-close px=" + profitPx2.ToString("F2") + " target=" + targetBe.ToString("F2")); goto SkipBe; }
                     }
                     // Ratchet only — never weaken SL
                     bool moved = false;
@@ -899,7 +929,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         #region Adaptive Trail
         private void MonitorAdaptiveTrail()
         {
-            if (!trailEnabled || averageEntryPrice <= 0) return;
+            // Allow execution when master toggle is off ONLY if user explicitly armed via TRL NOW
+            // (manualTrailEarlyStart) or trail was already active before toggle was flipped.
+            if (averageEntryPrice <= 0) return;
+            if (!trailEnabled && !trailActive && !manualTrailEarlyStart) return;
             double price = Close[0];
             if (State == State.Realtime)
             {
@@ -918,7 +951,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             if (!trailActive)
             {
-                if ((CurrentBar - entryBar) < 2)
+                // Bar-guard: skip first 2 bars after entry to avoid noise — BYPASSED if user pressed TRL NOW.
+                if (!manualTrailEarlyStart && (CurrentBar - entryBar) < 2)
                 {
                     if (enableDiagLog && (DateTime.Now - lastTrailDiagTime).TotalSeconds >= 5)
                     { lastTrailDiagTime = DateTime.Now; Print(TAG + "TRAIL diag: waiting bar-guard barsSinceEntry=" + (CurrentBar - entryBar)); }
@@ -1144,6 +1178,94 @@ namespace NinjaTrader.NinjaScript.Strategies
             return Math.Max(3, Math.Min(40, dist));
         }
         #endregion
+
+        // ===========================================================
+        //  FAST REVERSAL EXIT (item 4 — beat MM/algo sweeps)
+        // ===========================================================
+        // Logic: within first N bars after entry, if adverse move > factor×ATR
+        //   AND (EMA flipped against us OR strong opposite tape OR high-vol adverse bar)
+        //   AND we are NOT already in profit (trail/BE will handle that),
+        // then ExitLong/ExitShort immediately. Cuts the loss roughly in half vs waiting for hidden SL.
+        // Fires at most ONCE per trade (lastFastReversalBar guards re-fire).
+        private void MonitorFastReversalExit()
+        {
+            if (averageEntryPrice <= 0 || openTradeDirection == 0) return;
+            if (lastFastReversalBar == entryBar) return;       // already fired for this trade
+            int barsSince = CurrentBar - entryBar;
+            if (barsSince < 1 || barsSince > fastReversalMaxBars) return;
+            double atr = indAtr[0]; if (atr <= 0) return;
+            double tickPt = TickSize * NQ_TICKS_PER_POINT;
+            double price = Close[0];
+            if (State == State.Realtime)
+            {
+                double v = openTradeDirection == 1 ? GetCurrentBid(0) : GetCurrentAsk(0);
+                if (v > 0) price = v;
+            }
+            double adversePts = openTradeDirection == 1
+                ? (averageEntryPrice - price) / tickPt
+                : (price - averageEntryPrice) / tickPt;
+            if (adversePts < fastReversalAdverseMinPts) return;
+            double atrPts = atr / tickPt;
+            if (adversePts < atrPts * fastReversalAtrFactor) return;
+            // CONFIRMATION (need at least 2 of 3 anti-MM signals):
+            int confirms = 0;
+            // 1) EMA fast vs slow flipped against us
+            bool emaFlip = (openTradeDirection == 1 && indEmaFast[0] < indEmaSlow[0])
+                        || (openTradeDirection == -1 && indEmaFast[0] > indEmaSlow[0]);
+            if (emaFlip) confirms++;
+            // 2) Tape (cumulative-delta proxy) strongly against
+            bool tapeAgainst = (openTradeDirection == 1 && cachedTapeDelta < -0.15)
+                            || (openTradeDirection == -1 && cachedTapeDelta >  0.15);
+            if (tapeAgainst) confirms++;
+            // 3) High-volume adverse bar — MM dump
+            double avgVol = GetCachedAvgVolume();
+            bool volSpike = avgVol > 0 && Volume[0] > avgVol * 1.4;
+            if (volSpike) confirms++;
+            // 4) Trap detector says we're in a trap (use trapScore as a strong tiebreaker)
+            if (trapScore >= 40) confirms++;
+            if (confirms < 2) return;
+            // FIRE — cut the loss now.
+            lastFastReversalBar = entryBar;
+            Print(TAG + "FAST-REVERSAL EXIT (anti-MM) adv=" + adversePts.ToString("F1")
+                + "pt atr=" + atrPts.ToString("F1") + " confirms=" + confirms
+                + " emaFlip=" + emaFlip + " tape=" + cachedTapeDelta.ToString("F2")
+                + " volSpk=" + volSpike + " trap=" + trapScore.ToString("F0"));
+            if (enableDiagLog) WriteDiagRow("FAST_REVERSAL", "adv=" + adversePts.ToString("F1") + " confirms=" + confirms);
+            lastExitReason = "FAST_REV";
+            if (openTradeDirection == 1) ExitLong(" ", " ");
+            else                          ExitShort(" ", " ");
+            stopsArmed = false; pendingExit = true;
+        }
+
+        // ===========================================================
+        //  FUTURES SESSION ROLLOVER (item 8 — ~18:00 ET new session)
+        // ===========================================================
+        private void MaybeFuturesSessionRollover()
+        {
+            int ct = ToTime(Time[0]);
+            // Trigger once per calendar date when we cross 18:00 boundary.
+            if (ct >= 180000 && Time[0].Date != lastFuturesSessionResetDate)
+            {
+                lastFuturesSessionResetDate = Time[0].Date;
+                Print(TAG + "FUTURES SESSION ROLLOVER @ " + Time[0].ToString("yyyy-MM-dd HH:mm:ss")
+                    + " — clearing daily flags so new session can trade.");
+                dailyRealizedPnL    = 0;
+                dailyTradeCount     = 0;
+                consecutiveLosses   = 0;
+                consecutiveWins     = 0;
+                dailyLimitHit       = false;
+                dailyProfitHit      = false;
+                emergencyKillActive = false;
+                flattenFired        = false;
+                rthStartedToday     = false;
+                if (baseAggressiveTrailFactor > 0) aggressiveTrailMaxAtrFactor = baseAggressiveTrailFactor;
+                if (SystemPerformance != null && SystemPerformance.AllTrades != null)
+                    processedTradeCount = SystemPerformance.AllTrades.Count;
+                if (enableDiagLog) WriteDiagRow("SESSION_ROLLOVER", "auto=18:00");
+                UpdateDashboardStatus("New futures session — daily counters reset", Brushes.MediumPurple);
+            }
+        }
+
 
         // ===========================================================
         //  TRAP DETECTOR + STOP-HUNT
@@ -1705,6 +1827,12 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void ExecuteFlatten()
         {
+            // IMPORTANT: do NOT call Account.Flatten() here. Account.Flatten() unmanaged-flattens
+            // the position out from under the managed strategy and NinjaTrader 8 will disable
+            // the strategy because its position is no longer in sync. The user wants FLATTEN
+            // to ONLY close THIS strategy's position (and cancel its working orders) without
+            // disabling the strategy. KILL is the only path that should disable trading
+            // (and even KILL leaves the strategy enabled — it just sets emergencyKillActive).
             CancelPendingOrders();
             if (Position.MarketPosition == MarketPosition.Flat)
             {
@@ -1712,10 +1840,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 UpdateDashboardStatus("Already flat — state reset", Brushes.CornflowerBlue);
                 return;
             }
-            if (State == State.Realtime)
-            { try { lastExitReason = "FLATTEN"; Account.Flatten(new[] { Instrument }); } catch { lastExitReason = "FLATTEN"; ManagedExitAll(); } }
-            else { lastExitReason = "FLATTEN"; ManagedExitAll(); }
+            lastExitReason = "FLATTEN";
+            ManagedExitAll();
             stopsArmed = false; pendingExit = true;
+            UpdateDashboardStatus("FLATTEN — closing position (strategy stays enabled)", Brushes.OrangeRed);
         }
 
         private void ManagedExitAll()
@@ -1821,14 +1949,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             dailyLimitHit = true;
             lastExitReason = "KILL";
             CancelPendingOrders();
-            if (Position.MarketPosition != MarketPosition.Flat)
-            {
-                if (State == State.Realtime)
-                    try { Account.Flatten(new[] { Instrument }); } catch { ManagedExitAll(); }
-                else ManagedExitAll();
-            }
+            if (Position.MarketPosition != MarketPosition.Flat) ManagedExitAll();
             stopsArmed = false; pendingExit = true;
-            UpdateDashboardStatus("EMERGENCY KILL — halted", Brushes.OrangeRed);
+            UpdateDashboardStatus("⛔ KILL — closed + halted (no new entries until disable+enable)", Brushes.OrangeRed);
         }
 
         private void ExecuteResetDaily()
@@ -2035,9 +2158,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                     }
                 }
                 if (dailyRealizedPnL <= -maxDailyLossDollars && !dailyLimitHit)
-                { dailyLimitHit = true; ExecuteFlatten(); Print(TAG + "DAILY LOSS LIMIT " + dailyRealizedPnL.ToString("C0") + " — closing trade, NOT killing strategy. Disable+Enable to resume."); UpdateDashboardStatus("⛔ DAILY LOSS LIMIT " + dailyRealizedPnL.ToString("C0") + " — trade closed. Disable+Enable to resume.", Brushes.Red); }
+                { dailyLimitHit = true; ExecuteFlatten(); Print(TAG + "DAILY LOSS LIMIT " + dailyRealizedPnL.ToString("C0") + " — closing position. Strategy stays ENABLED. Press RESET or wait for 18:00 ET session rollover."); UpdateDashboardStatus("⛔ DAILY LOSS LIMIT " + dailyRealizedPnL.ToString("C0") + " — position closed. Strategy STILL ENABLED.", Brushes.Red); }
                 if (dailyRealizedPnL >= maxDailyProfitDollars && !dailyProfitHit)
-                { dailyProfitHit = true; ExecuteFlatten(); Print(TAG + "DAILY PROFIT TARGET " + dailyRealizedPnL.ToString("C0") + " — closing trade, NOT killing strategy. Disable+Enable to resume."); UpdateDashboardStatus("💰 DAILY PROFIT TARGET " + dailyRealizedPnL.ToString("C0") + " — trade closed. Disable+Enable to resume.", Brushes.Gold); }
+                { dailyProfitHit = true; ExecuteFlatten(); Print(TAG + "DAILY PROFIT TARGET " + dailyRealizedPnL.ToString("C0") + " — closing position. Strategy stays ENABLED. Press RESET or wait for 18:00 ET session rollover."); UpdateDashboardStatus("💰 DAILY PROFIT TARGET " + dailyRealizedPnL.ToString("C0") + " — position closed. Strategy STILL ENABLED.", Brushes.Gold); }
             }
             catch (Exception ex) { Print(TAG + "OnExecutionUpdate EX: " + ex.Message); }
         }
@@ -2765,12 +2888,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                         (s, e) => { int nv = contracts + 1; contracts = Math.Min(maxContracts, nv); UpdateAdjustLabels(); },
                         out lblQtyVal));
                     stack.Children.Add(MakeAdjustRow("SL:", slPoints + "pt | $" + (slPoints * 20),
-                        // − = WIDEN (move SL FURTHER from price = give more room).
-                        // + = TIGHTEN (move SL CLOSER to price = lock more profit / reduce risk).
+                        // Convention matches TP +/-: "-" decreases the points number, "+" increases it.
+                        // For SL that means "-" = TIGHTER (smaller risk distance, SL closer to price)
+                        //                    "+" = WIDER  (more risk room, SL further from price).
                         // Operates on hiddenStopPrice DIRECTLY so it works correctly even after
                         // Jump SL has moved SL into profit (where slPoints/entry-math becomes ambiguous).
-                        (s, e) => { RequestSlNudgePoints(-slTpAdjustStep); },
-                        (s, e) => { RequestSlNudgePoints(+slTpAdjustStep); },
+                        (s, e) => { RequestSlNudgePoints(+slTpAdjustStep); },  // "-" tightens => positive nudge to RequestSlNudgePoints (which TIGHTENS by convention of that helper)
+                        (s, e) => { RequestSlNudgePoints(-slTpAdjustStep); },  // "+" widens   => negative nudge
                         out lblSlVal));
                     stack.Children.Add(MakeAdjustRow("TP:", tpPoints + "pt | $" + (tpPoints * 20),
                         (s, e) => { int nv = tpPoints - slTpAdjustStep; tpPoints = Math.Max(1, nv); UpdateAdjustLabels(); RequestSlTpResize(); },
@@ -3435,7 +3559,26 @@ namespace NinjaTrader.NinjaScript.Strategies
             Description = "If ON (default), disabling+re-enabling the strategy clears today's PnL/trades so DAILY LIMIT does not re-trigger from prior fills. Turn OFF to keep persistent daily PnL across restarts.")]
         public bool ResetDailyOnRestart { get { return resetDailyOnRestart; } set { resetDailyOnRestart = value; } }
 
-        [NinjaScriptProperty][Range(2, 50)]
+        // ----- Fast Reversal Exit (anti-MM/algo sweep) -----
+        [NinjaScriptProperty]
+        [Display(Name = "Fast Reversal Exit (anti-MM)", Order = 9, GroupName = "1 - Risk",
+            Description = "Within first N bars after entry, if adverse move > factor×ATR AND 2+ confirms (EMA flip / tape against / vol spike / trap≥40), exit at market BEFORE hidden SL would hit. Cuts loss roughly in half on MM sweeps. Default ON.")]
+        public bool FastReversalExitEnabled { get { return fastReversalExitEnabled; } set { fastReversalExitEnabled = value; } }
+
+        [NinjaScriptProperty][Range(0.2, 1.5)]
+        [Display(Name = "Fast Reversal ATR Factor", Order = 10, GroupName = "1 - Risk",
+            Description = "Adverse move must exceed factor × current ATR before fast-exit can trigger. Lower = more aggressive cut. Default 0.6.")]
+        public double FastReversalAtrFactor { get { return fastReversalAtrFactor; } set { fastReversalAtrFactor = value; } }
+
+        [NinjaScriptProperty][Range(1, 12)]
+        [Display(Name = "Fast Reversal Max Bars", Order = 11, GroupName = "1 - Risk",
+            Description = "Only consider fast-exit within first N bars after entry. After that, normal trail/BE/trap logic governs. Default 4.")]
+        public int FastReversalMaxBars { get { return fastReversalMaxBars; } set { fastReversalMaxBars = value; } }
+
+        [NinjaScriptProperty][Range(1.0, 20.0)]
+        [Display(Name = "Fast Reversal Min Adverse (pts)", Order = 12, GroupName = "1 - Risk",
+            Description = "Hard floor — never fire fast-exit unless adverse is at least this many points (avoids over-reacting to noise). Default 4.")]
+        public double FastReversalMinAdversePts { get { return fastReversalAdverseMinPts; } set { fastReversalAdverseMinPts = value; } }        [NinjaScriptProperty][Range(2, 50)]
         [Display(Name = "Breakeven At (pts)", Order = 5, GroupName = "3 - Trail / SL")]
         public int BreakevenAtPoints { get { return breakevenAtPoints; } set { breakevenAtPoints = value; } }
 
