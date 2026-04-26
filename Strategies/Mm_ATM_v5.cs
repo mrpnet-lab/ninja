@@ -190,6 +190,21 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double        aggrTrailDistPts            = 2.0;   // Trail distance 2pt
         private double        aggrPullbackAtrFactor       = 0.4;   // Adverse 0.4xATR after peak -> exit
         private int           aggrPullbackMaxBars         = 2;     // Pullback exit valid within N bars after entry
+        // ----- AGGR adverse-exit (anti stop-hunt) — fires when trade NEVER showed profit -----
+        private bool          aggrAdverseExitEnabled      = true;  // When AGGR ON: exit if trade has never been green and adverse >= factor*ATR
+        private int           aggrAdverseMaxBars          = 2;     // Valid within N bars after entry
+        private double        aggrAdverseAtrFactor        = 0.5;   // Adverse >= this x ATR -> bail before full SL hit
+        private double        aggrAdverseMinPts           = 3.0;   // Floor: minimum adverse points to trigger (avoids tick noise)
+        // ----- AGGR static-SL cap — caps catastrophic loss when AGGR is ON -----
+        private double        aggrSlCapPoints             = 12.0;  // 0=disabled. When AGGR ON, SL distance capped at this many points.
+        // ----- SL-cluster cooldown — pauses entries after consecutive SL exits in a short window -----
+        private bool          slClusterCooldownEnabled    = true;
+        private int           slClusterCount              = 2;     // After this many SL exits within window -> cooldown
+        private int           slClusterWindowMin          = 60;    // Sliding window in minutes
+        private int           slClusterCooldownMin        = 15;    // Block new entries for this many minutes
+        private DateTime[]    slExitTimes;                          // ring buffer of recent SL-exit timestamps
+        private int           slExitTimesIndex;
+        private DateTime      slClusterCooldownUntil      = DateTime.MinValue;
         // ----- Chop filter (default ON, applies to manual + auto) -----
         private bool          chopFilterEnabled           = true;
         private double        chopAdxMin                  = 18.0;  // ADX below this is considered chop
@@ -470,6 +485,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                     aggrTrailDistPts            = 2.0;
                     aggrPullbackAtrFactor       = 0.4;
                     aggrPullbackMaxBars         = 2;
+                    aggrAdverseExitEnabled      = true;
+                    aggrAdverseMaxBars          = 2;
+                    aggrAdverseAtrFactor        = 0.5;
+                    aggrAdverseMinPts           = 3.0;
+                    aggrSlCapPoints             = 12.0;
+                    slClusterCooldownEnabled    = true;
+                    slClusterCount              = 2;
+                    slClusterWindowMin          = 60;
+                    slClusterCooldownMin        = 15;
                     chopFilterEnabled           = true;
                     chopAdxMin                  = 18.0;
                     chopAdxFallingBars          = 3;
@@ -1051,6 +1075,31 @@ namespace NinjaTrader.NinjaScript.Strategies
                 : Math.Max(trailActivationPoints, atrPts * 0.4);
             bool htfAgrees = (openTradeDirection == 1 && htfBias > 0) || (openTradeDirection == -1 && htfBias < 0);
 
+            // AGGR ADVERSE EXIT (anti stop-hunt): if AGGR is ON and the trade has NEVER been in profit
+            // beyond a small floor, and adverse excursion has reached factor*ATR within N bars,
+            // bail out before the full SL hits. Catches the "entry, instant 15-20pt spike against us,
+            // straight to SL" pattern that bleeds the most money. Trending winners (which always show
+            // peak > floor) are NEVER affected by this rule.
+            if (aggressiveExitsEnabled && aggrAdverseExitEnabled
+                && (CurrentBar - entryBar) <= aggrAdverseMaxBars
+                && trailMaxProfitPts < 1.0
+                && lastFastReversalBar != CurrentBar)
+            {
+                double adverse = -profitPts; // positive when underwater
+                double adverseTrigger = Math.Max(aggrAdverseMinPts, aggrAdverseAtrFactor * atrPts);
+                if (adverse >= adverseTrigger)
+                {
+                    lastFastReversalBar = CurrentBar;
+                    lastExitReason = "AGGR_ADVERSE";
+                    if (enableDiagLog) WriteDiagRow("AGGR_ADVERSE_EXIT", "adv=" + adverse.ToString("F1") + " trig=" + adverseTrigger.ToString("F1") + " bars=" + (CurrentBar - entryBar));
+                    Print(TAG + "AGGR ADVERSE EXIT  adverse=" + adverse.ToString("F1") + " trigger=" + adverseTrigger.ToString("F1"));
+                    if (openTradeDirection == 1) ExitLong();
+                    else if (openTradeDirection == -1) ExitShort();
+                    pendingExit = true;
+                    return;
+                }
+            }
+
             // AGGRESSIVE PULLBACK EXIT (anti-MM-trap): once we've been in profit beyond activation,
             // any retracement >= aggrPullbackAtrFactor*ATR within aggrPullbackMaxBars of entry
             // forces a market exit so MM stop-runs can't flip a winner into a loser.
@@ -1401,14 +1450,22 @@ namespace NinjaTrader.NinjaScript.Strategies
         // Eval order: Open window → Close window → Midday window. First match wins.
         private int GetEffectiveSlPoints()
         {
-            if (!timeOfDaySlSizingEnabled) return slPoints;
-            int ct = ToTime(Time[0]);
-            double mult = 1.0;
-            if (IsTimeInWindow(ct, sodOpenStart, sodOpenEnd))   mult = sodOpenSlMult;
-            else if (IsTimeInWindow(ct, sodCloseStart, sodCloseEnd)) mult = sodCloseSlMult;
-            else if (IsTimeInWindow(ct, sodMiddayStart, sodMiddayEnd)) mult = sodMiddaySlMult;
-            int eff = (int)Math.Round(slPoints * mult);
-            return Math.Max(2, eff); // never below 2pt
+            int baseSl = slPoints;
+            if (timeOfDaySlSizingEnabled)
+            {
+                int ct = ToTime(Time[0]);
+                double mult = 1.0;
+                if (IsTimeInWindow(ct, sodOpenStart, sodOpenEnd))   mult = sodOpenSlMult;
+                else if (IsTimeInWindow(ct, sodCloseStart, sodCloseEnd)) mult = sodCloseSlMult;
+                else if (IsTimeInWindow(ct, sodMiddayStart, sodMiddayEnd)) mult = sodMiddaySlMult;
+                baseSl = (int)Math.Round(slPoints * mult);
+            }
+            // AGGR static-SL cap — when aggressive exits are armed, the AGGR pullback / adverse
+            // logic catches normal losses, so the static SL is only there as a catastrophe brake.
+            // Cap it tighter than the manual default to limit worst-case dollar loss per trade.
+            if (aggressiveExitsEnabled && aggrSlCapPoints > 0 && baseSl > aggrSlCapPoints)
+                baseSl = (int)Math.Round(aggrSlCapPoints);
+            return Math.Max(2, baseSl); // never below 2pt
         }
 
         // Inclusive of start, exclusive of end. Handles wrap-around (start > end).
@@ -1670,6 +1727,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                     if (enableDiagLog) WriteDiagRow("BLOCK_CHOP", chopReason);
                     return false;
                 }
+            }
+            // SL-cluster cooldown: if we just hit N stop-losses in a short window, the regime is
+            // toxic for our system right now. Pause new entries so we don't chain another -$400.
+            if (slClusterCooldownEnabled && Time[0] < slClusterCooldownUntil)
+            {
+                int remainSec = (int)(slClusterCooldownUntil - Time[0]).TotalSeconds;
+                UpdateDashboardStatus(label + " blocked: SL CLUSTER cooldown " + (remainSec / 60) + "m", Brushes.OrangeRed);
+                if (enableDiagLog) WriteDiagRow("BLOCK_SL_CLUSTER", "cooldown_remaining_sec=" + remainSec);
+                return false;
             }
             if (enteredThisBar && !allowMultiEntryPerBar) { UpdateDashboardStatus(label + " blocked: already entered this bar", Brushes.Orange); return false; }
             if (maxTradesPerDay > 0 && !isManual && dailyTradeCount >= maxTradesPerDay
@@ -2451,6 +2517,26 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 lastLossDirection = last.Entry.MarketPosition == MarketPosition.Long ? 1 : -1;
                                 lastLossBarNumber = CurrentBar;
                                 RecordTradeOutcome(false);
+                                // SL-cluster tracker: only stop-loss exits count (not BE / not AGGR_PULLBACK / not AGGR_ADVERSE).
+                                // The cooldown is for the "can't read tape, getting hunted" regime.
+                                if (slClusterCooldownEnabled && reason == "SL")
+                                {
+                                    if (slExitTimes == null || slExitTimes.Length != slClusterCount)
+                                    { slExitTimes = new DateTime[slClusterCount]; slExitTimesIndex = 0; }
+                                    slExitTimes[slExitTimesIndex] = Time[0];
+                                    slExitTimesIndex = (slExitTimesIndex + 1) % slClusterCount;
+                                    // Check: are ALL slots within the window?
+                                    bool allWithin = true;
+                                    DateTime windowStart = Time[0].AddMinutes(-slClusterWindowMin);
+                                    for (int j = 0; j < slClusterCount; j++)
+                                        if (slExitTimes[j] < windowStart) { allWithin = false; break; }
+                                    if (allWithin)
+                                    {
+                                        slClusterCooldownUntil = Time[0].AddMinutes(slClusterCooldownMin);
+                                        if (enableDiagLog) WriteDiagRow("SL_CLUSTER_COOLDOWN", "count=" + slClusterCount + " window=" + slClusterWindowMin + "m cooldown=" + slClusterCooldownMin + "m until=" + slClusterCooldownUntil.ToString("HH:mm"));
+                                        Print(TAG + "SL CLUSTER -> cooldown until " + slClusterCooldownUntil.ToString("HH:mm"));
+                                    }
+                                }
                                 if (enableDiagLog) WriteDiagRow("EXIT_LOSS_" + reason, "pnl=" + last.ProfitCurrency.ToString("F2") + " consec=" + consecutiveLosses);
                                 // Auto-tighten on N consecutive losses
                                 if (autoTightenOnLossesEnabled && consecutiveLosses >= autoTightenLossN && baseAggressiveTrailFactor > 0)
@@ -4059,6 +4145,31 @@ namespace NinjaTrader.NinjaScript.Strategies
             Description = "Pullback exit only fires within this many bars after entry. Default 2.")]
         public int AggrPullbackMaxBars { get { return aggrPullbackMaxBars; } set { aggrPullbackMaxBars = value; } }
 
+        [NinjaScriptProperty]
+        [Display(Name = "Aggr Adverse Exit Enabled", Order = 7, GroupName = "12 - Aggressive Exits",
+            Description = "Anti stop-hunt: when AGGR ON, if a trade NEVER reached profit and goes adverse by AggrAdverseAtrFactor x ATR (or AggrAdverseMinPts) within AggrAdverseMaxBars of entry, exit at market BEFORE the full SL hits. Trending winners (which always show profit) are NEVER affected. Default ON.")]
+        public bool AggrAdverseExitEnabled { get { return aggrAdverseExitEnabled; } set { aggrAdverseExitEnabled = value; } }
+
+        [NinjaScriptProperty][Range(1, 10)]
+        [Display(Name = "Aggr Adverse Max Bars", Order = 8, GroupName = "12 - Aggressive Exits",
+            Description = "Adverse exit only fires within this many bars after entry. Default 2.")]
+        public int AggrAdverseMaxBars { get { return aggrAdverseMaxBars; } set { aggrAdverseMaxBars = value; } }
+
+        [NinjaScriptProperty][Range(0.1, 2.0)]
+        [Display(Name = "Aggr Adverse (x ATR)", Order = 9, GroupName = "12 - Aggressive Exits",
+            Description = "Adverse excursion threshold as multiple of ATR. Default 0.5 (e.g. ATR 14pt → trigger at 7pt adverse).")]
+        public double AggrAdverseAtrFactor { get { return aggrAdverseAtrFactor; } set { aggrAdverseAtrFactor = value; } }
+
+        [NinjaScriptProperty][Range(1.0, 20.0)]
+        [Display(Name = "Aggr Adverse Min (pts)", Order = 10, GroupName = "12 - Aggressive Exits",
+            Description = "Minimum adverse points to trigger (floor; avoids tick noise on very low ATR). Default 3.0.")]
+        public double AggrAdverseMinPts { get { return aggrAdverseMinPts; } set { aggrAdverseMinPts = value; } }
+
+        [NinjaScriptProperty][Range(0.0, 50.0)]
+        [Display(Name = "Aggr SL Cap (pts, 0=off)", Order = 11, GroupName = "12 - Aggressive Exits",
+            Description = "When AGGR ON, the static stop-loss distance is capped at this many points (catastrophe brake). Set 0 to disable cap and use the global SL. Default 12 (= -$240 max per NQ contract). Trail is unaffected — runners can still ride to T4-Big.")]
+        public double AggrSlCapPoints { get { return aggrSlCapPoints; } set { aggrSlCapPoints = value; } }
+
         // ===== Group 13 — Chop Filter (manual + auto) =====
         [NinjaScriptProperty]
         [Display(Name = "Chop Filter Enabled", Order = 1, GroupName = "13 - Chop Filter",
@@ -4134,6 +4245,27 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "Adaptive Confidence Boost", Order = 5, GroupName = "14 - Adaptive Window",
             Description = "Points added to required min-confidence while tighten is active. Default 5.")]
         public int AdaptiveConfBoost { get { return adaptiveConfBoost; } set { adaptiveConfBoost = value; } }
+
+        // ===== Group 15 — SL Cluster Cooldown =====
+        [NinjaScriptProperty]
+        [Display(Name = "SL Cluster Cooldown Enabled", Order = 1, GroupName = "15 - SL Cluster Cooldown",
+            Description = "After SlClusterCount stop-loss exits within SlClusterWindowMin minutes, block new entries for SlClusterCooldownMin minutes. Detects 'toxic regime' periods where the strategy is being stop-hunted and pauses to let conditions reset. Default ON.")]
+        public bool SlClusterCooldownEnabled { get { return slClusterCooldownEnabled; } set { slClusterCooldownEnabled = value; } }
+
+        [NinjaScriptProperty][Range(2, 10)]
+        [Display(Name = "SL Cluster Count", Order = 2, GroupName = "15 - SL Cluster Cooldown",
+            Description = "Number of SL exits within window that triggers cooldown. Default 2.")]
+        public int SlClusterCount { get { return slClusterCount; } set { slClusterCount = value; if (slExitTimes != null && slExitTimes.Length != value) { slExitTimes = null; } } }
+
+        [NinjaScriptProperty][Range(5, 240)]
+        [Display(Name = "SL Cluster Window (min)", Order = 3, GroupName = "15 - SL Cluster Cooldown",
+            Description = "Sliding window in minutes used to count recent SL exits. Default 60.")]
+        public int SlClusterWindowMin { get { return slClusterWindowMin; } set { slClusterWindowMin = value; } }
+
+        [NinjaScriptProperty][Range(1, 120)]
+        [Display(Name = "SL Cluster Cooldown (min)", Order = 4, GroupName = "15 - SL Cluster Cooldown",
+            Description = "Block new entries for this many minutes after the cluster trigger fires. Default 15.")]
+        public int SlClusterCooldownMin { get { return slClusterCooldownMin; } set { slClusterCooldownMin = value; } }
 
         [NinjaScriptProperty][Range(2, 50)]
         [Display(Name = "Breakeven At (pts)", Order = 5, GroupName = "3 - Trail / SL")]
