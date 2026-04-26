@@ -87,6 +87,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private EMA indEmaFast, indEmaSlow, indEmaHtf, indEma5mFast, indEma5mSlow;
         private RSI indRsi;
         private ATR indAtr;
+        private ADX indAdx;
         #endregion
 
         // ===========================================================
@@ -147,6 +148,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private volatile bool pendingLongLimit, pendingShortLimit;
         private volatile bool pendingFlatten, pendingCloseTrade, pendingCloseOne;
         private volatile bool pendingJumpSL, pendingRearm, pendingSlTpResize, pendingEmergencyKill;
+        private volatile bool pendingResetDaily;
         private volatile bool pendingTrailActivate;
         private volatile int  pendingTrailNudgePoints;          // signed: + = looser (away from price), − = tighter
         private volatile int  pendingSlNudge;                    // signed: + = TIGHTEN (toward price), − = WIDEN (away from price)
@@ -154,6 +156,23 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double        aggressiveTrailMaxAtrFactor = 0.5; // TRL NOW initial distance = max(2pt, factor×ATR)
         private double        beSafeAtrFactor             = 0.35; // Smart BE: SL must stay >= max(beSafeMinTicks, factor×ATR) below price
         private int           beSafeMinTicks              = 6;    // Hard floor in ticks (1.5pt on NQ) so MM stop-hunts can't tag us
+        // ----- Streak-adaptive trail (auto-tighten on losses / auto-widen on wins) -----
+        private bool          autoTightenOnLossesEnabled  = false;
+        private int           autoTightenLossN            = 2;    // after N consecutive losses
+        private double        autoTightenFactor           = 0.5;  // multiply aggressiveTrailMaxAtrFactor by this (lower = tighter)
+        private bool          autoWidenOnWinsEnabled      = false;
+        private int           autoWidenWinN               = 3;    // after N consecutive wins
+        private double        autoWidenFactor             = 1.5;  // multiply aggressiveTrailMaxAtrFactor by this (higher = looser)
+        private int           consecutiveWins;                    // win-side streak counter (mirror of consecutiveLosses)
+        private double        baseAggressiveTrailFactor;          // snapshot for restoring after streak adjustment
+        // ----- ADX-aware prevDay TP-clamp skip -----
+        private bool          skipPrevDayClampOnHighAdx   = true;
+        private double        highAdxThreshold            = 28.0;
+        // ----- Last exit reason (used to differentiate EXIT_* tags in the CSV) -----
+        // Set by the code path that triggers the ExitLong/ExitShort; consumed by OnExecutionUpdate when SystemPerformance reports the trade.
+        private string        lastExitReason              = "UNKNOWN";
+        // ----- Reset-daily-on-restart -----
+        private bool          resetDailyOnRestart         = true;
         private volatile bool pendingPositionFlat;
         private volatile bool pendingExit;
         private int  pendingExitTicks;
@@ -295,7 +314,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private Button btnBuyAsk, btnSellBid;
         private Button btnBuyLmt, btnSellLmt;
         private Button btnCloseTrade, btnCloseOne;
-        private Button btnJumpSL, btnFlatten, btnKill;
+        private Button btnJumpSL, btnFlatten, btnKill, btnResetDaily;
         private Button btnTrailNow;
         private Button btnModeManual, btnModeAuto;
         private Button btnHoursToggle;
@@ -363,6 +382,16 @@ namespace NinjaTrader.NinjaScript.Strategies
                     trailAtrMultiplier    = 1.5;
                     smartTrailBacktrackTicks = 4;
                     aggressiveTrailMaxAtrFactor = 0.5;
+                    baseAggressiveTrailFactor   = aggressiveTrailMaxAtrFactor;
+                    autoTightenOnLossesEnabled  = false;
+                    autoTightenLossN            = 2;
+                    autoTightenFactor           = 0.5;
+                    autoWidenOnWinsEnabled      = false;
+                    autoWidenWinN               = 3;
+                    autoWidenFactor             = 1.5;
+                    skipPrevDayClampOnHighAdx   = true;
+                    highAdxThreshold            = 28.0;
+                    resetDailyOnRestart         = true;
 
                     // SmartSL / JumpSL
                     breakevenAtPoints     = 8;
@@ -394,6 +423,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     indEmaHtf  = EMA(htfEmaPeriod);
                     indRsi     = RSI(rsiPeriod, 3);
                     indAtr     = ATR(atrPeriod);
+                    indAdx     = ADX(14);
 
                     AddDataSeries(BarsPeriodType.Minute, 5);
                     indEma5mFast = EMA(BarsArray[1], 9);
@@ -426,6 +456,21 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     ResetSessionFlags();
                     ResetPositionStateInternal(true);
+                    // ----- ResetDailyOnRestart -----
+                    // SystemPerformance.AllTrades persists across strategy disable/re-enable.
+                    // If reset is enabled (default), advance processedTradeCount past whatever is
+                    // already there so we DO NOT re-credit prior PnL into dailyRealizedPnL on the
+                    // first new fill. Without this, after disable+enable today's prior trades
+                    // would re-trigger DAILY PROFIT/LOSS LIMIT instantly on the next entry.
+                    if (resetDailyOnRestart && SystemPerformance != null && SystemPerformance.AllTrades != null)
+                    {
+                        int existing = SystemPerformance.AllTrades.Count;
+                        processedTradeCount = existing;
+                        dailyRealizedPnL = 0;
+                        consecutiveLosses = 0;
+                        consecutiveWins = 0;
+                        Print(TAG + "DAILY counters RESET on restart (skipped " + existing + " prior trades). Set ResetDailyOnRestart=false to keep daily PnL across restarts.");
+                    }
                     if (Position.MarketPosition != MarketPosition.Flat)
                     {
                         openTradeDirection = Position.MarketPosition == MarketPosition.Long ? 1 : -1;
@@ -466,6 +511,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             flattenFired = false;
             emergencyKillActive = false;
             consecutiveLosses = 0;
+            consecutiveWins = 0;
+            // Restore base aggressive trail factor (any streak-adjustment is per-session)
+            if (baseAggressiveTrailFactor > 0) aggressiveTrailMaxAtrFactor = baseAggressiveTrailFactor;
             lastLossDirection = 0;
             lastLossBarNumber = 0;
             lastTradeExitBar = 0;
@@ -616,6 +664,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void ProcessPendingButtons()
         {
             if (State != State.Realtime && State != State.Historical) return;
+            if (pendingResetDaily)    { pendingResetDaily    = false; ExecuteResetDaily();    return; }
             if (pendingEmergencyKill) { pendingEmergencyKill = false; ExecuteEmergencyKill(); return; }
             if (pendingCloseTrade)    { pendingCloseTrade    = false; ExecuteCloseTrade();    return; }
             if (pendingFlatten)       { pendingFlatten       = false; ExecuteFlatten();       return; }
@@ -684,12 +733,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 flattenFired = true;
                 Print(TAG + "AUTO-FLATTEN @ " + Time[0].ToString("HH:mm:ss"));
+                lastExitReason = "AUTO_FLATTEN";
                 ExecuteFlatten();
             }
             if (rthStartedToday && currentTime >= 165500 && currentTime < 180000
                 && Position.MarketPosition != MarketPosition.Flat)
             {
                 Print(TAG + "CME maintenance flatten");
+                lastExitReason = "CME_MAINT";
                 ExecuteFlatten();
             }
         }
@@ -707,6 +758,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 dailyLimitHit = true;
                 Print(TAG + "LIVE LOSS LIMIT " + live.ToString("C0") + " — closing trade, NOT killing strategy. Disable+Enable to resume.");
+                lastExitReason = "DAILY_LOSS";
                 ExecuteFlatten();
                 UpdateDashboardStatus("⛔ DAILY LOSS LIMIT " + live.ToString("C0") + " — trade closed. Disable+Enable to resume.", Brushes.Red);
             }
@@ -714,6 +766,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 dailyProfitHit = true;
                 Print(TAG + "LIVE PROFIT TARGET " + live.ToString("C0") + " — closing trade, NOT killing strategy. Disable+Enable to resume.");
+                lastExitReason = "DAILY_PROFIT";
                 ExecuteFlatten();
                 UpdateDashboardStatus("💰 DAILY PROFIT TARGET " + live.ToString("C0") + " — trade closed. Disable+Enable to resume.", Brushes.Gold);
             }
@@ -812,11 +865,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (priceLong <= hiddenStopPrice)
                 {
                     Print(TAG + "HIDDEN SL LONG @ " + priceLong.ToString("F2"));
+                    lastExitReason = breakevenLocked ? "BE" : "SL";
                     ExitLong(" ", " "); stopsArmed = false; pendingExit = true;
                 }
                 else if (priceLong >= hiddenTargetPrice && (!runnerModeActive || tpClampedByPrevDay))
                 {
                     Print(TAG + "HIDDEN TP LONG @ " + priceLong.ToString("F2") + (tpClampedByPrevDay ? " (prevDay-clamp)" : ""));
+                    lastExitReason = tpClampedByPrevDay ? "TP_PD" : "TP";
                     ExitLong(" ", " "); stopsArmed = false; pendingExit = true;
                 }
             }
@@ -825,11 +880,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (priceShort >= hiddenStopPrice)
                 {
                     Print(TAG + "HIDDEN SL SHORT @ " + priceShort.ToString("F2"));
+                    lastExitReason = breakevenLocked ? "BE" : "SL";
                     ExitShort(" ", " "); stopsArmed = false; pendingExit = true;
                 }
                 else if (priceShort <= hiddenTargetPrice && (!runnerModeActive || tpClampedByPrevDay))
                 {
                     Print(TAG + "HIDDEN TP SHORT @ " + priceShort.ToString("F2") + (tpClampedByPrevDay ? " (prevDay-clamp)" : ""));
+                    lastExitReason = tpClampedByPrevDay ? "TP_PD" : "TP";
                     ExitShort(" ", " "); stopsArmed = false; pendingExit = true;
                 }
             }
@@ -1023,6 +1080,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (price <= trailPrice)
                 {
                     Print(TAG + "TRAIL HIT LONG @ " + price.ToString("F2") + " trail=" + trailPrice.ToString("F2") + " tier=" + trailTierName);
+                    lastExitReason = "TRAIL_" + trailTierName;
                     ExitLong(" ", " "); stopsArmed = false; pendingExit = true;
                 }
             }
@@ -1032,6 +1090,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (price >= trailPrice)
                 {
                     Print(TAG + "TRAIL HIT SHORT @ " + price.ToString("F2") + " trail=" + trailPrice.ToString("F2") + " tier=" + trailTierName);
+                    lastExitReason = "TRAIL_" + trailTierName;
                     ExitShort(" ", " "); stopsArmed = false; pendingExit = true;
                 }
             }
@@ -1152,6 +1211,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 Print(TAG + "TRAP ESCAPE IMMEDIATE score=" + trapScore.ToString("F0") + " adv=" + adverse.ToString("F1"));
                 trapEscapeCooldownBar = CurrentBar;
+                lastExitReason = "TRAP_IMM";
                 if (openTradeDirection == 1) ExitLong(" ", " ");
                 else ExitShort(" ", " ");
                 stopsArmed = false; pendingExit = true;
@@ -1164,6 +1224,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     Print(TAG + "TRAP ESCAPE GRAD bars=" + trapEscapeBars + " adv=" + adverse.ToString("F1"));
                     trapEscapeCooldownBar = CurrentBar;
+                    lastExitReason = "TRAP_GRAD";
                     if (openTradeDirection == 1) ExitLong(" ", " ");
                     else ExitShort(" ", " ");
                     stopsArmed = false; pendingExit = true;
@@ -1406,14 +1467,18 @@ namespace NinjaTrader.NinjaScript.Strategies
             // Clamp TP to prevDay levels if relevant
             tpClampedByPrevDay = false;
             double minTpDist = 8 * tickPt;
-            if (prevDayHigh > 0 && openTradeDirection == 1
+            // Skip the clamp on high-ADX trend days (price more likely to slice through prevDay levels):
+            double adxNow = (indAdx != null && CurrentBar > 14) ? indAdx[0] : 0;
+            bool clampAllowed = !skipPrevDayClampOnHighAdx || adxNow < highAdxThreshold;
+            if (clampAllowed && prevDayHigh > 0 && openTradeDirection == 1
                 && prevDayHigh > averageEntryPrice + minTpDist
                 && prevDayHigh < hiddenTargetPrice)
             { hiddenTargetPrice = prevDayHigh - TickSize; tpClampedByPrevDay = true; }
-            if (prevDayLow > 0 && openTradeDirection == -1
+            if (clampAllowed && prevDayLow > 0 && openTradeDirection == -1
                 && prevDayLow < averageEntryPrice - minTpDist
                 && prevDayLow > hiddenTargetPrice)
             { hiddenTargetPrice = prevDayLow + TickSize; tpClampedByPrevDay = true; }
+            if (!clampAllowed && enableDiagLog) WriteDiagRow("CLAMP_SKIP", "adx=" + adxNow.ToString("F1") + " thr=" + highAdxThreshold.ToString("F1"));
             stopsArmed = true;
             if (runnerModeActive) Print(TAG + "RUNNER mode armed dir=" + openTradeDirection);
         }
@@ -1438,10 +1503,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             // PrevDay clamp on TP
             tpClampedByPrevDay = false;
             double minTpDist = 8 * tickPt;
-            if (prevDayHigh > 0 && openTradeDirection == 1
+            double adxNow = (indAdx != null && CurrentBar > 14) ? indAdx[0] : 0;
+            bool clampAllowed = !skipPrevDayClampOnHighAdx || adxNow < highAdxThreshold;
+            if (clampAllowed && prevDayHigh > 0 && openTradeDirection == 1
                 && prevDayHigh > averageEntryPrice + minTpDist && prevDayHigh < newTp)
             { newTp = prevDayHigh - TickSize; tpClampedByPrevDay = true; }
-            if (prevDayLow > 0 && openTradeDirection == -1
+            if (clampAllowed && prevDayLow > 0 && openTradeDirection == -1
                 && prevDayLow < averageEntryPrice - minTpDist && prevDayLow > newTp)
             { newTp = prevDayLow + TickSize; tpClampedByPrevDay = true; }
 
@@ -1646,8 +1713,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
             if (State == State.Realtime)
-            { try { Account.Flatten(new[] { Instrument }); } catch { ManagedExitAll(); } }
-            else ManagedExitAll();
+            { try { lastExitReason = "FLATTEN"; Account.Flatten(new[] { Instrument }); } catch { lastExitReason = "FLATTEN"; ManagedExitAll(); } }
+            else { lastExitReason = "FLATTEN"; ManagedExitAll(); }
             stopsArmed = false; pendingExit = true;
         }
 
@@ -1666,6 +1733,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 else UpdateDashboardStatus("Already flat", Brushes.CornflowerBlue);
                 return;
             }
+            lastExitReason = "CLOSE";
             ManagedExitAll();
             stopsArmed = false; pendingExit = true;
             UpdateDashboardStatus("Closing trade...", Brushes.Yellow);
@@ -1677,6 +1745,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (Position.Quantity <= 1) { ExecuteCloseTrade(); return; }
             CancelPendingOrders();
             string sig = activeEntrySignals.Count > 0 ? activeEntrySignals[activeEntrySignals.Count - 1] : "";
+            lastExitReason = "CLOSE_ONE";
             if (Position.MarketPosition == MarketPosition.Long) ExitLong(1, "", sig);
             else ExitShort(1, "", sig);
             if (activeEntrySignals.Count > 0) activeEntrySignals.RemoveAt(activeEntrySignals.Count - 1);
@@ -1750,6 +1819,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             emergencyKillActive = true;
             dailyLimitHit = true;
+            lastExitReason = "KILL";
             CancelPendingOrders();
             if (Position.MarketPosition != MarketPosition.Flat)
             {
@@ -1759,6 +1829,30 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             stopsArmed = false; pendingExit = true;
             UpdateDashboardStatus("EMERGENCY KILL — halted", Brushes.OrangeRed);
+        }
+
+        private void ExecuteResetDaily()
+        {
+            // Manually clear all daily counters/flags. Use at start of new session OR
+            // when ResetDailyOnRestart=false and you want to wipe today's stats by hand.
+            dailyRealizedPnL    = 0;
+            dailyTradeCount     = 0;
+            consecutiveLosses   = 0;
+            consecutiveWins     = 0;
+            lastLossDirection   = 0;
+            dailyLimitHit       = false;
+            dailyProfitHit      = false;
+            emergencyKillActive = false;
+            flattenFired        = false;
+            // Restore aggressive trail factor to its base if streak-adapted
+            if (baseAggressiveTrailFactor > 0) aggressiveTrailMaxAtrFactor = baseAggressiveTrailFactor;
+            // Sync processedTradeCount past existing SystemPerformance trades so we don't re-count.
+            if (SystemPerformance != null && SystemPerformance.AllTrades != null)
+                processedTradeCount = SystemPerformance.AllTrades.Count;
+            sessionDate = Time[0].Date;
+            Print(TAG + "MANUAL RESET DAILY — counters cleared.");
+            if (enableDiagLog) WriteDiagRow("RESET_DAILY", "manual=true");
+            UpdateDashboardStatus("Daily counters reset", Brushes.MediumPurple);
         }
 
         private bool CancelPendingOrders()
@@ -1898,19 +1992,45 @@ namespace NinjaTrader.NinjaScript.Strategies
                         if (last.Exit.Time >= time.AddSeconds(-2))
                         {
                             lastTradeExitBar = CurrentBar;
+                            string reason = string.IsNullOrEmpty(lastExitReason) ? "UNK" : lastExitReason;
                             if (last.ProfitCurrency < 0)
                             {
                                 consecutiveLosses++;
+                                consecutiveWins = 0;
                                 lastLossDirection = last.Entry.MarketPosition == MarketPosition.Long ? 1 : -1;
                                 lastLossBarNumber = CurrentBar;
-                                if (enableDiagLog) WriteDiagRow("EXIT_LOSS", "pnl=" + last.ProfitCurrency.ToString("F2") + " consec=" + consecutiveLosses);
+                                if (enableDiagLog) WriteDiagRow("EXIT_LOSS_" + reason, "pnl=" + last.ProfitCurrency.ToString("F2") + " consec=" + consecutiveLosses);
+                                // Auto-tighten on N consecutive losses
+                                if (autoTightenOnLossesEnabled && consecutiveLosses >= autoTightenLossN && baseAggressiveTrailFactor > 0)
+                                {
+                                    double newF = Math.Max(0.1, baseAggressiveTrailFactor * autoTightenFactor);
+                                    if (Math.Abs(newF - aggressiveTrailMaxAtrFactor) > 0.001)
+                                    {
+                                        aggressiveTrailMaxAtrFactor = newF;
+                                        if (enableDiagLog) WriteDiagRow("ADAPT_TIGHTEN", "consec=" + consecutiveLosses + " factor=" + newF.ToString("F2"));
+                                        Print(TAG + "AUTO-TIGHTEN trail factor -> " + newF.ToString("F2") + " (consecLosses=" + consecutiveLosses + ")");
+                                    }
+                                }
                             }
                             else
                             {
                                 consecutiveLosses = 0;
+                                consecutiveWins++;
                                 lastLossDirection = 0;
-                                if (enableDiagLog) WriteDiagRow("EXIT_WIN", "pnl=" + last.ProfitCurrency.ToString("F2"));
+                                if (enableDiagLog) WriteDiagRow("EXIT_WIN_" + reason, "pnl=" + last.ProfitCurrency.ToString("F2") + " consec=" + consecutiveWins);
+                                // Auto-widen on N consecutive wins
+                                if (autoWidenOnWinsEnabled && consecutiveWins >= autoWidenWinN && baseAggressiveTrailFactor > 0)
+                                {
+                                    double newF = Math.Min(2.0, baseAggressiveTrailFactor * autoWidenFactor);
+                                    if (Math.Abs(newF - aggressiveTrailMaxAtrFactor) > 0.001)
+                                    {
+                                        aggressiveTrailMaxAtrFactor = newF;
+                                        if (enableDiagLog) WriteDiagRow("ADAPT_WIDEN", "consec=" + consecutiveWins + " factor=" + newF.ToString("F2"));
+                                        Print(TAG + "AUTO-WIDEN trail factor -> " + newF.ToString("F2") + " (consecWins=" + consecutiveWins + ")");
+                                    }
+                                }
                             }
+                            lastExitReason = "";
                         }
                     }
                 }
@@ -2626,12 +2746,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                     rowClose.Children.Add(btnFlatten);
                     stack.Children.Add(rowClose);
 
-                    // CLOSE 1 / KILL row
+                    // CLOSE 1 / KILL / RESET DAILY row
                     var rowKill = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 2, 0, 2) };
-                    btnCloseOne = MakeBtn("CLOSE 1", Brushes.DarkGoldenrod, (s, e) => pendingCloseOne = true);
-                    btnKill     = MakeBtn("KILL",    Brushes.DarkRed,        (s, e) => pendingEmergencyKill = true);
+                    btnCloseOne   = MakeBtn("CLOSE 1", Brushes.DarkGoldenrod, (s, e) => pendingCloseOne = true);
+                    btnKill       = MakeBtn("KILL",    Brushes.DarkRed,        (s, e) => pendingEmergencyKill = true);
+                    btnResetDaily = MakeBtn("RESET",   Brushes.DarkSlateBlue,  (s, e) => pendingResetDaily = true);
+                    btnResetDaily.ToolTip = "Reset daily counters (PnL, trade count, loss/win streaks, daily-limit flags). Use at start of new session or after restart if ResetDailyOnRestart=false.";
                     rowKill.Children.Add(btnCloseOne);
                     rowKill.Children.Add(btnKill);
+                    rowKill.Children.Add(btnResetDaily);
                     stack.Children.Add(rowKill);
 
                     stack.Children.Add(MakeSep());
@@ -3157,7 +3280,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void WriteDiagHeader()
         {
             if (diagWriter == null || diagHeaderWritten) return;
-            diagWriter.WriteLine("DateTime,Bar,Close,VWAP,EmaF,EmaS,RSI,ATR,RawBull,RawBear,Bull,Bear,Tape,htfBias,trapScore,Action,Detail");
+            diagWriter.WriteLine("DateTime,Bar,Close,VWAP,EmaF,EmaS,RSI,ATR,ADX,RawBull,RawBear,Bull,Bear,Tape,htfBias,trapScore,Pos,Qty,AvgEntry,HiddenSL,HiddenTP,TrailPx,TrailTier,ManualOff,ConsecLoss,ConsecWin,DailyPnL,Action,Detail");
             diagHeaderWritten = true;
         }
         private void WriteDiagRow(string action, string detail = "")
@@ -3170,11 +3293,17 @@ namespace NinjaTrader.NinjaScript.Strategies
                 double es = indEmaSlow != null ? indEmaSlow[0] : 0;
                 double rs = indRsi != null ? indRsi[0] : 0;
                 double at = indAtr != null ? indAtr[0] : 0;
+                double ax = (indAdx != null && CurrentBar > 14) ? indAdx[0] : 0;
+                int pos = openTradeDirection;
+                int qty = Position.Quantity;
                 diagWriter.WriteLine(string.Format(
-                    "{0},{1},{2:F2},{3:F2},{4:F2},{5:F2},{6:F2},{7:F2},{8:F1},{9:F1},{10:F1},{11:F1},{12:F2},{13},{14:F1},{15},{16}",
+                    "{0},{1},{2:F2},{3:F2},{4:F2},{5:F2},{6:F2},{7:F2},{8:F1},{9:F1},{10:F1},{11:F1},{12:F1},{13:F2},{14},{15:F1},{16},{17},{18:F2},{19:F2},{20:F2},{21:F2},{22},{23:F1},{24},{25},{26:F2},{27},{28}",
                     Time[0].ToString("yyyy-MM-dd HH:mm:ss"), CurrentBar, Close[0], vwapValue,
-                    ef, es, rs, at, rawBullConfidence, rawBearConfidence,
-                    lastBullConfidence, lastBearConfidence, cachedTapeDelta, htfBias, trapScore, action, detail));
+                    ef, es, rs, at, ax, rawBullConfidence, rawBearConfidence,
+                    lastBullConfidence, lastBearConfidence, cachedTapeDelta, htfBias, trapScore,
+                    pos, qty, averageEntryPrice, hiddenStopPrice, hiddenTargetPrice, trailPrice,
+                    (trailTierName ?? ""), manualTrailOffsetPoints, consecutiveLosses, consecutiveWins,
+                    dailyRealizedPnL, action, detail));
             }
             catch (Exception ex) { Print(TAG + "DiagLog write EX: " + ex.Message); }
         }
@@ -3256,7 +3385,55 @@ namespace NinjaTrader.NinjaScript.Strategies
         [NinjaScriptProperty][Range(0.1, 2.0)]
         [Display(Name = "TRL NOW Aggr ATR Factor", Order = 41, GroupName = "3 - Trail / SL",
             Description = "TRL NOW initial trail distance = max(2pt, factor × ATR). Lower = tighter / locks more profit faster but riskier on noise. Default 0.5.")]
-        public double AggressiveTrailMaxAtrFactor { get { return aggressiveTrailMaxAtrFactor; } set { aggressiveTrailMaxAtrFactor = value; } }
+        public double AggressiveTrailMaxAtrFactor { get { return aggressiveTrailMaxAtrFactor; } set { aggressiveTrailMaxAtrFactor = value; baseAggressiveTrailFactor = value; } }
+
+        // ----- Streak-adaptive trail (auto-tighten on N consecutive losses / auto-widen on N consecutive wins) -----
+        [NinjaScriptProperty]
+        [Display(Name = "Auto-Tighten on Losses", Order = 42, GroupName = "3 - Trail / SL",
+            Description = "When N consecutive losing trades occur, multiply TRL NOW Aggr ATR Factor by 'Auto-Tighten Factor' (tightens trail). Default OFF.")]
+        public bool AutoTightenOnLosses { get { return autoTightenOnLossesEnabled; } set { autoTightenOnLossesEnabled = value; } }
+
+        [NinjaScriptProperty][Range(1, 10)]
+        [Display(Name = "Tighten After N Losses", Order = 43, GroupName = "3 - Trail / SL",
+            Description = "Number of CONSECUTIVE losses before auto-tightening trail. Default 2.")]
+        public int AutoTightenLossN { get { return autoTightenLossN; } set { autoTightenLossN = value; } }
+
+        [NinjaScriptProperty][Range(0.1, 1.0)]
+        [Display(Name = "Auto-Tighten Factor", Order = 44, GroupName = "3 - Trail / SL",
+            Description = "Multiplier applied to base TRL NOW factor on loss streak (lower = tighter). Default 0.5.")]
+        public double AutoTightenFactor { get { return autoTightenFactor; } set { autoTightenFactor = value; } }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Auto-Widen on Wins", Order = 45, GroupName = "3 - Trail / SL",
+            Description = "When N consecutive winning trades occur, multiply TRL NOW Aggr ATR Factor by 'Auto-Widen Factor' (loosens trail to let winners run). Default OFF.")]
+        public bool AutoWidenOnWins { get { return autoWidenOnWinsEnabled; } set { autoWidenOnWinsEnabled = value; } }
+
+        [NinjaScriptProperty][Range(1, 10)]
+        [Display(Name = "Widen After N Wins", Order = 46, GroupName = "3 - Trail / SL",
+            Description = "Number of CONSECUTIVE wins before auto-widening trail. Default 3.")]
+        public int AutoWidenWinN { get { return autoWidenWinN; } set { autoWidenWinN = value; } }
+
+        [NinjaScriptProperty][Range(1.0, 3.0)]
+        [Display(Name = "Auto-Widen Factor", Order = 47, GroupName = "3 - Trail / SL",
+            Description = "Multiplier applied to base TRL NOW factor on win streak (higher = looser). Default 1.5.")]
+        public double AutoWidenFactor { get { return autoWidenFactor; } set { autoWidenFactor = value; } }
+
+        // ----- ADX-aware prevDay TP-clamp skip -----
+        [NinjaScriptProperty]
+        [Display(Name = "Skip PrevDay TP Clamp on High ADX", Order = 6, GroupName = "1 - Risk",
+            Description = "On strong-trend days (ADX above threshold) DO NOT clamp TP to prior-day H/L — let winners run through pivots. Default ON.")]
+        public bool SkipPrevDayClampOnHighAdx { get { return skipPrevDayClampOnHighAdx; } set { skipPrevDayClampOnHighAdx = value; } }
+
+        [NinjaScriptProperty][Range(15.0, 60.0)]
+        [Display(Name = "High ADX Threshold", Order = 7, GroupName = "1 - Risk",
+            Description = "ADX(14) value above which prevDay TP clamp is skipped. Typical trend regime starts ~25; default 28.")]
+        public double HighAdxThreshold { get { return highAdxThreshold; } set { highAdxThreshold = value; } }
+
+        // ----- Reset daily counters on strategy restart -----
+        [NinjaScriptProperty]
+        [Display(Name = "Reset Daily on Restart", Order = 8, GroupName = "1 - Risk",
+            Description = "If ON (default), disabling+re-enabling the strategy clears today's PnL/trades so DAILY LIMIT does not re-trigger from prior fills. Turn OFF to keep persistent daily PnL across restarts.")]
+        public bool ResetDailyOnRestart { get { return resetDailyOnRestart; } set { resetDailyOnRestart = value; } }
 
         [NinjaScriptProperty][Range(2, 50)]
         [Display(Name = "Breakeven At (pts)", Order = 5, GroupName = "3 - Trail / SL")]

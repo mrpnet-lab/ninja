@@ -805,3 +805,140 @@ Manual nudges (`Trail ±pt`) keep flowing through the same ratchet — `manualTrail
 - Add a `DOUBLE` button that doubles current `Qty` on conviction signal (already throttled by `MaxContracts`)
 - Heuristic to skip TP-clamping by prevDay during high-ADX trend days (clamp wastes profit when trend is breaking through)
 - Live diagnostic CSV: include `hiddenTargetPrice`, `hiddenStopPrice`, `trailPrice`, `tier`, `manualTrailOffsetPoints` per row — for post-trade replay
+
+---
+
+## 14.8 — Diagnostics, daily-reset & adaptive trail (this revision)
+
+This revision builds on 14.7 and addresses three live-trading findings:
+
+1. The CSV showed every win as `EXIT_WIN` with no way to tell whether the exit
+   was the actual TP, a trail-hit, a BE-stop, a trap-escape, a manual close,
+   or a daily-limit auto-flatten.
+2. After **disable + re-enable** within the same RTH session the strategy
+   immediately printed `DAILY PROFIT TARGET` and flattened. Root cause:
+   `SystemPerformance.AllTrades` persists across enable/disable, but
+   `processedTradeCount` was being reset to 0, so the OnExecutionUpdate loop
+   re-credited every prior trade into `dailyRealizedPnL` on the next fill.
+3. There is no manual `RESET DAILY` button, and no way to let winners run
+   through prevDay H/L on strong-trend days, and no auto-tightening when
+   the day starts going against us.
+
+### 14.8.1 Differentiated EXIT_* tags
+
+A new `string lastExitReason` is set immediately **before** every
+`ExitLong`/`ExitShort` call site. `OnExecutionUpdate` then composes the
+diag tag as `EXIT_WIN_<reason>` or `EXIT_LOSS_<reason>`. Reasons in use:
+
+| Reason | Source |
+|---|---|
+| `TP` | Hidden target hit, no prevDay clamp |
+| `TP_PD` | Hidden target hit, target was clamped to prevDay H/L |
+| `SL` | Hidden stop hit while breakeven NOT yet locked |
+| `BE` | Hidden stop hit while breakeven WAS locked |
+| `TRAIL_<tier>` | Adaptive trail hit, e.g. `TRAIL_T4-Big` |
+| `TRAP_IMM` | Trap detector immediate escape (score = 65, adverse > 10) |
+| `TRAP_GRAD` | Trap detector graduated escape (score = 50, 2+ bars adverse) |
+| `CLOSE` | User pressed `CLOSE` |
+| `CLOSE_ONE` | User pressed `CLOSE 1` |
+| `FLATTEN` | User pressed `FLATTEN` (Account.Flatten) |
+| `KILL` | User pressed `KILL` (emergency halt) |
+| `AUTO_FLATTEN` | Session-end auto-flatten at `flattenTime` |
+| `CME_MAINT` | CME maintenance auto-flatten (16:55–18:00) |
+| `DAILY_LOSS` | LiveDailyPnLCheck loss-limit auto-flatten |
+| `DAILY_PROFIT` | LiveDailyPnLCheck profit-target auto-flatten |
+| `UNK` | Defensive fallback (should never appear) |
+
+`lastExitReason` is cleared after consumption so a stale tag cannot bleed
+into a later trade.
+
+### 14.8.2 `ResetDailyOnRestart` (default ON)
+
+In the `State.Realtime` branch, after `ResetSessionFlags()`, when this
+property is ON the agent advances `processedTradeCount` past every existing
+`SystemPerformance.AllTrades` entry **and** zeroes `dailyRealizedPnL` /
+streak counters. Net effect: only fills that arrive **after** the restart
+contribute to today's PnL — exactly matching the user's mental model that
+`Disable + Enable` should "start clean" for the daily limits.
+
+Set OFF if you actually want disable+enable to preserve the persistent
+intra-day PnL counter (e.g. you intentionally cycle the strategy and want
+the prior session's  profit/loss to keep counting toward the daily cap).
+
+### 14.8.3 Manual `RESET` button
+
+A third button is added to the `CLOSE 1 | KILL` row, making it
+`CLOSE 1 | KILL | RESET`. `RESET` invokes `ExecuteResetDaily()` which:
+
+- Zeroes `dailyRealizedPnL`, `dailyTradeCount`, `consecutiveLosses`,
+  `consecutiveWins`, `lastLossDirection`.
+- Clears `dailyLimitHit`, `dailyProfitHit`, `emergencyKillActive`,
+  `flattenFired`.
+- Restores `aggressiveTrailMaxAtrFactor` to its baseline (undoing any
+  streak-adaptation).
+- Advances `processedTradeCount` to `SystemPerformance.AllTrades.Count`
+  so prior fills are not re-credited on the next entry.
+- Re-stamps `sessionDate` to `Time[0].Date`.
+- Logs `RESET_DAILY,manual=true` to the diag CSV.
+
+### 14.8.4 Auto-tighten / auto-widen on consecutive trades
+
+Four new properties (default OFF for both directions):
+
+- `AutoTightenOnLosses` (bool) + `AutoTightenLossN` (int 1–10, default 2)
+  + `AutoTightenFactor` (double 0.1–1.0, default 0.5).
+  When N consecutive losing trades occur, the agent multiplies the
+  **base** `AggressiveTrailMaxAtrFactor` by `AutoTightenFactor` and writes
+  `ADAPT_TIGHTEN` to the CSV. Tighter trail => locks profit faster on a
+  bad-rhythm day.
+- `AutoWidenOnWins` (bool) + `AutoWidenWinN` (int 1–10, default 3)
+  + `AutoWidenFactor` (double 1.0–3.0, default 1.5).
+  When N consecutive winning trades occur, multiplies base factor by
+  `AutoWidenFactor` (capped at 2.0). Looser trail => lets winners run on a
+  good-rhythm day. Logs `ADAPT_WIDEN`.
+
+The factor is restored to its base value on:
+- `ResetSessionFlags` (new RTH session).
+- `ExecuteResetDaily` (manual RESET button).
+- Whenever `AggressiveTrailMaxAtrFactor` is re-applied via the property
+  setter (so editing in the dashboard params resets the baseline too).
+
+The streak counter that opens the next adaptation is reset on the **opposite**
+outcome (a single win clears the loss streak, a single loss clears the win
+streak).
+
+### 14.8.5 ADX-aware prevDay TP-clamp skip
+
+`ADX(14)` is now instantiated in `State.Configure` (`indAdx`).
+
+Two new properties (group `1 - Risk`):
+
+- `SkipPrevDayClampOnHighAdx` (bool, default ON).
+- `HighAdxThreshold` (double 15–60, default 28).
+
+In both `ArmHiddenStops` and `ResizeHiddenStops` the prevDay TP clamp
+is now gated:
+
+`
+clampAllowed = !skipPrevDayClampOnHighAdx || indAdx[0] < highAdxThreshold;
+`
+
+When the clamp is skipped a `CLAMP_SKIP` row is logged with the live ADX
+value so post-trade we can confirm whether a runaway profit was due to the
+heuristic firing.
+
+### 14.8.6 Extended diagnostic CSV
+
+The CSV header is now:
+
+`
+DateTime,Bar,Close,VWAP,EmaF,EmaS,RSI,ATR,ADX,RawBull,RawBear,Bull,Bear,Tape,htfBias,trapScore,Pos,Qty,AvgEntry,HiddenSL,HiddenTP,TrailPx,TrailTier,ManualOff,ConsecLoss,ConsecWin,DailyPnL,Action,Detail
+`
+
+Every row now carries the live position context (direction, qty, entry,
+hidden SL/TP, trail price + tier, manual trail offset, both streak counters
+and the running daily PnL) so a single CSV is enough for post-trade replay
+without needing to cross-reference Print logs.
+
+**Backwards compatibility note**: any pivot/spreadsheet built against the
+17-column 14.x header must be re-built against the new 29-column 14.8 header.
