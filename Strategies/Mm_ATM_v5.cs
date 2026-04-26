@@ -190,13 +190,17 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double        aggrTrailDistPts            = 2.0;   // Trail distance 2pt
         private double        aggrPullbackAtrFactor       = 0.4;   // Adverse 0.4xATR after peak -> exit
         private int           aggrPullbackMaxBars         = 2;     // Pullback exit valid within N bars after entry
-        // ----- AGGR adverse-exit (anti stop-hunt) — fires when trade NEVER showed profit -----
+        // ----- AGGR adverse-exit (anti stop-hunt) — fires when trade NEVER showed meaningful profit -----
         private bool          aggrAdverseExitEnabled      = true;  // When AGGR ON: exit if trade has never been green and adverse >= factor*ATR
         private int           aggrAdverseMaxBars          = 2;     // Valid within N bars after entry
-        private double        aggrAdverseAtrFactor        = 0.5;   // Adverse >= this x ATR -> bail before full SL hit
+        private double        aggrAdverseAtrFactor        = 0.4;   // Adverse >= this x ATR -> bail before full SL hit
         private double        aggrAdverseMinPts           = 3.0;   // Floor: minimum adverse points to trigger (avoids tick noise)
-        // ----- AGGR static-SL cap — caps catastrophic loss when AGGR is ON -----
-        private double        aggrSlCapPoints             = 12.0;  // 0=disabled. When AGGR ON, SL distance capped at this many points.
+        private double        aggrAdverseDisarmPeak       = 3.0;   // If trade ever reached >= this peak profit (pts), disarm adverse-exit (let it ride)
+        // ----- AGGR static-SL cap — OFF by default; raise only if you want a hard cap. -----
+        // NOTE: 12pt cap was tested and WORSENED results because NQ first-bar wicks routinely
+        // hit 10-15pt on volatile mornings, killing trades that would have run to peak +22pt.
+        // Leave at 0 (disabled). The AGGR adverse + pullback exits already protect capital correctly.
+        private double        aggrSlCapPoints             = 0.0;   // 0=disabled. When >0 and AGGR ON, SL distance capped at this many points.
         // ----- SL-cluster cooldown — pauses entries after consecutive SL exits in a short window -----
         private bool          slClusterCooldownEnabled    = true;
         private int           slClusterCount              = 2;     // After this many SL exits within window -> cooldown
@@ -487,13 +491,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                     aggrPullbackMaxBars         = 2;
                     aggrAdverseExitEnabled      = true;
                     aggrAdverseMaxBars          = 2;
-                    aggrAdverseAtrFactor        = 0.5;
+                    aggrAdverseAtrFactor        = 0.4;
                     aggrAdverseMinPts           = 3.0;
-                    aggrSlCapPoints             = 12.0;
+                    aggrAdverseDisarmPeak       = 3.0;
+                    aggrSlCapPoints             = 0.0;
                     slClusterCooldownEnabled    = true;
                     slClusterCount              = 2;
-                    slClusterWindowMin          = 60;
-                    slClusterCooldownMin        = 15;
+                    slClusterWindowMin          = 90;
+                    slClusterCooldownMin        = 25;
                     chopFilterEnabled           = true;
                     chopAdxMin                  = 18.0;
                     chopAdxFallingBars          = 3;
@@ -932,6 +937,39 @@ namespace NinjaTrader.NinjaScript.Strategies
                 double ask = GetCurrentAsk(0); if (ask > 0) priceShort = ask;
             }
 
+            // ===== AGGR ADVERSE EXIT (PREEMPTS STATIC SL) =====
+            // When AGGR is ON and trade is going wrong fast, bail BEFORE the static SL hits so
+            // we lose -$160 instead of -$400. Trending winners that quickly show profit are immune
+            // (disarmed once peak profit >= aggrAdverseDisarmPeak).
+            if (aggressiveExitsEnabled && aggrAdverseExitEnabled
+                && openTradeDirection != 0
+                && (CurrentBar - entryBar) <= aggrAdverseMaxBars
+                && trailMaxProfitPts < aggrAdverseDisarmPeak
+                && lastFastReversalBar != CurrentBar
+                && indAtr != null && indAtr[0] > 0)
+            {
+                double tickPtAdv = TickSize * NQ_TICKS_PER_POINT;
+                double atrPtsAdv = indAtr[0] / tickPtAdv;
+                double pxAdv = openTradeDirection == 1 ? priceLong : priceShort;
+                double profitPtsAdv = openTradeDirection == 1
+                    ? (pxAdv - averageEntryPrice) / tickPtAdv
+                    : (averageEntryPrice - pxAdv) / tickPtAdv;
+                if (profitPtsAdv > trailMaxProfitPts) trailMaxProfitPts = profitPtsAdv; // keep peak fresh
+                double adverse = -profitPtsAdv;
+                double adverseTrigger = Math.Max(aggrAdverseMinPts, aggrAdverseAtrFactor * atrPtsAdv);
+                if (adverse >= adverseTrigger)
+                {
+                    lastFastReversalBar = CurrentBar;
+                    lastExitReason = "AGGR_ADVERSE";
+                    if (enableDiagLog) WriteDiagRow("AGGR_ADVERSE_EXIT", "adv=" + adverse.ToString("F1") + " trig=" + adverseTrigger.ToString("F1") + " bars=" + (CurrentBar - entryBar) + " peak=" + trailMaxProfitPts.ToString("F1"));
+                    Print(TAG + "AGGR ADVERSE EXIT  adverse=" + adverse.ToString("F1") + " trigger=" + adverseTrigger.ToString("F1"));
+                    if (openTradeDirection == 1) ExitLong(" ", " ");
+                    else if (openTradeDirection == -1) ExitShort(" ", " ");
+                    stopsArmed = false; pendingExit = true;
+                    return;
+                }
+            }
+
             // SMART BE — dynamic trigger and ratcheting micro-BE
             //  Trigger = max(BreakevenAtPoints, 0.5×ATR, 0.4×TP)  — prevents firing too early on volatile NQ
             //  Lock 1: at trigger → SL = entry + 2 ticks (locks $10 + commission cushion)
@@ -1075,24 +1113,20 @@ namespace NinjaTrader.NinjaScript.Strategies
                 : Math.Max(trailActivationPoints, atrPts * 0.4);
             bool htfAgrees = (openTradeDirection == 1 && htfBias > 0) || (openTradeDirection == -1 && htfBias < 0);
 
-            // AGGR ADVERSE EXIT (anti stop-hunt): if AGGR is ON and the trade has NEVER been in profit
-            // beyond a small floor, and adverse excursion has reached factor*ATR within N bars,
-            // bail out before the full SL hits. Catches the "entry, instant 15-20pt spike against us,
-            // straight to SL" pattern that bleeds the most money. Trending winners (which always show
-            // peak > floor) are NEVER affected by this rule.
-            if (aggressiveExitsEnabled && aggrAdverseExitEnabled
+            // AGGR ADVERSE EXIT (DEPRECATED HERE — now runs at top of MonitorHiddenStops so it can
+            // preempt the static SL). Kept as a no-op fallback for safety.
+            if (false && aggressiveExitsEnabled && aggrAdverseExitEnabled
                 && (CurrentBar - entryBar) <= aggrAdverseMaxBars
-                && trailMaxProfitPts < 1.0
+                && trailMaxProfitPts < aggrAdverseDisarmPeak
                 && lastFastReversalBar != CurrentBar)
             {
-                double adverse = -profitPts; // positive when underwater
+                double adverse = -profitPts;
                 double adverseTrigger = Math.Max(aggrAdverseMinPts, aggrAdverseAtrFactor * atrPts);
                 if (adverse >= adverseTrigger)
                 {
                     lastFastReversalBar = CurrentBar;
                     lastExitReason = "AGGR_ADVERSE";
                     if (enableDiagLog) WriteDiagRow("AGGR_ADVERSE_EXIT", "adv=" + adverse.ToString("F1") + " trig=" + adverseTrigger.ToString("F1") + " bars=" + (CurrentBar - entryBar));
-                    Print(TAG + "AGGR ADVERSE EXIT  adverse=" + adverse.ToString("F1") + " trigger=" + adverseTrigger.ToString("F1"));
                     if (openTradeDirection == 1) ExitLong();
                     else if (openTradeDirection == -1) ExitShort();
                     pendingExit = true;
@@ -4147,7 +4181,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         [NinjaScriptProperty]
         [Display(Name = "Aggr Adverse Exit Enabled", Order = 7, GroupName = "12 - Aggressive Exits",
-            Description = "Anti stop-hunt: when AGGR ON, if a trade NEVER reached profit and goes adverse by AggrAdverseAtrFactor x ATR (or AggrAdverseMinPts) within AggrAdverseMaxBars of entry, exit at market BEFORE the full SL hits. Trending winners (which always show profit) are NEVER affected. Default ON.")]
+            Description = "Anti stop-hunt: when AGGR ON, if a trade NEVER reached AggrAdverseDisarmPeak profit and goes adverse by AggrAdverseAtrFactor x ATR (or AggrAdverseMinPts) within AggrAdverseMaxBars of entry, exit at market BEFORE the full SL hits. Runs at top of MonitorHiddenStops so it preempts the static SL. Trending winners (which quickly show profit) are immune. Default ON.")]
         public bool AggrAdverseExitEnabled { get { return aggrAdverseExitEnabled; } set { aggrAdverseExitEnabled = value; } }
 
         [NinjaScriptProperty][Range(1, 10)]
@@ -4157,7 +4191,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         [NinjaScriptProperty][Range(0.1, 2.0)]
         [Display(Name = "Aggr Adverse (x ATR)", Order = 9, GroupName = "12 - Aggressive Exits",
-            Description = "Adverse excursion threshold as multiple of ATR. Default 0.5 (e.g. ATR 14pt → trigger at 7pt adverse).")]
+            Description = "Adverse excursion threshold as multiple of ATR. Default 0.4 (e.g. ATR 26pt -> trigger at 10.4pt adverse).")]
         public double AggrAdverseAtrFactor { get { return aggrAdverseAtrFactor; } set { aggrAdverseAtrFactor = value; } }
 
         [NinjaScriptProperty][Range(1.0, 20.0)]
@@ -4165,9 +4199,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             Description = "Minimum adverse points to trigger (floor; avoids tick noise on very low ATR). Default 3.0.")]
         public double AggrAdverseMinPts { get { return aggrAdverseMinPts; } set { aggrAdverseMinPts = value; } }
 
+        [NinjaScriptProperty][Range(0.5, 20.0)]
+        [Display(Name = "Aggr Adverse Disarm Peak (pts)", Order = 11, GroupName = "12 - Aggressive Exits",
+            Description = "Once trade peak profit reaches this many points, the adverse-exit is disarmed for this trade and AGGR_PULLBACK / trail take over. Default 3.0 (lets short blips disarm noise-only entries while still protecting fast-collapsing trades).")]
+        public double AggrAdverseDisarmPeak { get { return aggrAdverseDisarmPeak; } set { aggrAdverseDisarmPeak = value; } }
+
         [NinjaScriptProperty][Range(0.0, 50.0)]
-        [Display(Name = "Aggr SL Cap (pts, 0=off)", Order = 11, GroupName = "12 - Aggressive Exits",
-            Description = "When AGGR ON, the static stop-loss distance is capped at this many points (catastrophe brake). Set 0 to disable cap and use the global SL. Default 12 (= -$240 max per NQ contract). Trail is unaffected — runners can still ride to T4-Big.")]
+        [Display(Name = "Aggr SL Cap (pts, 0=off)", Order = 12, GroupName = "12 - Aggressive Exits",
+            Description = "When AGGR ON, the static stop-loss distance is capped at this many points. Default 0 (DISABLED). Testing showed that capping below 18pt on NQ kills trend trades on first-bar wicks. The AGGR adverse + pullback exits already handle capital protection. Only enable (>=18) if you want a hard catastrophe brake.")]
         public double AggrSlCapPoints { get { return aggrSlCapPoints; } set { aggrSlCapPoints = value; } }
 
         // ===== Group 13 — Chop Filter (manual + auto) =====
@@ -4259,12 +4298,12 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         [NinjaScriptProperty][Range(5, 240)]
         [Display(Name = "SL Cluster Window (min)", Order = 3, GroupName = "15 - SL Cluster Cooldown",
-            Description = "Sliding window in minutes used to count recent SL exits. Default 60.")]
+            Description = "Sliding window in minutes used to count recent SL exits. Default 90.")]
         public int SlClusterWindowMin { get { return slClusterWindowMin; } set { slClusterWindowMin = value; } }
 
         [NinjaScriptProperty][Range(1, 120)]
         [Display(Name = "SL Cluster Cooldown (min)", Order = 4, GroupName = "15 - SL Cluster Cooldown",
-            Description = "Block new entries for this many minutes after the cluster trigger fires. Default 15.")]
+            Description = "Block new entries for this many minutes after the cluster trigger fires. Default 25.")]
         public int SlClusterCooldownMin { get { return slClusterCooldownMin; } set { slClusterCooldownMin = value; } }
 
         [NinjaScriptProperty][Range(2, 50)]
