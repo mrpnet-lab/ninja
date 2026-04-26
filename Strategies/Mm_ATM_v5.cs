@@ -182,6 +182,35 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int           fastReversalMaxBars         = 4;     // only within first N bars after entry
         private double        fastReversalAdverseMinPts   = 4.0;   // hard floor: ignore tiny adverse moves
         private int           lastFastReversalBar         = -1;    // throttle so we only fire once per trade
+        // ----- Time-of-day SL sizing (item: customizable) -----
+        // SL = baseSlPoints × multiplier_for_current_window. Three customizable windows.
+        // If multiple overlap, FIRST match wins (Open > Close > Midday in eval order).
+        private bool          timeOfDaySlSizingEnabled    = true;
+        private int           sodOpenStart                = 93000;
+        private int           sodOpenEnd                  = 103000;
+        private double        sodOpenSlMult               = 1.30;   // wider on the open (volatile)
+        private int           sodMiddayStart              = 103000;
+        private int           sodMiddayEnd                = 140000;
+        private double        sodMiddaySlMult             = 0.80;   // tighter in chop
+        private int           sodCloseStart               = 150000;
+        private int           sodCloseEnd                 = 160000;
+        private double        sodCloseSlMult              = 1.20;   // wider near close (whipsaw)
+        // ----- News blackout window (item: customizable) -----
+        // Block ALL entries within ±NewsBlackoutWindowMin of any time in NewsBlackoutTimes.
+        // Times are comma-separated HHMMSS (e.g. "083000,100000,140000").
+        private bool          newsBlackoutEnabled         = true;
+        private string        newsBlackoutTimes           = "083000,100000,140000";  // CPI/PPI, ISM, FOMC
+        private int           newsBlackoutWindowMin       = 2;
+        private int[]         newsBlackoutMinutesCache;             // parsed from newsBlackoutTimes (minutes since midnight)
+        // ----- Liquidity-sweep entry boost (item: smarter MM-detection bonus) -----
+        // If last bar wicked beyond N-bar high/low then closed back inside (classic stop-run),
+        // BOOST opposite-direction signals: bypass overextension + lower effective min-confidence.
+        private bool          liquiditySweepBoostEnabled  = true;
+        private int           liquiditySweepLookback      = 30;
+        private double        liquiditySweepConfBoost     = 8.0;    // points subtracted from effMin
+        // ----- Auto-DCA disable on loss streak -----
+        private bool          suppressDcaOnLossStreak     = true;
+        private int           suppressDcaLossN            = 2;
         private volatile bool pendingPositionFlat;
         private volatile bool pendingExit;
         private int  pendingExitTicks;
@@ -405,6 +434,24 @@ namespace NinjaTrader.NinjaScript.Strategies
                     fastReversalAtrFactor       = 0.6;
                     fastReversalMaxBars         = 4;
                     fastReversalAdverseMinPts   = 4.0;
+                    timeOfDaySlSizingEnabled    = true;
+                    sodOpenStart                = 93000;
+                    sodOpenEnd                  = 103000;
+                    sodOpenSlMult               = 1.30;
+                    sodMiddayStart              = 103000;
+                    sodMiddayEnd                = 140000;
+                    sodMiddaySlMult             = 0.80;
+                    sodCloseStart               = 150000;
+                    sodCloseEnd                 = 160000;
+                    sodCloseSlMult              = 1.20;
+                    newsBlackoutEnabled         = true;
+                    newsBlackoutTimes           = "083000,100000,140000";
+                    newsBlackoutWindowMin       = 2;
+                    liquiditySweepBoostEnabled  = true;
+                    liquiditySweepLookback      = 30;
+                    liquiditySweepConfBoost     = 8.0;
+                    suppressDcaOnLossStreak     = true;
+                    suppressDcaLossN            = 2;
 
                     // SmartSL / JumpSL
                     breakevenAtPoints     = 8;
@@ -1266,6 +1313,81 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
+        // ===========================================================
+        //  HELPERS — time-of-day SL, news blackout, liquidity sweep
+        // ===========================================================
+        // Returns the (possibly-scaled) SL points for the current time of day.
+        // Eval order: Open window → Close window → Midday window. First match wins.
+        private int GetEffectiveSlPoints()
+        {
+            if (!timeOfDaySlSizingEnabled) return slPoints;
+            int ct = ToTime(Time[0]);
+            double mult = 1.0;
+            if (IsTimeInWindow(ct, sodOpenStart, sodOpenEnd))   mult = sodOpenSlMult;
+            else if (IsTimeInWindow(ct, sodCloseStart, sodCloseEnd)) mult = sodCloseSlMult;
+            else if (IsTimeInWindow(ct, sodMiddayStart, sodMiddayEnd)) mult = sodMiddaySlMult;
+            int eff = (int)Math.Round(slPoints * mult);
+            return Math.Max(2, eff); // never below 2pt
+        }
+
+        // Inclusive of start, exclusive of end. Handles wrap-around (start > end).
+        private bool IsTimeInWindow(int t, int start, int end)
+        {
+            if (start <= end) return t >= start && t < end;
+            return t >= start || t < end;
+        }
+
+        // News blackout: convert HHMMSS → minutes-of-day, check against parsed cache.
+        private bool IsInNewsBlackout()
+        {
+            if (newsBlackoutMinutesCache == null) ParseNewsBlackoutTimes();
+            if (newsBlackoutMinutesCache == null || newsBlackoutMinutesCache.Length == 0) return false;
+            int ct = ToTime(Time[0]);
+            int curMin = (ct / 10000) * 60 + ((ct / 100) % 100);
+            for (int i = 0; i < newsBlackoutMinutesCache.Length; i++)
+                if (Math.Abs(curMin - newsBlackoutMinutesCache[i]) <= newsBlackoutWindowMin) return true;
+            return false;
+        }
+        private void ParseNewsBlackoutTimes()
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(newsBlackoutTimes)) { newsBlackoutMinutesCache = new int[0]; return; }
+                var parts = newsBlackoutTimes.Split(new[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                var list = new System.Collections.Generic.List<int>();
+                foreach (var p in parts)
+                {
+                    int t;
+                    if (int.TryParse(p.Trim(), out t) && t >= 0 && t <= 235959)
+                        list.Add((t / 10000) * 60 + ((t / 100) % 100));
+                }
+                newsBlackoutMinutesCache = list.ToArray();
+            }
+            catch (Exception ex) { Print(TAG + "ParseNewsBlackoutTimes EX: " + ex.Message); newsBlackoutMinutesCache = new int[0]; }
+        }
+
+        // Liquidity-sweep detection (classic MM stop-run reversal):
+        //   Bull sweep: prior bar Low broke below N-bar low THEN closed back above that level
+        //               by >= 0.3×ATR — BUY signal.
+        //   Bear sweep: mirror image.
+        private bool IsLiquiditySweepBull()
+        {
+            if (CurrentBar < liquiditySweepLookback + 2 || indAtr == null || indAtr[0] <= 0) return false;
+            double prevLow = double.MaxValue;
+            for (int i = 2; i <= liquiditySweepLookback + 1; i++) if (Low[i] < prevLow) prevLow = Low[i];
+            double atr = indAtr[0];
+            // Bar 1 wicked below, closed back above by 30% of ATR
+            return Low[1] < prevLow && Close[1] >= prevLow + 0.3 * atr;
+        }
+        private bool IsLiquiditySweepBear()
+        {
+            if (CurrentBar < liquiditySweepLookback + 2 || indAtr == null || indAtr[0] <= 0) return false;
+            double prevHigh = double.MinValue;
+            for (int i = 2; i <= liquiditySweepLookback + 1; i++) if (High[i] > prevHigh) prevHigh = High[i];
+            double atr = indAtr[0];
+            return High[1] > prevHigh && Close[1] <= prevHigh - 0.3 * atr;
+        }
+
 
         // ===========================================================
         //  TRAP DETECTOR + STOP-HUNT
@@ -1365,6 +1487,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (pendingExit) { UpdateDashboardStatus(label + " blocked: exit pending", Brushes.Orange); return false; }
             if (dailyLimitHit || dailyProfitHit) { UpdateDashboardStatus(label + " blocked: daily limit", Brushes.OrangeRed); return false; }
             if (emergencyKillActive) { UpdateDashboardStatus(label + " blocked: KILL", Brushes.OrangeRed); return false; }
+            // News blackout (manual + auto)
+            if (newsBlackoutEnabled && IsInNewsBlackout())
+            { UpdateDashboardStatus(label + " blocked: NEWS blackout ±" + newsBlackoutWindowMin + "min", Brushes.Orange); if (enableDiagLog) WriteDiagRow("BLOCK_NEWS", label); return false; }
             if (enteredThisBar && !allowMultiEntryPerBar) { UpdateDashboardStatus(label + " blocked: already entered this bar", Brushes.Orange); return false; }
             if (maxTradesPerDay > 0 && !isManual && dailyTradeCount >= maxTradesPerDay
                 && Position.MarketPosition == MarketPosition.Flat)
@@ -1381,6 +1506,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                             || (direction == -1 && Position.MarketPosition == MarketPosition.Short);
                 if (sameDir && Position.Quantity >= maxContracts)
                 { UpdateDashboardStatus("Max contracts (" + maxContracts + ")", Brushes.Orange); return false; }
+                // Suppress same-direction DCA add after consecutive losses (capital protection)
+                if (sameDir && suppressDcaOnLossStreak && consecutiveLosses >= suppressDcaLossN)
+                { UpdateDashboardStatus(label + " blocked: DCA suppressed (" + consecutiveLosses + " losses)", Brushes.Orange); if (enableDiagLog) WriteDiagRow("BLOCK_DCA", "consec=" + consecutiveLosses); return false; }
             }
             if (entryDelaySeconds > 0
                 && ((State == State.Realtime ? DateTime.Now : Time[0]) - lastEntryWallTime).TotalSeconds < entryDelaySeconds)
@@ -1436,12 +1564,24 @@ namespace NinjaTrader.NinjaScript.Strategies
             bool tapeBlockL = orderFlowFilterEnabled && tape < -0.3;
             bool tapeBlockS = orderFlowFilterEnabled && tape >  0.3;
 
-            if (lastBullConfidence >= effMin && !rsiDown && !overLong && !nearH && !volSpike
+            // Liquidity-sweep boost: classic MM stop-hunt reversal pattern
+            //   Bull sweep => boost LONG (and let it bypass overextension)
+            //   Bear sweep => boost SHORT (and let it bypass overextension)
+            bool sweepBull = liquiditySweepBoostEnabled && IsLiquiditySweepBull();
+            bool sweepBear = liquiditySweepBoostEnabled && IsLiquiditySweepBear();
+            double effMinL = sweepBull ? Math.Max(35.0, effMin - liquiditySweepConfBoost) : effMin;
+            double effMinS = sweepBear ? Math.Max(35.0, effMin - liquiditySweepConfBoost) : effMin;
+            if (sweepBull) overLong  = false;
+            if (sweepBear) overShort = false;
+            if ((sweepBull || sweepBear) && enableDiagLog)
+                WriteDiagRow("SWEEP_BOOST", "bull=" + sweepBull + " bear=" + sweepBear + " lookback=" + liquiditySweepLookback);
+
+            if (lastBullConfidence >= effMinL && !rsiDown && !overLong && !nearH && !volSpike
                 && !htfBlockL && !tapeBlockL)
             {
                 ExecuteLongEntry(false);
             }
-            else if (lastBearConfidence >= effMin && !rsiUp && !overShort && !nearL && !volSpike
+            else if (lastBearConfidence >= effMinS && !rsiUp && !overShort && !nearL && !volSpike
                 && !htfBlockS && !tapeBlockS)
             {
                 ExecuteShortEntry(false);
@@ -1563,7 +1703,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                             || (openTradeDirection == -1 && htfBias < 0);
             int effTp = runnerModeActive ? 500 : tpPoints;
             double tickPt = NQ_TICKS_PER_POINT * TickSize;
-            double slOff = slPoints * tickPt;
+            int effSl = GetEffectiveSlPoints();
+            double slOff = effSl * tickPt;
             double tpOff = effTp * tickPt;
             breakevenLocked = false;
             entryBar = CurrentBar;
@@ -1614,12 +1755,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             double newSl, newTp;
             if (openTradeDirection == 1)
             {
-                newSl = averageEntryPrice - (slPoints * tickPt);
+                newSl = averageEntryPrice - (GetEffectiveSlPoints() * tickPt);
                 newTp = averageEntryPrice + ((runnerModeActive ? 500 : tpPoints) * tickPt);
             }
             else
             {
-                newSl = averageEntryPrice + (slPoints * tickPt);
+                newSl = averageEntryPrice + (GetEffectiveSlPoints() * tickPt);
                 newTp = averageEntryPrice - ((runnerModeActive ? 500 : tpPoints) * tickPt);
             }
             // PrevDay clamp on TP
@@ -3578,7 +3719,99 @@ namespace NinjaTrader.NinjaScript.Strategies
         [NinjaScriptProperty][Range(1.0, 20.0)]
         [Display(Name = "Fast Reversal Min Adverse (pts)", Order = 12, GroupName = "1 - Risk",
             Description = "Hard floor — never fire fast-exit unless adverse is at least this many points (avoids over-reacting to noise). Default 4.")]
-        public double FastReversalMinAdversePts { get { return fastReversalAdverseMinPts; } set { fastReversalAdverseMinPts = value; } }        [NinjaScriptProperty][Range(2, 50)]
+        public double FastReversalMinAdversePts { get { return fastReversalAdverseMinPts; } set { fastReversalAdverseMinPts = value; } }
+
+        // ===== Group 8 — Time-of-day SL sizing (customizable windows) =====
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Time-of-Day SL Sizing", Order = 1, GroupName = "8 - Time-of-Day SL",
+            Description = "Multiply base SL by per-window factor. Open/Close = wider, Midday = tighter. Default ON.")]
+        public bool TimeOfDaySlSizingEnabled { get { return timeOfDaySlSizingEnabled; } set { timeOfDaySlSizingEnabled = value; } }
+
+        [NinjaScriptProperty][Range(0, 235959)]
+        [Display(Name = "Open Window Start (HHMMSS)", Order = 2, GroupName = "8 - Time-of-Day SL")]
+        public int SodOpenStart { get { return sodOpenStart; } set { sodOpenStart = value; } }
+
+        [NinjaScriptProperty][Range(0, 235959)]
+        [Display(Name = "Open Window End (HHMMSS)", Order = 3, GroupName = "8 - Time-of-Day SL")]
+        public int SodOpenEnd { get { return sodOpenEnd; } set { sodOpenEnd = value; } }
+
+        [NinjaScriptProperty][Range(0.3, 3.0)]
+        [Display(Name = "Open SL Multiplier", Order = 4, GroupName = "8 - Time-of-Day SL",
+            Description = "Multiplier applied to base SL during the Open window (default 1.30 = wider).")]
+        public double SodOpenSlMult { get { return sodOpenSlMult; } set { sodOpenSlMult = value; } }
+
+        [NinjaScriptProperty][Range(0, 235959)]
+        [Display(Name = "Midday Window Start (HHMMSS)", Order = 5, GroupName = "8 - Time-of-Day SL")]
+        public int SodMiddayStart { get { return sodMiddayStart; } set { sodMiddayStart = value; } }
+
+        [NinjaScriptProperty][Range(0, 235959)]
+        [Display(Name = "Midday Window End (HHMMSS)", Order = 6, GroupName = "8 - Time-of-Day SL")]
+        public int SodMiddayEnd { get { return sodMiddayEnd; } set { sodMiddayEnd = value; } }
+
+        [NinjaScriptProperty][Range(0.3, 3.0)]
+        [Display(Name = "Midday SL Multiplier", Order = 7, GroupName = "8 - Time-of-Day SL",
+            Description = "Multiplier applied during the Midday window (default 0.80 = tighter, chop).")]
+        public double SodMiddaySlMult { get { return sodMiddaySlMult; } set { sodMiddaySlMult = value; } }
+
+        [NinjaScriptProperty][Range(0, 235959)]
+        [Display(Name = "Close Window Start (HHMMSS)", Order = 8, GroupName = "8 - Time-of-Day SL")]
+        public int SodCloseStart { get { return sodCloseStart; } set { sodCloseStart = value; } }
+
+        [NinjaScriptProperty][Range(0, 235959)]
+        [Display(Name = "Close Window End (HHMMSS)", Order = 9, GroupName = "8 - Time-of-Day SL")]
+        public int SodCloseEnd { get { return sodCloseEnd; } set { sodCloseEnd = value; } }
+
+        [NinjaScriptProperty][Range(0.3, 3.0)]
+        [Display(Name = "Close SL Multiplier", Order = 10, GroupName = "8 - Time-of-Day SL",
+            Description = "Multiplier applied during the Close window (default 1.20 = wider, whipsaw).")]
+        public double SodCloseSlMult { get { return sodCloseSlMult; } set { sodCloseSlMult = value; } }
+
+        // ===== Group 9 — News blackout (customizable times) =====
+        [NinjaScriptProperty]
+        [Display(Name = "Enable News Blackout", Order = 1, GroupName = "9 - News Blackout",
+            Description = "Block all entries within ± window-min of any time in News Blackout Times. Default ON.")]
+        public bool NewsBlackoutEnabled { get { return newsBlackoutEnabled; } set { newsBlackoutEnabled = value; } }
+
+        [NinjaScriptProperty]
+        [Display(Name = "News Blackout Times (CSV HHMMSS)", Order = 2, GroupName = "9 - News Blackout",
+            Description = "Comma-separated HHMMSS times. Default '083000,100000,140000' = CPI/PPI 8:30, ISM 10:00, FOMC 14:00 ET.")]
+        public string NewsBlackoutTimes
+        {
+            get { return newsBlackoutTimes; }
+            set { newsBlackoutTimes = value; newsBlackoutMinutesCache = null; }
+        }
+
+        [NinjaScriptProperty][Range(0, 60)]
+        [Display(Name = "News Blackout Window (min)", Order = 3, GroupName = "9 - News Blackout",
+            Description = "± minutes around each blackout time during which entries are blocked. Default 2.")]
+        public int NewsBlackoutWindowMin { get { return newsBlackoutWindowMin; } set { newsBlackoutWindowMin = value; } }
+
+        // ===== Group 10 — Liquidity sweep (anti-MM bonus) =====
+        [NinjaScriptProperty]
+        [Display(Name = "Liquidity Sweep Boost", Order = 1, GroupName = "10 - Liquidity Sweep",
+            Description = "If prior bar wicked past N-bar high/low then closed back inside, BOOST opposite-direction signals (lower min-confidence and bypass overextension). Default ON.")]
+        public bool LiquiditySweepBoostEnabled { get { return liquiditySweepBoostEnabled; } set { liquiditySweepBoostEnabled = value; } }
+
+        [NinjaScriptProperty][Range(5, 200)]
+        [Display(Name = "Liquidity Sweep Lookback (bars)", Order = 2, GroupName = "10 - Liquidity Sweep",
+            Description = "How many bars to look back for the prior swing high/low. Default 30.")]
+        public int LiquiditySweepLookback { get { return liquiditySweepLookback; } set { liquiditySweepLookback = value; } }
+
+        [NinjaScriptProperty][Range(0.0, 30.0)]
+        [Display(Name = "Liquidity Sweep Conf Boost", Order = 3, GroupName = "10 - Liquidity Sweep",
+            Description = "Points subtracted from required min-signal-confidence when sweep is detected (effective floor 35). Default 8.")]
+        public double LiquiditySweepConfBoost { get { return liquiditySweepConfBoost; } set { liquiditySweepConfBoost = value; } }
+
+        // ===== Group 11 — DCA suppression =====
+        [NinjaScriptProperty]
+        [Display(Name = "Suppress DCA on Loss Streak", Order = 1, GroupName = "11 - DCA Suppression",
+            Description = "After N consecutive losses, block same-direction adds to the open position (saves capital on choppy days). Default ON.")]
+        public bool SuppressDcaOnLossStreak { get { return suppressDcaOnLossStreak; } set { suppressDcaOnLossStreak = value; } }
+
+        [NinjaScriptProperty][Range(1, 10)]
+        [Display(Name = "Suppress DCA After N Losses", Order = 2, GroupName = "11 - DCA Suppression",
+            Description = "Consecutive-loss threshold above which DCA adds are blocked. Default 2.")]
+        public int SuppressDcaLossN { get { return suppressDcaLossN; } set { suppressDcaLossN = value; } }        [NinjaScriptProperty][Range(2, 50)]
         [Display(Name = "Breakeven At (pts)", Order = 5, GroupName = "3 - Trail / SL")]
         public int BreakevenAtPoints { get { return breakevenAtPoints; } set { breakevenAtPoints = value; } }
 

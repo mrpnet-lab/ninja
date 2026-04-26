@@ -942,3 +942,78 @@ without needing to cross-reference Print logs.
 
 **Backwards compatibility note**: any pivot/spreadsheet built against the
 17-column 14.x header must be re-built against the new 29-column 14.8 header.
+
+---
+
+## 14.10 — Smarter than MM/algos: TOD-SL, news blackout, sweep boost, DCA suppression
+
+This revision adds four customization layers — every threshold/window/factor is a NinjaScript property so each user can tune to their account size and instrument.
+
+### 14.10.1 Time-of-Day SL sizing  (Group `8 - Time-of-Day SL`)
+
+The hidden SL distance now adapts to the time of day. Three windows (Open / Midday / Close), each with its own multiplier on the base `slPoints`. Eval order: **Open ? Close ? Midday** (first match wins). Outside any window the base SL is used unchanged.
+
+| Window | Default times (HHMMSS) | Default mult | Rationale |
+|---|---|---|---|
+| Open    | 09:30:00 – 10:30:00 | **1.30** | Wider — opening expansion can wick 6-12pt before settling |
+| Midday  | 10:30:00 – 14:00:00 | **0.80** | Tighter — chop, low-ATR; tighter SL preserves the small wins |
+| Close   | 15:00:00 – 16:00:00 | **1.20** | Wider — power-hour whipsaws can sweep stops both directions |
+
+Internal helper `GetEffectiveSlPoints()` returns `round(slPoints × mult)` clamped to a 2pt floor. It's called from `ArmHiddenStops` and both branches of `ResizeHiddenStops`. Wrap-around windows (start > end) are supported, e.g. you could define an overnight session window.
+
+Properties:
+- `TimeOfDaySlSizingEnabled` (bool, default ON).
+- `SodOpenStart` / `SodOpenEnd` (HHMMSS) + `SodOpenSlMult`.
+- `SodMiddayStart` / `SodMiddayEnd` + `SodMiddaySlMult`.
+- `SodCloseStart` / `SodCloseEnd` + `SodCloseSlMult`.
+
+### 14.10.2 News blackout window  (Group `9 - News Blackout`)
+
+Block ALL entries (manual + auto) within ± window-min of any time in a CSV list of HHMMSS times. The list is parsed once, cached as minutes-since-midnight; when `NewsBlackoutTimes` is changed via the UI the cache invalidates and re-parses on next entry attempt.
+
+Default times (ET): **08:30** (CPI/PPI/NFP), **10:00** (ISM/JOLTS), **14:00** (FOMC). Default window: **±2 minutes**.
+
+A `BLOCK_NEWS` row is written to the diag CSV every time an entry attempt is suppressed.
+
+Properties:
+- `NewsBlackoutEnabled` (bool, default ON).
+- `NewsBlackoutTimes` (string, comma-separated HHMMSS).
+- `NewsBlackoutWindowMin` (int 0–60, default 2).
+
+### 14.10.3 Liquidity-sweep boost  (Group `10 - Liquidity Sweep`)
+
+Classic MM stop-run reversal:
+- **Bull sweep** = bar [-1] Low broke below the prior N-bar Low **AND** Close[-1] = that prior low + 0.3 × ATR (closed back above the swept level).
+- **Bear sweep** = mirror image of above.
+
+When detected, the **opposite-direction** signal is boosted in two ways:
+1. `effMin` is reduced by `LiquiditySweepConfBoost` points (floor 35).
+2. The `overLong` / `overShort` overextension veto is bypassed for that direction.
+
+This lets the strategy *participate* in the kind of move where MMs sweep one side then reverse — exactly the inverse of getting trapped by it.
+
+A `SWEEP_BOOST` diag row is written whenever the boost is active.
+
+Properties:
+- `LiquiditySweepBoostEnabled` (bool, default ON).
+- `LiquiditySweepLookback` (int 5–200, default 30 bars).
+- `LiquiditySweepConfBoost` (double 0–30, default 8.0).
+
+### 14.10.4 DCA suppression on loss streak  (Group `11 - DCA Suppression`)
+
+In `CanEnterTrade`, when the requested entry is **same-direction as the open position** and `consecutiveLosses = SuppressDcaLossN`, the add is blocked with a `DCA suppressed` status banner and a `BLOCK_DCA` diag row. The block applies to BOTH manual and auto entries (DCA on a losing day rarely ends well — preserve the capital, wait for a clean win to clear the streak).
+
+Default: **2 consecutive losses** ? DCA blocked until next win clears the streak.
+
+Properties:
+- `SuppressDcaOnLossStreak` (bool, default ON).
+- `SuppressDcaLossN` (int 1–10, default 2).
+
+### 14.10.5 Diagnostic CSV additions
+
+New `Action` tags introduced this revision:
+- `BLOCK_NEWS` — entry attempt blocked by news blackout.
+- `BLOCK_DCA` — same-direction add blocked by loss-streak suppression.
+- `SWEEP_BOOST` — sweep detected and boost active for this bar.
+
+(Existing 29-column header is unchanged; these tags use the existing `Action,Detail` slots.)
