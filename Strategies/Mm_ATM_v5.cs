@@ -215,6 +215,15 @@ namespace NinjaTrader.NinjaScript.Strategies
         private DateTime[]    slExitTimes;                          // ring buffer of recent SL-exit timestamps
         private int           slExitTimesIndex;
         private DateTime      slClusterCooldownUntil      = DateTime.MinValue;
+        // ----- Post-win same-direction cooldown (anti trail-and-trap) -----
+        // After a winning exit, the MM often reverses price 1-2 bars to clear stops above the recent
+        // pullback before resuming trend. If we re-enter same direction within ~5min, we get caught
+        // by that very wick. This cooldown blocks same-direction re-entries for a short window after
+        // any winning exit. Doesn't apply after losses (re-entry post-loss is fine if structure justifies).
+        private bool          postWinSameDirCooldownEnabled = true;
+        private int           postWinSameDirCooldownMin     = 5;     // minutes to block same-direction re-entry after a win
+        private DateTime      lastWinExitTime               = DateTime.MinValue;
+        private int           lastWinExitDirection          = 0;     // +1=long win, -1=short win
         // ----- Chop filter (default ON, applies to manual + auto) -----
         private bool          chopFilterEnabled           = true;
         private double        chopAdxMin                  = 18.0;  // ADX below this is considered chop
@@ -505,6 +514,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                     slClusterCount              = 2;
                     slClusterWindowMin          = 90;
                     slClusterCooldownMin        = 25;
+                    postWinSameDirCooldownEnabled = true;
+                    postWinSameDirCooldownMin     = 5;
                     chopFilterEnabled           = true;
                     chopAdxMin                  = 18.0;
                     chopAdxFallingBars          = 3;
@@ -1779,6 +1790,20 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (enableDiagLog) WriteDiagRow("BLOCK_SL_CLUSTER", "cooldown_remaining_sec=" + remainSec);
                 return false;
             }
+            // Post-win same-direction cooldown (anti trail-and-trap): block re-entry in the SAME
+            // direction as the most recent winning exit for a short window. Catches MM stop-runs
+            // that ramp price against us right after our trail kicked out, then continue trend.
+            if (postWinSameDirCooldownEnabled && lastWinExitDirection != 0 && lastWinExitDirection == direction)
+            {
+                double minsSinceWin = (Time[0] - lastWinExitTime).TotalMinutes;
+                if (minsSinceWin < postWinSameDirCooldownMin)
+                {
+                    int remainSec = (int)((postWinSameDirCooldownMin - minsSinceWin) * 60);
+                    UpdateDashboardStatus(label + " blocked: POST-WIN cooldown " + remainSec + "s", Brushes.Orange);
+                    if (enableDiagLog) WriteDiagRow("BLOCK_POST_WIN", "dir=" + direction + " mins_since_win=" + minsSinceWin.ToString("F1") + " cooldown=" + postWinSameDirCooldownMin + "m");
+                    return false;
+                }
+            }
             if (enteredThisBar && !allowMultiEntryPerBar) { UpdateDashboardStatus(label + " blocked: already entered this bar", Brushes.Orange); return false; }
             if (maxTradesPerDay > 0 && !isManual && dailyTradeCount >= maxTradesPerDay
                 && Position.MarketPosition == MarketPosition.Flat)
@@ -2598,6 +2623,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 consecutiveWins++;
                                 lastLossDirection = 0;
                                 RecordTradeOutcome(true);
+                                // Track for post-win same-direction cooldown
+                                lastWinExitTime = Time[0];
+                                lastWinExitDirection = last.Entry.MarketPosition == MarketPosition.Long ? 1 : -1;
                                 if (enableDiagLog) WriteDiagRow("EXIT_WIN_" + reason, "pnl=" + last.ProfitCurrency.ToString("F2") + " consec=" + consecutiveWins);
                                 // Auto-widen on N consecutive wins
                                 if (autoWidenOnWinsEnabled && consecutiveWins >= autoWidenWinN && baseAggressiveTrailFactor > 0)
@@ -4313,6 +4341,17 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "SL Cluster Cooldown (min)", Order = 4, GroupName = "15 - SL Cluster Cooldown",
             Description = "Block new entries for this many minutes after the cluster trigger fires. Default 25.")]
         public int SlClusterCooldownMin { get { return slClusterCooldownMin; } set { slClusterCooldownMin = value; } }
+
+        // ===== Group 16 — Post-Win Same-Direction Cooldown (anti trail-and-trap) =====
+        [NinjaScriptProperty]
+        [Display(Name = "Post-Win Same-Dir Cooldown Enabled", Order = 1, GroupName = "16 - Post-Win Cooldown",
+            Description = "After a winning exit, block same-direction re-entries for PostWinSameDirCooldownMin minutes. Defends against the MM trail-and-trap: trail kicks out for small profit, MM ramps price against to clear stops, we re-enter and get hunted. Default ON.")]
+        public bool PostWinSameDirCooldownEnabled { get { return postWinSameDirCooldownEnabled; } set { postWinSameDirCooldownEnabled = value; } }
+
+        [NinjaScriptProperty][Range(1, 60)]
+        [Display(Name = "Post-Win Cooldown (min)", Order = 2, GroupName = "16 - Post-Win Cooldown",
+            Description = "Minutes to block same-direction re-entry after a winning exit. Default 5.")]
+        public int PostWinSameDirCooldownMin { get { return postWinSameDirCooldownMin; } set { postWinSameDirCooldownMin = value; } }
 
         [NinjaScriptProperty][Range(2, 50)]
         [Display(Name = "Breakeven At (pts)", Order = 5, GroupName = "3 - Trail / SL")]
