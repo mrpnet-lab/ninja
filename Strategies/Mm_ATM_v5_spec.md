@@ -740,20 +740,20 @@ if (enteredThisBar && !allowMultiEntryPerBar) return false;
 
 ---
 
-## 14.7 — Live Manual-Trader Hardening (Apr 25, 2026)
+## 14.7 ï¿½ Live Manual-Trader Hardening (Apr 25, 2026)
 
 Set of fixes after live NQ paper-trading exposed UX + correctness gaps.
 
-### Daily Profit / Loss — DOES NOT KILL THE STRATEGY
+### Daily Profit / Loss ï¿½ DOES NOT KILL THE STRATEGY
 **Behavior:** When the live or realized PnL crosses `MaxDailyProfitDollars` or `-MaxDailyLossDollars`, the strategy:
 1. Closes the open trade (`ExecuteFlatten`)
 2. Sets `dailyProfitHit` / `dailyLimitHit` so further entry attempts are *blocked*
 3. Displays a prominent banner on the dashboard:
-   - Profit: ?? gold "DAILY PROFIT TARGET $X — trade closed. Disable+Enable to resume."
-   - Loss:   ? red  "DAILY LOSS LIMIT $X — trade closed. Disable+Enable to resume."
+   - Profit: ?? gold "DAILY PROFIT TARGET $X ï¿½ trade closed. Disable+Enable to resume."
+   - Loss:   ? red  "DAILY LOSS LIMIT $X ï¿½ trade closed. Disable+Enable to resume."
 4. Logs a clarifying line: "closing trade, NOT killing strategy. Disable+Enable to resume."
 
-The strategy itself stays in `State.Realtime` — `Print` and dashboard still update. To resume trading the same session, the user toggles the strategy off/on (which re-runs `State.DataLoaded` and resets `dailyLimitHit / dailyProfitHit / emergencyKillActive` to `false`).
+The strategy itself stays in `State.Realtime` ï¿½ `Print` and dashboard still update. To resume trading the same session, the user toggles the strategy off/on (which re-runs `State.DataLoaded` and resets `dailyLimitHit / dailyProfitHit / emergencyKillActive` to `false`).
 
 ### TP draw distance + TP-not-firing-in-runner-mode (FIX)
 **Bug observed:** Label "TP 50pt | 200tk | $1000" but the green horizontal line was actually at `entry + 18pt`. Price walked through it without triggering exit; only the trail eventually closed the trade.
@@ -765,33 +765,33 @@ The strategy itself stays in `State.Realtime` — `Print` and dashboard still upda
 **Fix:**
 - New field `tpClampedByPrevDay` set in `ArmHiddenStops` and `ResizeHiddenStops` whenever a prevDay level pulls TP in.
 - TP exit gate now: `priceLong >= hiddenTargetPrice && (!runnerModeActive || tpClampedByPrevDay)`. So a clamped runner TP fires; an un-clamped 500pt runner TP still rides the trail.
-- `DrawChartAnnotations` rewritten to compute `slDistPts` and `tpDistPts` from the **actual** `hiddenStopPrice` / `hiddenTargetPrice`, not from `slPoints` / `tpPoints` properties. Adds `— PD` suffix on the TP label when prev-day-clamped, and `+` sign on SL label when SL is in profit (post-Jump SL).
+- `DrawChartAnnotations` rewritten to compute `slDistPts` and `tpDistPts` from the **actual** `hiddenStopPrice` / `hiddenTargetPrice`, not from `slPoints` / `tpPoints` properties. Adds `ï¿½ PD` suffix on the TP label when prev-day-clamped, and `+` sign on SL label when SL is in profit (post-Jump SL).
 
 ### SL +/- after Jump SL (FIX)
 **Bug:** After `JUMP SL` moved the SL into profit, pressing the SL `-` button on the dashboard did nothing.
 
-**Root cause:** Old buttons did `slPoints -= step; ResizeHiddenStops()`. `ResizeHiddenStops` recomputes from `entry - slPoints*tickPt`. After Jump SL had stored `slPoints` as a *price-distance* (not entry-distance), the formula produced a target either nonsensical or below the current SL — and `breakevenLocked = true` (set by Jump SL) blocked any relaxation.
+**Root cause:** Old buttons did `slPoints -= step; ResizeHiddenStops()`. `ResizeHiddenStops` recomputes from `entry - slPoints*tickPt`. After Jump SL had stored `slPoints` as a *price-distance* (not entry-distance), the formula produced a target either nonsensical or below the current SL ï¿½ and `breakevenLocked = true` (set by Jump SL) blocked any relaxation.
 
 **Fix:**
 - New thread-safe handler `RequestSlNudgePoints(int dPts)` enqueues `pendingSlNudge` (signed); `ProcessPendingButtons` calls `NudgeSlPricePoints(n)`.
 - `NudgeSlPricePoints` operates **directly on `hiddenStopPrice`** in price space:
-  - `-` (`dPts < 0`): WIDEN — SL moves further from price (more breathing room). Allowed regardless of `breakevenLocked`. Also widens `originalSlPrice` so trail backtrack respects the new floor.
-  - `+` (`dPts > 0`): TIGHTEN — SL moves toward price. Clamped to `price - 1tk`. Sets `breakevenLocked = true` so auto-BE doesn't undo it.
+  - `-` (`dPts < 0`): WIDEN ï¿½ SL moves further from price (more breathing room). Allowed regardless of `breakevenLocked`. Also widens `originalSlPrice` so trail backtrack respects the new floor.
+  - `+` (`dPts > 0`): TIGHTEN ï¿½ SL moves toward price. Clamped to `price - 1tk`. Sets `breakevenLocked = true` so auto-BE doesn't undo it.
 - After move, `slPoints` is reset to the actual distance from current price (matches Jump SL's convention) and dashboard refreshes immediately via `DrawChartAnnotations`.
-- Sanity floor: SL never beyond `entry ± 200pt` from current trade.
+- Sanity floor: SL never beyond `entry ï¿½ 200pt` from current trade.
 
-### Trail — extra-aggressive on huge profit
+### Trail ï¿½ extra-aggressive on huge profit
 Two new ladder rungs added to `MonitorAdaptiveTrail`:
 
 | `trailMaxProfitPts` vs activation | Multiplier on `curDist` | Tier name |
 |---|---|---|
-| `= 4× activation` | `× 0.70` | T3-Runner (existing) |
-| `= 6× activation` | additional `× 0.75` (cumulative ˜ 0.525) | T4-Big (new) |
-| `= 8× activation` | hard cap `min(curDist, max(1pt, ATR×0.25))` | T4-Big |
+| `= 4ï¿½ activation` | `ï¿½ 0.70` | T3-Runner (existing) |
+| `= 6ï¿½ activation` | additional `ï¿½ 0.75` (cumulative ï¿½ 0.525) | T4-Big (new) |
+| `= 8ï¿½ activation` | hard cap `min(curDist, max(1pt, ATRï¿½0.25))` | T4-Big |
 
 Tier-floor table now includes `T4-Big` at **65 % of `trailMaxProfitPts`** (vs 50 % for T3). On a 60-pt runner this locks ~39pt instead of 30pt.
 
-Manual nudges (`Trail ±pt`) keep flowing through the same ratchet — `manualTrailOffsetPoints` is added every pass, and tightening (`-`) takes effect *immediately* in the same handler.
+Manual nudges (`Trail ï¿½pt`) keep flowing through the same ratchet ï¿½ `manualTrailOffsetPoints` is added every pass, and tightening (`-`) takes effect *immediately* in the same handler.
 
 ### Spec doc + .md as living history
 **Convention going forward:** every behavioral or property change appends a numbered subsection here (14.x). Future-recommended enhancements are listed with status `[planned]` so they survive across sessions.
@@ -801,14 +801,14 @@ Manual nudges (`Trail ±pt`) keep flowing through the same ratchet — `manualTrail
 - Add `RESET DAILY` button on dashboard that flips `dailyLimitHit / dailyProfitHit / emergencyKillActive` to false without requiring strategy re-enable
 - Add `auto-tighten on N consecutive losses` (e.g. after 2 losses, halve `aggressiveTrailMaxAtrFactor` for 1 hour)
 - Add `auto-widen on N consecutive wins` (let winners run further)
-- Add `partial profit at 1R` toggle — close half at `1× slPoints` so worst case is BE on remainder
+- Add `partial profit at 1R` toggle ï¿½ close half at `1ï¿½ slPoints` so worst case is BE on remainder
 - Add a `DOUBLE` button that doubles current `Qty` on conviction signal (already throttled by `MaxContracts`)
 - Heuristic to skip TP-clamping by prevDay during high-ADX trend days (clamp wastes profit when trend is breaking through)
-- Live diagnostic CSV: include `hiddenTargetPrice`, `hiddenStopPrice`, `trailPrice`, `tier`, `manualTrailOffsetPoints` per row — for post-trade replay
+- Live diagnostic CSV: include `hiddenTargetPrice`, `hiddenStopPrice`, `trailPrice`, `tier`, `manualTrailOffsetPoints` per row ï¿½ for post-trade replay
 
 ---
 
-## 14.8 — Diagnostics, daily-reset & adaptive trail (this revision)
+## 14.8 ï¿½ Diagnostics, daily-reset & adaptive trail (this revision)
 
 This revision builds on 14.7 and addresses three live-trading findings:
 
@@ -844,7 +844,7 @@ diag tag as `EXIT_WIN_<reason>` or `EXIT_LOSS_<reason>`. Reasons in use:
 | `FLATTEN` | User pressed `FLATTEN` (Account.Flatten) |
 | `KILL` | User pressed `KILL` (emergency halt) |
 | `AUTO_FLATTEN` | Session-end auto-flatten at `flattenTime` |
-| `CME_MAINT` | CME maintenance auto-flatten (16:55–18:00) |
+| `CME_MAINT` | CME maintenance auto-flatten (16:55ï¿½18:00) |
 | `DAILY_LOSS` | LiveDailyPnLCheck loss-limit auto-flatten |
 | `DAILY_PROFIT` | LiveDailyPnLCheck profit-target auto-flatten |
 | `UNK` | Defensive fallback (should never appear) |
@@ -858,7 +858,7 @@ In the `State.Realtime` branch, after `ResetSessionFlags()`, when this
 property is ON the agent advances `processedTradeCount` past every existing
 `SystemPerformance.AllTrades` entry **and** zeroes `dailyRealizedPnL` /
 streak counters. Net effect: only fills that arrive **after** the restart
-contribute to today's PnL — exactly matching the user's mental model that
+contribute to today's PnL ï¿½ exactly matching the user's mental model that
 `Disable + Enable` should "start clean" for the daily limits.
 
 Set OFF if you actually want disable+enable to preserve the persistent
@@ -885,14 +885,14 @@ A third button is added to the `CLOSE 1 | KILL` row, making it
 
 Four new properties (default OFF for both directions):
 
-- `AutoTightenOnLosses` (bool) + `AutoTightenLossN` (int 1–10, default 2)
-  + `AutoTightenFactor` (double 0.1–1.0, default 0.5).
+- `AutoTightenOnLosses` (bool) + `AutoTightenLossN` (int 1ï¿½10, default 2)
+  + `AutoTightenFactor` (double 0.1ï¿½1.0, default 0.5).
   When N consecutive losing trades occur, the agent multiplies the
   **base** `AggressiveTrailMaxAtrFactor` by `AutoTightenFactor` and writes
   `ADAPT_TIGHTEN` to the CSV. Tighter trail => locks profit faster on a
   bad-rhythm day.
-- `AutoWidenOnWins` (bool) + `AutoWidenWinN` (int 1–10, default 3)
-  + `AutoWidenFactor` (double 1.0–3.0, default 1.5).
+- `AutoWidenOnWins` (bool) + `AutoWidenWinN` (int 1ï¿½10, default 3)
+  + `AutoWidenFactor` (double 1.0ï¿½3.0, default 1.5).
   When N consecutive winning trades occur, multiplies base factor by
   `AutoWidenFactor` (capped at 2.0). Looser trail => lets winners run on a
   good-rhythm day. Logs `ADAPT_WIDEN`.
@@ -914,7 +914,7 @@ streak).
 Two new properties (group `1 - Risk`):
 
 - `SkipPrevDayClampOnHighAdx` (bool, default ON).
-- `HighAdxThreshold` (double 15–60, default 28).
+- `HighAdxThreshold` (double 15ï¿½60, default 28).
 
 In both `ArmHiddenStops` and `ResizeHiddenStops` the prevDay TP clamp
 is now gated:
@@ -945,9 +945,40 @@ without needing to cross-reference Print logs.
 
 ---
 
-## 14.10 — Smarter than MM/algos: TOD-SL, news blackout, sweep boost, DCA suppression
+## 14.9 â€” Live-fix batch: stop-direction, BE relax, fast-reversal exit, no-disable flatten, session rollover
 
-This revision adds four customization layers — every threshold/window/factor is a NinjaScript property so each user can tune to their account size and instrument.
+Eight live-trading defects / hardening items addressed in commit `94bdf82`.
+
+### 14.9.1 `maxTradesPerDay` raised 12 â†’ 20
+Default cap was choking active days. New default **20** in `ConfigureDefaults`. Existing `MaxTradesPerDay` property unchanged otherwise.
+
+### 14.9.2 SL price-direction swap (sign convention fix)
+`pendingSlNudge` semantics standardized: **positive = TIGHTEN, negative = WIDEN**, regardless of trade direction. The arming and resize paths now apply the sign correctly for both Long and Short, so a `TIGHTEN` button always moves the hidden stop closer to entry and `WIDEN` always moves it further. Previously the Short path inverted this and could flip a tighten into a widen mid-trade.
+
+### 14.9.3 Breakeven relax + fallback
+- BE-lock no longer triggers prematurely on tiny ticks. Threshold uses `max(beSafeMinTicks, beSafeAtrFactor Ã— ATR)` (defaults 4 ticks, 0.20Ã—ATR) before locking BE.
+- If `breakevenAtPoints` is set very low (â‰¤ 4pt) and ATR-derived floor would block it, the floor is the fallback so BE still arms â€” never silently disabled.
+
+### 14.9.4 Fast-reversal exit  (`MonitorFastReversalExit`)
+First-tick-of-bar anti-MM exit. Inside an open trade, if **adverse move â‰¥ `fastReversalAtrFactor Ã— ATR`** AND **adverse â‰¥ `fastReversalAdverseMinPts`** (hard floor) AND it happened within **`fastReversalMaxBars`** of entry, the position is force-flattened with `EXIT_LOSS_FAST_REVERSAL`. Throttled by `lastFastReversalBar` so it fires at most once per trade. Defaults: enabled, factor 0.6, max 4 bars, floor 4pt.
+
+### 14.9.5 FLATTEN button: no-disable
+The dashboard FLATTEN button used to call `Account.Flatten()`, which causes NT8 to disable the managed strategy due to position-state desync. All flatten paths now route through `ManagedExitAll()` only â€” strategy stays enabled, dashboard stays live.
+
+### 14.9.6 Daily-limit hit: no-disable
+Same root cause: hitting `maxDailyLossDollars` / `dailyProfitTargetDollars` previously disabled the strategy. Now it sets `dailyLimitHit` / `dailyProfitHit` flags which veto new entries via `CanEnterTrade`, while leaving the strategy enabled (so trail/exit logic on any open position still runs).
+
+### 14.9.7 TRL NOW button bypass
+The "TRL NOW" dashboard button now bypasses the `trailEnabled` gate and the profit-threshold gate â€” pressing it forces `manualTrailEarlyStart = true`, `trailActive = true` and seeds `trailPrice` immediately at the requested offset. The `MonitorAdaptiveTrail` call in `OnBarUpdate` is gated by `trailEnabled || trailActive || manualTrailEarlyStart` so the manual override is honored even when auto-trail is off.
+
+### 14.9.8 18:00 ET futures session rollover  (`MaybeFuturesSessionRollover`)
+At the first bar whose timestamp crosses 18:00:00 ET (start of next CME session), daily counters are auto-reset: `dailyTradeCount`, `dailyPnL`, `dailyLimitHit`, `dailyProfitHit`, `consecutiveLosses`, `consecutiveWins`, `lastFuturesSessionResetDate`. A `SESSION_ROLLOVER` row is written to the diag CSV. This means a strategy left running 24/5 begins each new electronic session with a clean slate.
+
+---
+
+## 14.10 â€” Smarter than MM/algos: TOD-SL, news blackout, sweep boost, DCA suppression
+
+This revision adds four customization layers ï¿½ every threshold/window/factor is a NinjaScript property so each user can tune to their account size and instrument.
 
 ### 14.10.1 Time-of-Day SL sizing  (Group `8 - Time-of-Day SL`)
 
@@ -955,11 +986,11 @@ The hidden SL distance now adapts to the time of day. Three windows (Open / Midd
 
 | Window | Default times (HHMMSS) | Default mult | Rationale |
 |---|---|---|---|
-| Open    | 09:30:00 – 10:30:00 | **1.30** | Wider — opening expansion can wick 6-12pt before settling |
-| Midday  | 10:30:00 – 14:00:00 | **0.80** | Tighter — chop, low-ATR; tighter SL preserves the small wins |
-| Close   | 15:00:00 – 16:00:00 | **1.20** | Wider — power-hour whipsaws can sweep stops both directions |
+| Open    | 09:30:00 ï¿½ 10:30:00 | **1.30** | Wider ï¿½ opening expansion can wick 6-12pt before settling |
+| Midday  | 10:30:00 ï¿½ 14:00:00 | **0.80** | Tighter ï¿½ chop, low-ATR; tighter SL preserves the small wins |
+| Close   | 15:00:00 ï¿½ 16:00:00 | **1.20** | Wider ï¿½ power-hour whipsaws can sweep stops both directions |
 
-Internal helper `GetEffectiveSlPoints()` returns `round(slPoints × mult)` clamped to a 2pt floor. It's called from `ArmHiddenStops` and both branches of `ResizeHiddenStops`. Wrap-around windows (start > end) are supported, e.g. you could define an overnight session window.
+Internal helper `GetEffectiveSlPoints()` returns `round(slPoints ï¿½ mult)` clamped to a 2pt floor. It's called from `ArmHiddenStops` and both branches of `ResizeHiddenStops`. Wrap-around windows (start > end) are supported, e.g. you could define an overnight session window.
 
 Properties:
 - `TimeOfDaySlSizingEnabled` (bool, default ON).
@@ -969,51 +1000,51 @@ Properties:
 
 ### 14.10.2 News blackout window  (Group `9 - News Blackout`)
 
-Block ALL entries (manual + auto) within ± window-min of any time in a CSV list of HHMMSS times. The list is parsed once, cached as minutes-since-midnight; when `NewsBlackoutTimes` is changed via the UI the cache invalidates and re-parses on next entry attempt.
+Block ALL entries (manual + auto) within ï¿½ window-min of any time in a CSV list of HHMMSS times. The list is parsed once, cached as minutes-since-midnight; when `NewsBlackoutTimes` is changed via the UI the cache invalidates and re-parses on next entry attempt.
 
-Default times (ET): **08:30** (CPI/PPI/NFP), **10:00** (ISM/JOLTS), **14:00** (FOMC). Default window: **±2 minutes**.
+Default times (ET): **08:30** (CPI/PPI/NFP), **10:00** (ISM/JOLTS), **14:00** (FOMC). Default window: **ï¿½2 minutes**.
 
 A `BLOCK_NEWS` row is written to the diag CSV every time an entry attempt is suppressed.
 
 Properties:
 - `NewsBlackoutEnabled` (bool, default ON).
 - `NewsBlackoutTimes` (string, comma-separated HHMMSS).
-- `NewsBlackoutWindowMin` (int 0–60, default 2).
+- `NewsBlackoutWindowMin` (int 0ï¿½60, default 2).
 
 ### 14.10.3 Liquidity-sweep boost  (Group `10 - Liquidity Sweep`)
 
 Classic MM stop-run reversal:
-- **Bull sweep** = bar [-1] Low broke below the prior N-bar Low **AND** Close[-1] = that prior low + 0.3 × ATR (closed back above the swept level).
+- **Bull sweep** = bar [-1] Low broke below the prior N-bar Low **AND** Close[-1] = that prior low + 0.3 ï¿½ ATR (closed back above the swept level).
 - **Bear sweep** = mirror image of above.
 
 When detected, the **opposite-direction** signal is boosted in two ways:
 1. `effMin` is reduced by `LiquiditySweepConfBoost` points (floor 35).
 2. The `overLong` / `overShort` overextension veto is bypassed for that direction.
 
-This lets the strategy *participate* in the kind of move where MMs sweep one side then reverse — exactly the inverse of getting trapped by it.
+This lets the strategy *participate* in the kind of move where MMs sweep one side then reverse ï¿½ exactly the inverse of getting trapped by it.
 
 A `SWEEP_BOOST` diag row is written whenever the boost is active.
 
 Properties:
 - `LiquiditySweepBoostEnabled` (bool, default ON).
-- `LiquiditySweepLookback` (int 5–200, default 30 bars).
-- `LiquiditySweepConfBoost` (double 0–30, default 8.0).
+- `LiquiditySweepLookback` (int 5ï¿½200, default 30 bars).
+- `LiquiditySweepConfBoost` (double 0ï¿½30, default 8.0).
 
 ### 14.10.4 DCA suppression on loss streak  (Group `11 - DCA Suppression`)
 
-In `CanEnterTrade`, when the requested entry is **same-direction as the open position** and `consecutiveLosses = SuppressDcaLossN`, the add is blocked with a `DCA suppressed` status banner and a `BLOCK_DCA` diag row. The block applies to BOTH manual and auto entries (DCA on a losing day rarely ends well — preserve the capital, wait for a clean win to clear the streak).
+In `CanEnterTrade`, when the requested entry is **same-direction as the open position** and `consecutiveLosses = SuppressDcaLossN`, the add is blocked with a `DCA suppressed` status banner and a `BLOCK_DCA` diag row. The block applies to BOTH manual and auto entries (DCA on a losing day rarely ends well ï¿½ preserve the capital, wait for a clean win to clear the streak).
 
 Default: **2 consecutive losses** ? DCA blocked until next win clears the streak.
 
 Properties:
 - `SuppressDcaOnLossStreak` (bool, default ON).
-- `SuppressDcaLossN` (int 1–10, default 2).
+- `SuppressDcaLossN` (int 1ï¿½10, default 2).
 
 ### 14.10.5 Diagnostic CSV additions
 
 New `Action` tags introduced this revision:
-- `BLOCK_NEWS` — entry attempt blocked by news blackout.
-- `BLOCK_DCA` — same-direction add blocked by loss-streak suppression.
-- `SWEEP_BOOST` — sweep detected and boost active for this bar.
+- `BLOCK_NEWS` ï¿½ entry attempt blocked by news blackout.
+- `BLOCK_DCA` ï¿½ same-direction add blocked by loss-streak suppression.
+- `SWEEP_BOOST` ï¿½ sweep detected and boost active for this bar.
 
 (Existing 29-column header is unchanged; these tags use the existing `Action,Detail` slots.)
