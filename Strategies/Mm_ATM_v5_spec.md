@@ -1100,6 +1100,120 @@ WAIT — low conf htf-against
 
 ---
 
+## 18. v5 Stability Lock & v6 Roadmap — "Make MM open their mouth"
+
+> **Status (Apr 27, 2026):** v5 14.19 is the **stable production line**. No more invasive changes go into v5 — only bug fixes and parameter tuning. All structural ideas below are deferred to **`Mm_ATM_v6.cs`** (new file, fork of v5 14.19).
+
+### 18.1 Why fork to v6 instead of patching v5
+
+v5 has earned its place: hidden SL/TP, smart trail with 4 tiers, sweep boost, runner mode, 5 soft blockers + 12 hard blockers, manual signal panel, tape integration, dashboard with live diag CSV. The +$1,710 day on 2026-03-20 proved the architecture works. Adding more layers risks regression. v6 lets us experiment safely while keeping v5 trading live.
+
+### 18.2 v6 design pillars
+
+1. **Adaptive over fixed** — replace hard-coded thresholds with rolling-window self-tuning (per-hour, per-regime).
+2. **Multi-timeframe truth** — promote 5-min and 15-min from "filter inputs" to first-class signal sources with their own confidence.
+3. **Pattern memory** — record what worked / what failed by setup signature (open-type × hour × ATR-bucket × HTF) and adjust min-confidence per signature.
+4. **MM behavioral modeling** — explicitly model the MM playbook (stop-run levels, ladder pulls, fade-the-breakout) and trade *against* the predicted MM action, not just the chart.
+5. **Risk-aware position sizing** — Kelly-like fraction based on rolling win-rate × R:R, not fixed contracts.
+
+### 18.3 Concrete features queued for v6
+
+#### A. Pattern-Memory Engine (priority 1)
+- Record every trade with a **setup fingerprint**: `(hour, openType, atrBucket, htfBias, sweepPresent, vwapDistAtr, dirAgreesEma)`.
+- Build a rolling 90-day P&L heat-map per fingerprint.
+- At entry time, look up the fingerprint and **scale the size** (or block entirely) based on its historical edge.
+- Diag tag: `PATTERN_LOOKUP fingerprint=... histPnL=... n=... action=BOOST/NORMAL/REDUCE/BLOCK`.
+- Persist as JSON in `~/Documents/NinjaTrader 8/MmATM_v6_PatternStore.json` so it survives restarts.
+
+#### B. Per-Hour Self-Tuning (priority 1)
+- Rolling 30-day **per-hour** win-rate, avg R, expectancy.
+- Auto-adjusts `MinSignalConfidence` per hour: e.g. midday low-edge hour gets +10 confidence requirement, opening 30-min gets −5.
+- Auto-adjusts `ExtensionMaxAtrFromVwap` per hour (volatile hours allow more extension).
+- Heat-map tile on dashboard showing each hour's win-rate as color intensity.
+
+#### C. MM Playbook Detector (priority 1 — "the open mouth feature")
+A separate scoring engine, parallel to confidence, that predicts the next MM move:
+- **Stop-run setup**: equal lows/highs for N bars + tape balanced + low ADX = MM is preparing to sweep. Pre-arm a fade entry on the sweep tick.
+- **Ladder pull**: sudden book thinning (would need L2 if NinjaTrader allows, otherwise tape compression) before a violent move = MM stepping aside. Block entries.
+- **Squeeze trap**: BB width minimum + RSI mid + low volume = MM coiling for an expansion. Don't fade either side; trade the breakout direction once tape confirms.
+- **Liquidity grab**: prev-day H/L + first 2 hours + low conviction tape = MM grab + reversal expected. Pre-arm reversal signal.
+- Outputs: `mmIntent ∈ {NEUTRAL, STOP_RUN_BULL, STOP_RUN_BEAR, LADDER_PULL, SQUEEZE_BUILD, GRAB_REVERSAL}` displayed on dashboard.
+- Trades are biased toward *fading* the predicted MM action.
+
+#### D. Multi-Timeframe Confidence Stack
+- Promote 5-min and 15-min into independent confidence calculators (re-use the F1–F12 pipeline per TF).
+- Final entry confidence = weighted: `0.5×conf1m + 0.3×conf5m + 0.2×conf15m`.
+- "STRONG" upgrade requires all 3 TFs agree on direction.
+- Dashboard shows 3 confidence bars stacked (1m / 5m / 15m).
+
+#### E. Adaptive Risk-Per-Trade (Kelly-fraction sizing)
+- Track rolling 30-day expectancy `E = winRate × avgWin − lossRate × avgLoss`.
+- Kelly fraction `f = E / avgWin²` (half-Kelly for safety).
+- Translate to contracts via account equity. Caps: `MinContracts = 1`, `MaxContracts = configurable`.
+- Auto-reduce by 50% after `consecutiveLosses ≥ 3` (already partially done in v5 with DCA suppression).
+
+#### F. Fib + Candle Reversal Scalp Module (was deferred from v14.20)
+- Auto-draw fib retracement on the day's developing move.
+- Detect candlestick reversal patterns (engulf, hammer, doji-with-tail) at 38.2 / 50 / 61.8 levels.
+- Independent toggle, independent risk pool. Fires only when main strategy is WAIT.
+
+#### G. V-Fakeout Filter (the 2026-03-25 lesson)
+- Detect: sharp move → flat 3-bar consolidation at extreme → sudden reverse engulf.
+- Block entries on the second leg of a V-shape until 5 bars of trend confirmation post-reverse.
+- Diag tag: `BLOCK_V_FAKEOUT`.
+
+#### H. Spread / Slippage Awareness
+- Live spread monitor on dashboard (`Spread: 1.25t`).
+- If spread > N×typical → block entries (`BLOCK_SPREAD_WIDE`).
+- Track per-trade slippage (fill vs signal price); if rolling slippage worsens → tighten activation thresholds.
+
+#### I. Strategy Analyzer Walk-Forward Harness
+- Built-in framework to run v6 over rolling 30-day windows, log Sharpe / max DD / expectancy per window.
+- Auto-promote the best parameter set to live (with manual confirm).
+
+#### J. Dashboard v2
+- Move heavy WPF rendering to a single `CompositionTarget.Rendering` tick (currently scattered Dispatcher.InvokeAsync calls).
+- Add: per-hour heat-map, pattern-fingerprint last 5 outcomes, MM intent badge, Kelly-suggested size, live spread + slippage.
+- Save dashboard size + position to user settings (right now it resets).
+
+### 18.4 v6 architecture changes
+
+- **Fork**: copy `Mm_ATM_v5.cs` → `Mm_ATM_v6.cs`, rename class, bump display name.
+- **Split into partials**: `Mm_ATM_v6.Core.cs`, `.Signals.cs`, `.Trail.cs`, `.PatternMemory.cs`, `.MMPlaybook.cs`, `.Dashboard.cs`. The 4600-line monolith is fighting us.
+- **Persistence layer**: `MmATM_v6_PatternStore.json` for pattern memory, `MmATM_v6_HourStats.json` for per-hour stats. Load on `State.DataLoaded`, save on flatten + on shutdown.
+- **Diag CSV v2**: extend to ~40 columns to include MM intent, pattern fingerprint, Kelly size, spread.
+- **Backtest mode**: a `SimulateTape` flag that synthesizes a tape-delta proxy from bar OHLCV when not in live mode (so tape-dependent logic still runs in Strategy Analyzer).
+
+### 18.5 Migration plan (v5 → v6)
+
+1. **Freeze v5 14.19** — only bug-fix commits (e.g. `v5 14.19.1`) for production.
+2. Open `ninja-v6` branch off current `ninja`.
+3. Fork file, split into partials, get it compiling identical to v5 14.19 → tag `v6 0.1 - parity`.
+4. Implement features in priority order: B (per-hour) → A (pattern memory) → C (MM playbook) → G (V-fakeout) → H (spread) → D (multi-TF) → E (Kelly) → F (Fib scalp) → J (dashboard v2) → I (walk-forward).
+5. Each feature ships behind its own toggle, default OFF. Promote to default ON only after a 5-day live A/B vs v5.
+
+### 18.6 What "make MM open their mouth" looks like
+
+- **MM intent badge** on dashboard: "MM PROBE STOP-RUN BULL @ 18242.50 — fade ready" (you click the dashed level, strategy primes a long limit just below).
+- **Pattern lookup popup** on every entry: "This setup: 14 prior occurrences, 71% win, avg +$240" (or "0 prior, no edge data — passing").
+- **Hourly heat-map**: instantly see your worst hour and either flatten through it or boost confidence requirement.
+- **Kelly badge**: "Suggested 2 contracts (rolling expectancy $185, half-Kelly)" instead of fixed sizing.
+- **Walk-forward report** every Sunday: "Last 30 days: Sharpe 1.8, max DD $1,420, 64% wins. Suggested change: lower MinSignalConfidence to 53 (validated +$640 over baseline)."
+
+### 18.7 Out of scope (won't pursue in v6)
+
+- Machine-learning models — explicit rules > opaque models for trading; we can read a rule and override it. ML stays a research toy.
+- Multi-instrument trading — one symbol at a time keeps the dashboard sane and risk obvious.
+- Auto-news scraping — keep the manual news-blackout window, scraping adds fragility.
+- Cloud / remote dashboard — local-only for security and simplicity.
+
+### 18.8 The pact
+
+> **v5 stays alive trading real money. v6 is the lab.** When a v6 feature proves itself over 2 live weeks, we backport the *toggle* (not the implementation) into v5 14.x.x. v5's job is to be reliable. v6's job is to make MM regret showing up.
+
+---
+
+
 
 ### 14.8.2 `ResetDailyOnRestart` (default ON)
 
