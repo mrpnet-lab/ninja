@@ -221,7 +221,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         // by that very wick. This cooldown blocks same-direction re-entries for a short window after
         // any winning exit. Doesn't apply after losses (re-entry post-loss is fine if structure justifies).
         private bool          postWinSameDirCooldownEnabled = true;
-        private int           postWinSameDirCooldownMin     = 5;     // minutes to block same-direction re-entry after a win
+        private int           postWinSameDirCooldownMin     = 7;     // minutes to block same-direction re-entry after a win
         private DateTime      lastWinExitTime               = DateTime.MinValue;
         private int           lastWinExitDirection          = 0;     // +1=long win, -1=short win
         // ----- Directional lockout (per-direction loss-streak block) -----
@@ -540,7 +540,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     slClusterWindowMin          = 90;
                     slClusterCooldownMin        = 25;
                     postWinSameDirCooldownEnabled = true;
-                    postWinSameDirCooldownMin     = 5;
+                    postWinSameDirCooldownMin     = 7;
                     dirLockoutEnabled             = true;
                     dirLockoutLossN               = 2;
                     dirLockoutWindowMin           = 30;
@@ -4434,7 +4434,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         [NinjaScriptProperty][Range(1, 60)]
         [Display(Name = "Post-Win Cooldown (min)", Order = 2, GroupName = "16 - Post-Win Cooldown",
-            Description = "Minutes to block same-direction re-entry after a winning exit. Default 5.")]
+            Description = "Minutes to block same-direction re-entry after a winning exit. Default 7 (covers the typical 5-6 minute MM trail-and-trap re-entry trap).")]
         public int PostWinSameDirCooldownMin { get { return postWinSameDirCooldownMin; } set { postWinSameDirCooldownMin = value; } }
 
         // ===== Group 17 — Directional Lockout (per-direction loss-streak block) =====
