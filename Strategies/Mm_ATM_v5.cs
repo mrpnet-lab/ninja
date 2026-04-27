@@ -793,7 +793,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (Position.MarketPosition != MarketPosition.Flat && stopsArmed && !pendingExit)
                 {
                     MonitorHiddenStops();
-                    if (trailEnabled || trailActive || manualTrailEarlyStart) MonitorAdaptiveTrail();
+                    if (trailEnabled) MonitorAdaptiveTrail();
                     if (IsFirstTickOfBar && enableTrapDetector) MonitorTrapDetector();
                     if (fastReversalExitEnabled && IsFirstTickOfBar) MonitorFastReversalExit();
                     LiveDailyPnLCheck();
@@ -3499,7 +3499,19 @@ namespace NinjaTrader.NinjaScript.Strategies
                     btnTrailToggle = MakeToggle(trailEnabled ? "TRL ON" : "TRL OFF", trailEnabled, (s, e) =>
                     { trailEnabled = !trailEnabled;
                       btnTrailToggle.Content = trailEnabled ? "TRL ON" : "TRL OFF";
-                      btnTrailToggle.Background = trailEnabled ? Brushes.DarkSlateGray : Brushes.DarkRed; });
+                      btnTrailToggle.Background = trailEnabled ? Brushes.DarkSlateGray : Brushes.DarkRed;
+                      // When user turns TRL OFF, fully disarm any active/manual-early trail state so
+                      // the price-cross check no longer fires. Without this, a previously-active TRL
+                      // NOW would keep exiting at the in-memory trailPrice even though the UI says OFF.
+                      if (!trailEnabled)
+                      {
+                          trailActive = false;
+                          manualTrailEarlyStart = false;
+                          trailPrice = 0;
+                          trailMaxProfitPts = 0;
+                          trailTierName = "";
+                          Print(TAG + "TRL OFF -> trail fully disarmed (active+manualEarly cleared)");
+                      } });
                     btnTrapToggle = MakeToggle(enableTrapDetector ? "TRP ON" : "TRP OFF", enableTrapDetector, (s, e) =>
                     { enableTrapDetector = !enableTrapDetector;
                       btnTrapToggle.Content = enableTrapDetector ? "TRP ON" : "TRP OFF";
