@@ -1805,9 +1805,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             // News blackout (manual + auto)
             if (newsBlackoutEnabled && IsInNewsBlackout())
             { UpdateDashboardStatus(label + " blocked: NEWS blackout ±" + newsBlackoutWindowMin + "min", Brushes.Orange); if (enableDiagLog) WriteDiagRow("BLOCK_NEWS", label); return false; }
-            // Chop filter (manual + auto): protect capital when ADX collapses, EMAs converge,
-            // close-range collapses, OR tape is fighting the entry direction.
-            if (chopFilterEnabled)
+            // Chop filter (AUTO ONLY — manual entries bypass): protect capital when ADX collapses,
+            // EMAs converge, close-range collapses, OR tape is fighting the entry direction.
+            if (!isManual && chopFilterEnabled)
             {
                 string chopReason;
                 if (IsChoppy(direction, out chopReason))
@@ -1817,19 +1817,20 @@ namespace NinjaTrader.NinjaScript.Strategies
                     return false;
                 }
             }
-            // SL-cluster cooldown: if we just hit N stop-losses in a short window, the regime is
-            // toxic for our system right now. Pause new entries so we don't chain another -$400.
-            if (slClusterCooldownEnabled && Time[0] < slClusterCooldownUntil)
+            // SL-cluster cooldown (AUTO ONLY — manual entries bypass): if we just hit N stop-losses
+            // in a short window, the regime is toxic for our system right now. Pause new entries so
+            // we don't chain another -$400.
+            if (!isManual && slClusterCooldownEnabled && Time[0] < slClusterCooldownUntil)
             {
                 int remainSec = (int)(slClusterCooldownUntil - Time[0]).TotalSeconds;
                 UpdateDashboardStatus(label + " blocked: SL CLUSTER cooldown " + (remainSec / 60) + "m", Brushes.OrangeRed);
                 if (enableDiagLog) WriteDiagRow("BLOCK_SL_CLUSTER", "cooldown_remaining_sec=" + remainSec);
                 return false;
             }
-            // Post-win same-direction cooldown (anti trail-and-trap): block re-entry in the SAME
-            // direction as the most recent winning exit for a short window. Catches MM stop-runs
-            // that ramp price against us right after our trail kicked out, then continue trend.
-            if (postWinSameDirCooldownEnabled && lastWinExitDirection != 0 && lastWinExitDirection == direction)
+            // Post-win same-direction cooldown (AUTO ONLY — manual entries bypass): block re-entry
+            // in the SAME direction as the most recent winning exit for a short window. Catches MM
+            // stop-runs that ramp price against us right after our trail kicked out, then continue trend.
+            if (!isManual && postWinSameDirCooldownEnabled && lastWinExitDirection != 0 && lastWinExitDirection == direction)
             {
                 double minsSinceWin = (Time[0] - lastWinExitTime).TotalMinutes;
                 if (minsSinceWin < postWinSameDirCooldownMin)
@@ -1840,10 +1841,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                     return false;
                 }
             }
-            // Directional lockout: block this direction if it has been losing repeatedly. Opposite
-            // direction is still allowed (so a real reversal can be taken). Surgical fix for the
-            // pattern of 3 consecutive same-direction SL losses chasing fresh local extremes.
-            if (dirLockoutEnabled)
+            // Directional lockout (AUTO ONLY — manual entries bypass): block this direction if it
+            // has been losing repeatedly. Opposite direction is still allowed.
+            if (!isManual && dirLockoutEnabled)
             {
                 DateTime lockoutEnd = direction == 1 ? longLockoutUntil : (direction == -1 ? shortLockoutUntil : DateTime.MinValue);
                 if (Time[0] < lockoutEnd)
@@ -1854,11 +1854,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                     return false;
                 }
             }
-            // Extension filter: block late chases. When price is over-extended from VWAP relative
-            // to ATR, the move has likely already moved enough that MM stop-runs become high-probability.
-            // Only enforced when ATR is meaningful (>= extensionMinAtrPoints) so we don't over-block in
-            // quiet midday sessions where 5×ATR is a normal distance.
-            if (extensionFilterEnabled && vwapValue > 0 && indAtr != null && indAtr.IsValidDataPoint(0))
+            // Extension filter (AUTO ONLY — manual entries bypass): block late chases. When price
+            // is over-extended from VWAP relative to ATR, the move has likely already moved enough
+            // that MM stop-runs become high-probability. Only enforced when ATR is meaningful
+            // (>= extensionMinAtrPoints) so we don't over-block quiet midday sessions.
+            if (!isManual && extensionFilterEnabled && vwapValue > 0 && indAtr != null && indAtr.IsValidDataPoint(0))
             {
                 double atrNow = indAtr[0];
                 if (atrNow >= extensionMinAtrPoints)
