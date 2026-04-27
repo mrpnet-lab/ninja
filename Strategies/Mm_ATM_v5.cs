@@ -185,6 +185,14 @@ namespace NinjaTrader.NinjaScript.Strategies
         // ----- Aggressive Exits Mode (manual + auto, default OFF) -----
         // When ON: BE locks earlier, trail starts faster + tighter, pullback after peak triggers exit.
         private bool          aggressiveExitsEnabled      = true;
+        // ----- Runner Mode (per-trade override; user toggles on dashboard) -----
+        // When ON, the trail uses a SINGLE wide distance (RunnerAtrFactor × ATR, floor 4pt) and
+        // disables: profit-aggression multipliers, time ratchet, trap-tighten, EMA-tighten, AGGR
+        // override, and tier floors (so a strong runner doesn't get cut by 65% peak floor).
+        // BE / hidden SL / structural snap still work. Auto-clears when position goes flat.
+        private bool          runnerModeActive_user       = false;
+        private double        runnerAtrFactor             = 1.5;
+        private double        runnerMinPts                = 4.0;
         private int           aggrBeAtPoints              = 3;     // BE locks at +3pt instead of breakevenAtPoints
         private double        aggrTrailActivationPts      = 4.0;   // Trail activates at +4pt
         private double        aggrTrailDistPts            = 2.0;   // Trail distance 2pt
@@ -447,6 +455,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private Button btnTrailToggle, btnTrapToggle;
         private Button btnBeToggle;
         private Button btnAggrToggle, btnChopToggle, btnAdaptToggle;
+        private Button btnRunnerToggle;
         private Button btnStratPrev, btnStratNext;
         #endregion
 
@@ -1231,12 +1240,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 trailActive = true;
                 manualTrailMode = false;
-                // Distance choice:
-                //  - Early-start (TRL NOW): aggressive lock = max(2pt, 0.5×ATR) — protect profit fast
-                //  - HTF-agreeing runner:    GetTrailDistance() × 1.8
-                //  - Default:                GetTrailDistance()
+                // Runner Mode override: single wide distance, ignore all aggression sources.
                 double dist;
-                if (aggressiveExitsEnabled)
+                if (runnerModeActive_user)
+                {
+                    dist = Math.Max(runnerMinPts, atrPts * runnerAtrFactor);
+                    trailTierName = "RUNNER";
+                }
+                else if (aggressiveExitsEnabled)
                 {
                     dist = Math.Max(1.0, aggrTrailDistPts);
                     trailTierName = "Aggr-Mode";
@@ -1266,40 +1277,52 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             // ----- compute candidate new trail price -----
-            // Manual offset applied every pass so user nudges persist through auto-ratchet.
-            double curDist = Math.Max(1.0, GetTrailDistance() + manualTrailOffsetPoints);
-            // Time-based ratchet: every 5 bars in profit, tighten 10%
-            int barsInTrade = CurrentBar - entryBar;
-            if (barsInTrade > 0 && barsInTrade % 5 == 0 && profitPts > dynamicActivation * 1.5)
-                curDist *= 0.90;
-            // PROFIT-AGGRESSION ladder — the more we're up, the tighter we follow.
-            //  >= activation * 4  → 30% extra tighten (lock big profits)
-            //  >= activation * 6  → additional 25% tighten (very big — protect strongly)
-            //  >= activation * 8  → cap distance at max(1pt, ATR*0.25) regardless of base calc
-            if (trailMaxProfitPts >= dynamicActivation * 4) curDist *= 0.70;
-            if (trailMaxProfitPts >= dynamicActivation * 6) curDist *= 0.75;
-            if (trailMaxProfitPts >= dynamicActivation * 8)
+            // Runner Mode: bypass all aggression — single wide distance, no multipliers, no floors.
+            // Structural snap (below) still applies so the trail follows swing structure.
+            double curDist;
+            if (runnerModeActive_user)
             {
-                double hardCap = Math.Max(1.0, atrPts * 0.25);
-                if (curDist > hardCap) curDist = hardCap;
+                curDist = Math.Max(runnerMinPts, atrPts * runnerAtrFactor) + manualTrailOffsetPoints;
+                if (curDist < runnerMinPts) curDist = runnerMinPts;
+                trailTierName = "RUNNER";
             }
-            // Trap tighten
-            if (trapDetected && stopHuntSuspendBars <= 0) curDist *= 0.60;
-            // EMA against → tighter
-            if (openTradeDirection == 1 && indEmaFast[0] < indEmaSlow[0]) curDist *= 0.75;
-            else if (openTradeDirection == -1 && indEmaFast[0] > indEmaSlow[0]) curDist *= 0.75;
+            else
+            {
+                // Manual offset applied every pass so user nudges persist through auto-ratchet.
+                curDist = Math.Max(1.0, GetTrailDistance() + manualTrailOffsetPoints);
+                // Time-based ratchet: every 5 bars in profit, tighten 10%
+                int barsInTrade = CurrentBar - entryBar;
+                if (barsInTrade > 0 && barsInTrade % 5 == 0 && profitPts > dynamicActivation * 1.5)
+                    curDist *= 0.90;
+                // PROFIT-AGGRESSION ladder — the more we're up, the tighter we follow.
+                if (trailMaxProfitPts >= dynamicActivation * 4) curDist *= 0.70;
+                if (trailMaxProfitPts >= dynamicActivation * 6) curDist *= 0.75;
+                if (trailMaxProfitPts >= dynamicActivation * 8)
+                {
+                    double hardCap = Math.Max(1.0, atrPts * 0.25);
+                    if (curDist > hardCap) curDist = hardCap;
+                }
+                // Trap tighten
+                if (trapDetected && stopHuntSuspendBars <= 0) curDist *= 0.60;
+                // EMA against → tighter
+                if (openTradeDirection == 1 && indEmaFast[0] < indEmaSlow[0]) curDist *= 0.75;
+                else if (openTradeDirection == -1 && indEmaFast[0] > indEmaSlow[0]) curDist *= 0.75;
+            }
 
-            // Profit tier floors
+            // Profit tier floors (skipped in Runner Mode — don't cap a strong trade at 65% peak)
             double tierFloor = 0;
-            if (trailMaxProfitPts >= dynamicActivation * 6)
-            { tierFloor = 0.65 * trailMaxProfitPts * tickPt; trailTierName = "T4-Big"; }
-            else if (trailMaxProfitPts >= dynamicActivation * 4)
-            { tierFloor = (htfAgrees ? 0.50 : 0.45) * trailMaxProfitPts * tickPt; trailTierName = "T3-Runner"; }
-            else if (trailMaxProfitPts >= dynamicActivation * 2.5)
-            { tierFloor = 0.40 * trailMaxProfitPts * tickPt; trailTierName = "T2-Strong"; }
-            else if (!htfAgrees && trailMaxProfitPts >= dynamicActivation * 1.5)
-            { tierFloor = TickSize; trailTierName = "T1-BE"; }
-            else trailTierName = htfAgrees ? "Runner" : "Active";
+            if (!runnerModeActive_user)
+            {
+                if (trailMaxProfitPts >= dynamicActivation * 6)
+                { tierFloor = 0.65 * trailMaxProfitPts * tickPt; trailTierName = "T4-Big"; }
+                else if (trailMaxProfitPts >= dynamicActivation * 4)
+                { tierFloor = (htfAgrees ? 0.50 : 0.45) * trailMaxProfitPts * tickPt; trailTierName = "T3-Runner"; }
+                else if (trailMaxProfitPts >= dynamicActivation * 2.5)
+                { tierFloor = 0.40 * trailMaxProfitPts * tickPt; trailTierName = "T2-Strong"; }
+                else if (!htfAgrees && trailMaxProfitPts >= dynamicActivation * 1.5)
+                { tierFloor = TickSize; trailTierName = "T1-BE"; }
+                else trailTierName = htfAgrees ? "Runner" : "Active";
+            }
 
             double off = curDist * tickPt;
             double candidateNewTrail = openTradeDirection == 1
@@ -2541,6 +2564,18 @@ namespace NinjaTrader.NinjaScript.Strategies
             aggressiveLimitSubmitTime = DateTime.MinValue;
             activeEntrySignals.Clear();
             trailPrice = 0; trailActive = false; trailMaxProfitPts = 0; trailTierName = "";
+            // Auto-clear Runner Mode when position goes flat — it's a per-trade opt-in.
+            if (runnerModeActive_user)
+            {
+                runnerModeActive_user = false;
+                if (btnRunnerToggle != null && ChartControl != null)
+                {
+                    try { ChartControl.Dispatcher.InvokeAsync(() => {
+                        btnRunnerToggle.Content = "RUN OFF";
+                        btnRunnerToggle.Background = Brushes.DarkRed; }); } catch { }
+                }
+                Print(TAG + "Runner Mode auto-cleared on flat");
+            }
             trapScore = 0; trapDetected = false; trapBarsInTrade = 0; trapEscapeBars = 0;
             stopHuntSuspendBars = 0;
             breakevenLocked = false; runnerModeActive = false;
@@ -3551,6 +3586,16 @@ namespace NinjaTrader.NinjaScript.Strategies
                     rowSmart.Children.Add(btnAggrToggle);
                     rowSmart.Children.Add(btnChopToggle);
                     rowSmart.Children.Add(btnAdaptToggle);
+                    btnRunnerToggle = MakeToggle(runnerModeActive_user ? "RUN ON" : "RUN OFF", runnerModeActive_user, (s, e) =>
+                    { runnerModeActive_user = !runnerModeActive_user;
+                      btnRunnerToggle.Content = runnerModeActive_user ? "RUN ON" : "RUN OFF";
+                      btnRunnerToggle.Background = runnerModeActive_user ? Brushes.DarkGreen : Brushes.DarkRed;
+                      // Reset trail max so the wider distance computes from current price, not stale peak
+                      if (runnerModeActive_user) trailMaxProfitPts = 0;
+                      UpdateDashboardStatus("Runner Mode " + (runnerModeActive_user ? "ON — wide trail, no aggression" : "OFF"), Brushes.LightGoldenrodYellow);
+                      Print(TAG + "Runner Mode " + (runnerModeActive_user ? "ON" : "OFF")); });
+                    btnRunnerToggle.ToolTip = "RUNNER Mode (per-trade) — wide trail (1.5×ATR, floor 4pt), disables profit-aggression multipliers, time ratchet, trap/EMA tighten, AGGR override, and tier floors. Use when you spot a strong-trend setup and want to let the runner run. Auto-clears when position goes flat.";
+                    rowSmart.Children.Add(btnRunnerToggle);
                     stack.Children.Add(rowSmart);
 
                     dashScroller = new ScrollViewer { Content = stack, MaxHeight = dashHeight, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled };
@@ -4118,6 +4163,16 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "TRL NOW Aggr ATR Factor", Order = 41, GroupName = "3 - Trail / SL",
             Description = "TRL NOW initial trail distance = max(2pt, factor × ATR). Lower = tighter / locks more profit faster but riskier on noise. Default 0.5.")]
         public double AggressiveTrailMaxAtrFactor { get { return aggressiveTrailMaxAtrFactor; } set { aggressiveTrailMaxAtrFactor = value; baseAggressiveTrailFactor = value; } }
+
+        [NinjaScriptProperty][Range(0.5, 5.0)]
+        [Display(Name = "Runner ATR Factor", Order = 48, GroupName = "3 - Trail / SL",
+            Description = "When Runner Mode is toggled ON via the dashboard (RUN button), trail distance = max(RunnerMinPts, factor × ATR). Higher = wider / lets runners run further. Default 1.5.")]
+        public double RunnerAtrFactor { get { return runnerAtrFactor; } set { runnerAtrFactor = value; } }
+
+        [NinjaScriptProperty][Range(1.0, 20.0)]
+        [Display(Name = "Runner Min Pts", Order = 49, GroupName = "3 - Trail / SL",
+            Description = "Minimum trail distance (points) when Runner Mode is ON. Floor for low-ATR sessions. Default 4.")]
+        public double RunnerMinPts { get { return runnerMinPts; } set { runnerMinPts = value; } }
 
         // ----- Streak-adaptive trail (auto-tighten on N consecutive losses / auto-widen on N consecutive wins) -----
         [NinjaScriptProperty]
