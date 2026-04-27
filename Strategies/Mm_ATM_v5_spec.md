@@ -852,6 +852,131 @@ diag tag as `EXIT_WIN_<reason>` or `EXIT_LOSS_<reason>`. Reasons in use:
 `lastExitReason` is cleared after consumption so a stale tag cannot bleed
 into a later trade.
 
+---
+
+## 15. Entry Blockers (`CanEnterTrade`) — Plain-English Reference
+
+Every entry attempt (auto OR manual button) flows through `CanEnterTrade(label, isManual, direction)` in `Mm_ATM_v5.cs` ~line 1823. If any blocker fires, the dashboard shows **`<label> blocked: <reason>`** in orange/red and (where noted) writes a `BLOCK_*` row to the diagnostic CSV. Order matters — first match wins.
+
+### 15.1 Hard blockers (apply to BOTH auto and manual)
+
+| # | Blocker | Diag tag | Trigger | Why |
+|---|---|---|---|---|
+| 1 | **Pending exit** | — | `pendingExit == true` (an exit order is in flight) | Don't pile a new entry on top of an unresolved close. |
+| 2 | **Daily limit** | — | `dailyLimitHit` OR `dailyProfitHit` | Daily loss cap or profit target was hit; trading is paused for the session (strategy stays loaded). |
+| 3 | **KILL switch** | — | `emergencyKillActive` (you pressed KILL) | Hard stop until you reset. |
+| 4 | **NEWS blackout** | `BLOCK_NEWS` | `newsBlackoutEnabled` AND inside ±`newsBlackoutWindowMin` of a scheduled news event | Volatility spike + spread widening = MM heaven, our edge collapses. |
+| 5 | **Already entered this bar** | — | `enteredThisBar` AND `!allowMultiEntryPerBar` | Prevents duplicate fills on the same bar (toggle the property to allow stacking). |
+| 6 | **Max trades / day** | — | `dailyTradeCount >= maxTradesPerDay` AND flat AND auto only | Caps overtrading. Manual bypasses. |
+| 7 | **CME maintenance** | — | clock between 16:55 and 18:00 ET | Exchange settle window — orders flake. |
+| 8 | **Outside auto hours** | — | auto only — clock outside `tradingStartTime`..`flattenTime` | Auto is gated by the configured session; manual is always allowed. |
+| 9 | **Opposite-side reversal** | — | direction opposite to current open position | Not really "blocked" — it triggers `ExecutePartialClose` instead (closes the contrarian side). |
+| 10 | **Max contracts** | — | adding same direction beyond `maxContracts` | Position-size cap. |
+| 11 | **DCA suppression** | `BLOCK_DCA` | same-direction add AND `suppressDcaOnLossStreak` AND `consecutiveLosses >= suppressDcaLossN` | Don't average down into a losing streak — that's how accounts blow up. |
+| 12 | **Entry cooldown** | — | seconds since last entry < `entryDelaySeconds` | Anti-spam between entries. |
+
+### 15.2 Soft blockers (AUTO ONLY — manual buttons bypass since v14.17)
+
+These are smart filters that protect the auto-strategy. Manual entries are treated as explicit human intent and skip them.
+
+| # | Blocker | Diag tag | Trigger | Why |
+|---|---|---|---|---|
+| S1 | **CHOP** | `BLOCK_CHOP` | `chopFilterEnabled` AND `IsChoppy()` returns true. Tests: ADX collapsed, EMAs converged, recent close-range tight, OR tape fighting entry direction. | Choppy regime = high stop-out probability with low edge. The 03-20 chop-spiral autopsy showed all 7 losing shorts had every chop signature simultaneously. |
+| S2 | **SL CLUSTER cooldown** | `BLOCK_SL_CLUSTER` | `slClusterCooldownEnabled` AND now < `slClusterCooldownUntil` (set after N stop-losses in a short window) | "Toxic regime" detector — pause new entries so we don't chain another loss. |
+| S3 | **POST-WIN cooldown** | `BLOCK_POST_WIN` | `postWinSameDirCooldownEnabled` AND last winning exit was SAME direction within `postWinSameDirCooldownMin` (default 7 min) | Catches MM stop-runs that ramp price against us right after our trail kicked out, then continue trend in the original direction. |
+| S4 | **DIR LOCKOUT** | `BLOCK_DIR_LOCKOUT` | `dirLockoutEnabled` AND now < per-direction lockout end (set after `dirLockoutLossN` losses on that side within `dirLockoutWindowMin`) | One direction is broken right now — only allow the opposite side until lockout expires. |
+| S5 | **EXTENSION** | `BLOCK_EXTENSION` | `extensionFilterEnabled` AND `ATR >= extensionMinAtrPoints` AND `\|Close − VWAP\| / ATR > extensionMaxAtrFromVwap` (default 5×) | Don't chase late — over-extended price = high MM-stop-run probability. |
+
+**Manual bypass policy (v14.17):** All five S1–S5 filters check `!isManual` first. Manual buttons are explicit human conviction and skip them. Hard blockers (15.1) still apply to manual.
+
+### 15.3 Diagnostic-only "blocker" (not really a block)
+
+| Tag | Where | Meaning |
+|---|---|---|
+| `CLAMP_SKIP` | `MonitorAdaptiveStops` at trade-arm time | Logged when the **prev-day H/L TP-clamp was bypassed** because `ADX >= highAdxThreshold` AND `skipPrevDayClampOnHighAdx` is on. NOT an exit and NOT a block — just a heads-up that the TP was left wider on a trend day so price could reach it. |
+
+### 15.4 Auto-entry confidence gate (separate from `CanEnterTrade`)
+
+Inside `EvaluateAutoEntry`, even when `CanEnterTrade` would pass, an entry must clear:
+- `lastBullConfidence >= effMinL` (or bear ≥ `effMinS`)
+- `!rsiDown` / `!rsiUp` (avoid against-momentum)
+- `!overLong` / `!overShort` (overextension — relaxed by SWEEP boost)
+- `!nearH` / `!nearL` (don't enter at session H/L)
+- `!volSpike` (avoid volume-spike bars)
+- `!htfBlockL` / `!htfBlockS` (HTF EMA must agree, if HTF filter on)
+- `!tapeBlockL` / `!tapeBlockS` (tape delta must not be opposing > 0.3)
+
+The **Sweep Boost** (§14.10) lowers `effMin` by `liquiditySweepConfBoost` (default 8.0 pts) AND clears `overLong/overShort` when a fresh bull/bear liquidity-sweep pattern prints — so a high-quality reversal can take a fade trade even when overextended. Logged as `SWEEP_BOOST`.
+
+---
+
+## 16. Exit Types — Complete Reference (`lastExitReason`)
+
+Every exit sets `lastExitReason` (consumed in `OnExecutionUpdate` to build the `EXIT_WIN_*` / `EXIT_LOSS_*` diag row, then cleared). Below is the full taxonomy as wired in v14.19.
+
+### 16.1 Hidden SL / TP family (in-memory, MM-invisible)
+
+| Reason | Trigger | Notes |
+|---|---|---|
+| `SL` | Price crossed `hiddenStopPrice` | Stop is in-memory only — no `SetStopLoss()` call, so the MM order book never sees it. |
+| `BE` | Same as `SL` but `breakevenLocked == true` | Loss is ~zero or a small win because BE was armed first. |
+| `TP` | Price crossed `hiddenTargetPrice` | Hidden TP, MM-invisible. |
+| `TP_PD` | Same as `TP` but `tpClampedByPrevDay == true` | Target was clamped just inside prev-day H/L (to avoid MM stop-run ladders sitting at those levels). |
+
+### 16.2 Trail family — `TRAIL_<tier>`
+
+The tier name is whatever `trailTierName` was at the moment the trail price was crossed:
+
+| Tier | Condition that produced this tier |
+|---|---|
+| `TRAIL_T1-BE` | Profit ≥ 1.5×activation, no HTF agree → trail floor at +1 tick (locks BE) |
+| `TRAIL_T2-Strong` | Profit ≥ 2.5×activation → floor 40% of peak |
+| `TRAIL_T3-Runner` | Profit ≥ 4×activation → floor 45–50% of peak (50 if HTF agrees) |
+| `TRAIL_T4-Big` | Profit ≥ 6×activation → floor 65% of peak (very protective) |
+| `TRAIL_Aggr` | Trail started early via TRL NOW button — aggressive lock = max(2pt, 0.5×ATR) |
+| `TRAIL_Aggr-Mode` | AGGR mode override active — fixed `aggrTrailDistPts` distance |
+| `TRAIL_Runner` | HTF EMAs agree, default-tier runner (no peak floor yet) |
+| `TRAIL_Active` | Default tier — trail armed, no special condition |
+| `TRAIL_RUNNER` | **v14.19** — RUN button was ON; wide `1.5×ATR` (floor 4pt), no aggression multipliers / no tier floors |
+
+### 16.3 Aggressive-exit family
+
+| Reason | Trigger | Purpose |
+|---|---|---|
+| `AGGR_ADVERSE` | Within first `aggrAdverseMaxBars` AND adverse move ≥ `max(aggrAdverseMinPts, aggrAdverseAtrFactor × ATR)` AND we hadn't yet hit `aggrAdverseDisarmPeak` profit | Cuts losers fast before they mature. Runs at top of `MonitorHiddenStops` so it preempts the static SL. |
+| `AGGR_PULLBACK` | After being up ≥ activation, retracement from peak ≥ `aggrPullbackAtrFactor × ATR` within first `aggrPullbackMaxBars` | Anti-MM-trap — stops a winner from being flipped into a loser by a stop-run. |
+
+### 16.4 Reversal / trap family
+
+| Reason | Meaning |
+|---|---|
+| `FAST_REV` | Fast-reversal exit — sharp counter-move detected before trail engages. Smarter than waiting for the static SL or the trail. |
+| `TRAP_IMM` | **Immediate** trap — strong evidence of MM trap on entry bar; bail instantly. |
+| `TRAP_GRAD` | **Gradual** trap — trap score accumulated over multiple bars then crossed threshold. |
+
+### 16.5 Manual / system family
+
+| Reason | Meaning |
+|---|---|
+| `FLATTEN` | User pressed FLATTEN (close current trade only, strategy stays enabled) |
+| `CLOSE` | User pressed CLOSE-ALL (close all positions for the instrument) |
+| `CLOSE_ONE` | User pressed CLOSE-ONE (reduce by 1 contract) |
+| `KILL` | User pressed KILL SWITCH (close + disable strategy) |
+| `AUTO_FLATTEN` | End-of-session auto-flatten before settle |
+| `CME_MAINT` | Auto-flattened at CME maintenance window (16:55–18:00 ET) |
+| `DAILY_LOSS` | `dailyRealizedPnL <= -maxDailyLossDollars` — daily loss cap fired |
+| `DAILY_PROFIT` | `dailyRealizedPnL >= maxDailyProfitDollars` — daily profit target fired |
+| `UNKNOWN` | Initial value (never appears for a real exit) |
+
+### 16.6 How to read the diag CSV
+
+`OnExecutionUpdate` wraps the reason with the trade outcome:
+- `EXIT_WIN_<reason>` if `last.ProfitCurrency > 0`
+- `EXIT_LOSS_<reason>` otherwise
+
+So a row with action `EXIT_WIN_TRAIL_RUNNER` literally means: a winning trade closed by the **Runner Mode** wide trail (v14.19 RUN button was ON for that trade). Inversely, `EXIT_LOSS_AGGR_PULLBACK` means the AGGR pullback exit fired and gave back enough peak profit to close net-negative.
+
+
 ### 14.8.2 `ResetDailyOnRestart` (default ON)
 
 In the `State.Realtime` branch, after `ResetSessionFlags()`, when this
@@ -1051,28 +1176,28 @@ New `Action` tags introduced this revision:
 
 ---
 
-## 14.11 � Anti-MM smarts: Aggressive Exits, Chop filter, Adaptive intra-day window
+## 14.11 � Anti-MM smarts: Aggressive Exits, Chop filter, Adaptive intra-day window
 
-Three new behavioral layers driven by the 2026-03-20 chop-spiral autopsy: morning produced +`,640` of clean trend wins (09:50�10:16), then a low-ADX whipsaw chop window (10:24�11:34) gave back `-,070` in seven losing shorts where ADX had collapsed below 18 and the order-flow tape was actually buying. All three layers ship as both **NinjaScript properties** AND **dashboard toggles**.
+Three new behavioral layers driven by the 2026-03-20 chop-spiral autopsy: morning produced +`,640` of clean trend wins (09:50�10:16), then a low-ADX whipsaw chop window (10:24�11:34) gave back `-,070` in seven losing shorts where ADX had collapsed below 18 and the order-flow tape was actually buying. All three layers ship as both **NinjaScript properties** AND **dashboard toggles**.
 
 ### 14.11.1 Aggressive Exits Mode  (Group `12 - Aggressive Exits`, dashboard button `AGGR`, default OFF)
 
 When ON, applies to **both manual and auto** trades:
-- **BE locks early** at `+AggrBeAtPoints` (default 3pt) � the smart-BE ATR/TP floors are bypassed in this mode.
+- **BE locks early** at `+AggrBeAtPoints` (default 3pt) � the smart-BE ATR/TP floors are bypassed in this mode.
 - **Trail starts fast** at `+AggrTrailActivationPts` (default 4pt) with distance `AggrTrailDistPts` (default 2pt). Tier name in CSV is `Aggr-Mode`.
-- **Pullback exit** � once profit = activation, if it pulls back = `AggrPullbackAtrFactor � ATR` (default 0.4) **AND** we're within `AggrPullbackMaxBars` (default 2) of entry, fire a market exit (`ExitLong/ExitShort`) tagged `AGGR_PULLBACK`. This is the anti-MM-trap defense � once they've started reversing your fast scalp, get out before the round-trip becomes a loss.
+- **Pullback exit** � once profit = activation, if it pulls back = `AggrPullbackAtrFactor � ATR` (default 0.4) **AND** we're within `AggrPullbackMaxBars` (default 2) of entry, fire a market exit (`ExitLong/ExitShort`) tagged `AGGR_PULLBACK`. This is the anti-MM-trap defense � once they've started reversing your fast scalp, get out before the round-trip becomes a loss.
 
 Properties: `AggressiveExitsEnabled`, `AggrBeAtPoints`, `AggrTrailActivationPts`, `AggrTrailDistPts`, `AggrPullbackAtrFactor`, `AggrPullbackMaxBars`.
 
 ### 14.11.2 Chop Filter  (Group `13 - Chop Filter`, dashboard button `CHOP`, default ON)
 
-Veto layer in `CanEnterTrade` � fires for **manual AND auto**. Helper `IsChoppy(direction, out reason)` returns true if ANY of:
+Veto layer in `CanEnterTrade` � fires for **manual AND auto**. Helper `IsChoppy(direction, out reason)` returns true if ANY of:
 
 | # | Test | Default trigger |
 |---|---|---|
 | 1 | ADX-collapse | `indAdx[0] < ChopAdxMin (18)` AND ADX falling for `ChopAdxFallingBars (3)` consecutive bars |
-| 2 | EMA convergence | `|EmaFast - EmaSlow| < ChopEmaSepMinAtr � ATR (0.30 � ATR)` |
-| 3 | Close-range collapse | range of last `ChopRangeBars (5)` closes `< ChopRangeMaxAtr � ATR (1.0 � ATR)` |
+| 2 | EMA convergence | `|EmaFast - EmaSlow| < ChopEmaSepMinAtr � ATR (0.30 � ATR)` |
+| 3 | Close-range collapse | range of last `ChopRangeBars (5)` closes `< ChopRangeMaxAtr � ATR (1.0 � ATR)` |
 | 4 | Opposite tape | `ChopBlockOppositeTape` ON AND `|cachedTapeDelta| = ChopOppositeTapeMin (0.05)` AND sign opposes entry direction |
 
 Diag CSV row `BLOCK_CHOP` written with the trigger reason. Test #4 is what would have caught most of today's losing shorts (tape was buying while strategy was selling stop-runs).
@@ -1095,24 +1220,26 @@ Properties: `AdaptiveWindowEnabled`, `AdaptiveWindowSize`, `AdaptiveWindowLossTh
 ### 14.11.4 Dashboard
 
 Three new toggle buttons on a third action row below the existing TRL/TRP/BE row:
-- `AGGR ON/OFF` � DarkOrange when active, DarkRed when off. Tooltip shows current Aggr thresholds.
-- `CHOP ON/OFF` � DarkSlateGray when active. Tooltip describes the four chop tests.
-- `ADAPT ON/OFF` � DarkSlateGray when active. Tooltip shows window size + thresholds. Toggling OFF also clears any active tighten state.
+- `AGGR ON/OFF` � DarkOrange when active, DarkRed when off. Tooltip shows current Aggr thresholds.
+- `CHOP ON/OFF` � DarkSlateGray when active. Tooltip describes the four chop tests.
+- `ADAPT ON/OFF` � DarkSlateGray when active. Tooltip shows window size + thresholds. Toggling OFF also clears any active tighten state.
 
 ### 14.11.5 Diagnostic CSV additions
 
 New `Action` tags introduced this revision:
-- `BLOCK_CHOP` � entry blocked by chop filter (`Detail` = trigger reason).
-- `AGGR_PULLBACK_EXIT` � Aggressive Exits market exit fired (`Detail` shows peak / current / pullback in pts).
-- `ADAPT_WINDOW_ON` / `ADAPT_WINDOW_OFF` � adaptive tighten state transitions.
-- `ADAPT_TIGHTEN_ACTIVE` � heartbeat row each bar while tighten is active (shows boosted `effMin`).
+- `BLOCK_CHOP` � entry blocked by chop filter (`Detail` = trigger reason).
+- `AGGR_PULLBACK_EXIT` � Aggressive Exits market exit fired (`Detail` shows peak / current / pullback in pts).
+- `ADAPT_WINDOW_ON` / `ADAPT_WINDOW_OFF` � adaptive tighten state transitions.
+- `ADAPT_TIGHTEN_ACTIVE` � heartbeat row each bar while tighten is active (shows boosted `effMin`).
 
-(Header unchanged at 29 columns � these tags use the existing `Action,Detail` slots.)
+(Header unchanged at 29 columns � these tags use the existing `Action,Detail` slots.)
 
 ### 14.11.6 Why this addresses the 2026-03-20 chop-spiral autopsy
 
-Today's seven losing shorts had every chop signature simultaneously: ADX 9�18, EMAs flat, tape positive (buyers) while strategy fired shorts at price-wick lows. The chop filter alone (test #1 + #4) would have blocked all seven. The adaptive window would have additionally raised the bar after the first 3 losses. Aggressive exits would have flipped the few trades that *did* move our way (e.g. 11:21, 11:24) from `-` trail-stop losses into small wins by exiting on the first 0.4�ATR pullback.
+Today's seven losing shorts had every chop signature simultaneously: ADX 9�18, EMAs flat, tape positive (buyers) while strategy fired shorts at price-wick lows. The chop filter alone (test #1 + #4) would have blocked all seven. The adaptive window would have additionally raised the bar after the first 3 losses. Aggressive exits would have flipped the few trades that *did* move our way (e.g. 11:21, 11:24) from `-` trail-stop losses into small wins by exiting on the first 0.4�ATR pullback.
 
 Future work (deferred to 14.12):
 - Fib-retracement + candle-pattern reversal scalp setup (separate toggle, default OFF).
 - Per-hour outcome heat-map for self-tuning best/worst hours.
+
+
