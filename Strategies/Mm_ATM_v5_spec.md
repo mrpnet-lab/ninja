@@ -976,6 +976,130 @@ The tier name is whatever `trailTierName` was at the moment the trail price was 
 
 So a row with action `EXIT_WIN_TRAIL_RUNNER` literally means: a winning trade closed by the **Runner Mode** wide trail (v14.19 RUN button was ON for that trade). Inversely, `EXIT_LOSS_AGGR_PULLBACK` means the AGGR pullback exit fired and gave back enough peak profit to close net-negative.
 
+---
+
+## 17. Top-Dashboard Signal Strip & Order-Flow Tape
+
+The strip at the top of the dashboard is the **Manual Trade Signal** — a single one-glance recommendation built from confidence + HTF + EMA + tape + EMA-cross momentum. It is **informational only** and does not place orders; it tells you whether right now is a good moment to press BUY or SELL.
+
+### 17.1 The labels
+
+| Display | Color | Meaning |
+|---|---|---|
+| `▲ STRONG BUY` | Bright green | Long signal with strong confluence (see formula in §17.5) |
+| `↑ BUY` | Lime | Long signal — basic gates passed |
+| `● WAIT` | Gray | Not enough alignment — sit on hands. Reason text shows why. |
+| `↓ SELL` | OrangeRed | Short signal — basic gates passed |
+| `▼ STRONG SELL` | Red | Short signal with strong confluence |
+
+### 17.2 The supporting metrics (right of the signal)
+
+- **`Bull: 67%` / `Bear: 33%`** — the two confidence scores from the 12-filter system (`lastBullConfidence`, `lastBearConfidence`, range 0–120, clamped). Each side accumulates contributions from F1–F12 (EMA stack, RSI, ADX, sweep, EMA-cross momentum, tape, void, open-type, etc.). The dominant side drives the signal direction. Opacity dims when below `minSignalConfidence`.
+- **`conf=70`** — `dom = max(Bull%, Bear%)`. The same number as the higher of the two percentages above.
+- **`htf=+1` / `0` / `-1`** — Higher-timeframe bias from `UpdateHtfBias` (5-min EMA stack + session-open vs ATR + 45-EMA voting). +1 bullish HTF, −1 bearish, 0 mixed/neutral.
+- **`tape=+0.32`** — current order-flow tape delta (see §17.3).
+
+### 17.3 The "Tape Δ" label
+
+Format: `Tape Δ: +0.32  ▲ buyers` (or `▼ sellers` / `● balanced` / `off`).
+
+#### How the value is computed (`OnMarketData` ~line 2774)
+
+- **Live-only** — returns immediately if not in `State.Realtime` or if `OrderFlowFilterEnabled = false`.
+- Rolling **30-second window** of every Last-trade tick:
+  - Trade printed `>= Ask` → counted as **aggressor BUY** (`tapeAskVol += volume`)
+  - Trade printed `<= Bid` → counted as **aggressor SELL** (`tapeBidVol += volume`)
+  - Mid-price prints (between Bid and Ask) are ignored — they're not aggressive.
+- `cachedTapeDelta = (askVol − bidVol) / (askVol + bidVol)` → range **−1.0 to +1.0**.
+- Window resets every 30 seconds.
+
+#### Label thresholds (line 3747)
+
+| Tape Δ | Label | Color | Interpretation |
+|---|---|---|---|
+| `> +0.15` | `▲ buyers` | LimeGreen | Aggressors lifting offers — bid-side buying pressure |
+| `−0.15` to `+0.15` | `● balanced` | Gray | Roughly equal aggression both sides — no edge |
+| `< −0.15` | `▼ sellers` | OrangeRed | Aggressors hitting bids — sell pressure dominant |
+| (off) | `Tape Δ: off` | Gray | Order-flow filter disabled OR not in live mode (backtest/replay) |
+
+### 17.4 How the tape is USED across the strategy
+
+The tape feeds six independent decisions:
+
+| # | Where | Effect |
+|---|---|---|
+| 1 | **Dashboard display** (line 3747) | Color + arrow on the Tape Δ label |
+| 2 | **Confidence boost — F10** (`CalculateSignals` ~line 2971) | If `tape > +0.25` → `Bull% += 10, Bear% −= 5`. If `tape < −0.25` → `Bear% += 10, Bull% −= 5`. |
+| 3 | **Auto-entry block** (`EvaluateAutoEntry` ~line 1975) | `tapeBlockL` if `tape < −0.30` (long blocked); `tapeBlockS` if `tape > +0.30` (short blocked). |
+| 4 | **Manual signal gate** (`UpdateManualSignal` ~line 3087) | `tapeOk` requires `tape ≥ −0.1` for long, `tape ≤ +0.1` for short. Failed → `WAIT — tape-against`. |
+| 5 | **CHOP filter test #4** (`IsChoppy` ~line 1681) | If `chopBlockOppositeTape` AND `\|tape\| ≥ chopOppositeTapeMin` AND tape opposes direction → blocks auto entry as `BLOCK_CHOP — tape against long/short`. |
+| 6 | **Fast-reversal exit** (`MonitorFastReversal` ~line 1506) | Tape against open direction (`> 0.15` magnitude) is one input to the reversal score that fires `FAST_REV` exits. |
+
+So the tape is a **trade quality control** at three different stages: pre-entry confidence (boost or block), entry-time gate (manual signal & CHOP), and in-trade reversal detection.
+
+### 17.5 How the BUY / STRONG BUY decision is built (`UpdateManualSignal` ~line 3078)
+
+**Step 1 — Direction & dominance:**
+- `dir = +1` if `Bull% > Bear%`, `−1` if `Bear% > Bull%`, else `0`
+- `dom = max(Bull%, Bear%)`
+
+**Step 2 — Five gates must ALL pass (else WAIT):**
+| Gate | Condition |
+|---|---|
+| `meetsConf` | `dom ≥ MinSignalConfidence` (default ~55) |
+| `htfOk` | HTF bias agrees with direction (or HTF = 0) |
+| `emaOk` | 1-min Fast EMA on the right side of Slow EMA for `dir` |
+| `tapeOk` | tape not aggressively against (≥ −0.1 long, ≤ +0.1 short, or filter off) |
+| `noVoid` | not currently inside a liquidity-void window |
+
+If any gate fails → `WAIT — <reason1> <reason2> ...` (e.g. `WAIT — low conf htf-against tape-against liq-void`).
+
+**Step 3 — Strength upgrade (BUY → STRONG BUY):**
+
+A "confluence" score is built (max 5):
+- +1 if HTF agrees
+- +1 if EMA agrees
+- +1 if tape agrees
+- +1 if a **fresh EMA cross** in the same direction within the last 3 bars
+- +1 if a **confidence flip** just occurred AND previous dominant matched current direction
+
+```text
+level = (dom ≥ MinSignalConfidence + 15  AND  confluence ≥ 4)
+        ? dir × 2   // STRONG
+        : dir       // normal
+```
+
+So **STRONG BUY** = `dom ≥ ~70` AND at least 4 of the 5 confluences align. Plain `BUY` = the 5 basic gates passed but the strength bar wasn't cleared.
+
+The reason string format is:
+```
+STRONG BUY conf=78 htf=+1 tape=+0.42
+BUY conf=58 htf=0 tape=+0.05
+WAIT — low conf htf-against
+```
+
+### 17.6 Practical reading guide
+
+| You see | Do |
+|---|---|
+| `STRONG BUY conf=78 htf=+1 tape=+0.42  ▲ buyers` | Press BUY (or let auto take it). Multiple systems aligned. High-quality moment. |
+| `BUY conf=58 htf=0 tape=+0.05  ● balanced` | Marginal. Auto might take it; you may want to wait one more bar for confirmation. |
+| `WAIT — tape-against` | Your direction has aggressive opponents on tape. Don't fade without a reason — wait for tape to roll. |
+| `WAIT — low conf htf-against` | Fast and slow timeframes disagree. Common in chop. CHOP filter is probably also blocking auto. |
+| `WAIT — liq-void` | Last 3 bars had range > 2×ATR (extreme bars). Wait for liquidity to return — spreads are wide and stops are unreliable. |
+| `Tape Δ: off` | You're not in live mode, or the order-flow filter is disabled in properties. Tape contribution is neutral. |
+
+### 17.7 Tunable properties
+
+| Property | Default | Effect |
+|---|---|---|
+| `OrderFlowFilterEnabled` | `true` | Master switch. When OFF, tape neither displays nor influences anything. |
+| `MinSignalConfidence` | ~55 | Threshold the dominant side must clear for any BUY/SELL recommendation (vs WAIT). STRONG requires `+15` more. |
+| `ChopBlockOppositeTape` | `true` | Whether opposite-side tape can trigger a CHOP block. |
+| `ChopOppositeTapeMin` | ~0.20 | `\|tape\|` magnitude required to trigger CHOP test #4. |
+
+---
+
 
 ### 14.8.2 `ResetDailyOnRestart` (default ON)
 
