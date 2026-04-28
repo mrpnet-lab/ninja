@@ -466,6 +466,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private System.IO.StreamWriter diagWriter;
         private bool diagHeaderWritten;
         private DateTime diagLogDate;
+        private DateTime lastHeartbeatTime = DateTime.MinValue;
         #endregion
 
         // ===========================================================
@@ -762,6 +763,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     if (diagWriter == null) { diagLogDate = Time[0].Date; OpenDiagLog(); }
                     else if (Time[0].Date > diagLogDate) { CloseDiagLog(); diagLogDate = Time[0].Date; OpenDiagLog(); }
+                    // Periodic state heartbeat (every 10 minutes) so we capture regime even when no
+                    // entries/exits/blocks fire. Helps post-mortem correlate "why was nothing happening?"
+                    if ((Time[0] - lastHeartbeatTime).TotalMinutes >= 10)
+                    {
+                        lastHeartbeatTime = Time[0];
+                        WriteDiagRow("HEARTBEAT", "tradesToday=" + dailyTradeCount + " openDca=" + openDcaCount);
+                    }
                 }
 
                 // -------- CRITICAL pending button paths --------
@@ -2014,7 +2022,25 @@ namespace NinjaTrader.NinjaScript.Strategies
             // qty + avg recomputed in OnOrderUpdate.Filled (do NOT pre-increment)
             Print(TAG + "ENTER LONG #" + openDcaCount + " qty=" + contracts);
             UpdateDashboardStatus("LONG #" + openDcaCount, Brushes.LimeGreen);
-            if (enableDiagLog) WriteDiagRow("ENTRY_LONG", "manual=" + isManual + " bull=" + lastBullConfidence.ToString("F1"));
+            if (enableDiagLog)
+            {
+                // Capture the full decision context at entry time (helps post-trade analysis).
+                double atrNow = indAtr != null && indAtr.IsValidDataPoint(0) ? indAtr[0] : 0;
+                double distVw = vwapValue > 0 ? Close[0] - vwapValue : 0;
+                WriteDiagRow("ENTRY_LONG",
+                    "manual=" + (isManual ? "T" : "F")
+                    + " bull=" + lastBullConfidence.ToString("F1")
+                    + " bear=" + lastBearConfidence.ToString("F1")
+                    + " sig=" + manualSignalLevel
+                    + " htf=" + htfBias
+                    + " tape=" + cachedTapeDelta.ToString("F2")
+                    + " emaXAgo=" + emaCrossBarsAgo
+                    + " distVwap=" + distVw.ToString("F1")
+                    + " atr=" + atrNow.ToString("F1")
+                    + " px=" + Close[0].ToString("F2")
+                    + " sl=" + hiddenStopPrice.ToString("F2")
+                    + " tp=" + hiddenTargetPrice.ToString("F2"));
+            }
         }
 
         private void ExecuteShortEntry(bool isManual)
@@ -2030,7 +2056,24 @@ namespace NinjaTrader.NinjaScript.Strategies
             enteredThisBar = true;
             Print(TAG + "ENTER SHORT #" + openDcaCount + " qty=" + contracts);
             UpdateDashboardStatus("SHORT #" + openDcaCount, Brushes.OrangeRed);
-            if (enableDiagLog) WriteDiagRow("ENTRY_SHORT", "manual=" + isManual + " bear=" + lastBearConfidence.ToString("F1"));
+            if (enableDiagLog)
+            {
+                double atrNow = indAtr != null && indAtr.IsValidDataPoint(0) ? indAtr[0] : 0;
+                double distVw = vwapValue > 0 ? Close[0] - vwapValue : 0;
+                WriteDiagRow("ENTRY_SHORT",
+                    "manual=" + (isManual ? "T" : "F")
+                    + " bull=" + lastBullConfidence.ToString("F1")
+                    + " bear=" + lastBearConfidence.ToString("F1")
+                    + " sig=" + manualSignalLevel
+                    + " htf=" + htfBias
+                    + " tape=" + cachedTapeDelta.ToString("F2")
+                    + " emaXAgo=" + emaCrossBarsAgo
+                    + " distVwap=" + distVw.ToString("F1")
+                    + " atr=" + atrNow.ToString("F1")
+                    + " px=" + Close[0].ToString("F2")
+                    + " sl=" + hiddenStopPrice.ToString("F2")
+                    + " tp=" + hiddenTargetPrice.ToString("F2"));
+            }
         }
 
         private void ExecuteBuyAskEntry()
@@ -3371,12 +3414,13 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                     // Mode + Hours
                     var modeRow = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center };
-                    btnModeManual = MakeToggle("MANUAL", !autoMode, (s, e) => { autoMode = false; UpdateModeButtons(); });
-                    btnModeAuto   = MakeToggle("AUTO",    autoMode, (s, e) => { autoMode = true;  UpdateModeButtons(); });
+                    btnModeManual = MakeToggle("MANUAL", !autoMode, (s, e) => { autoMode = false; UpdateModeButtons(); if (enableDiagLog) WriteDiagRow("MODE_CHANGE", "MANUAL"); });
+                    btnModeAuto   = MakeToggle("AUTO",    autoMode, (s, e) => { autoMode = true;  UpdateModeButtons(); if (enableDiagLog) WriteDiagRow("MODE_CHANGE", "AUTO"); });
                     btnHoursToggle = MakeToggle(tradingHoursEnabled ? "HRS ON" : "HRS OFF", tradingHoursEnabled,
                         (s, e) => { tradingHoursEnabled = !tradingHoursEnabled;
                                     btnHoursToggle.Content = tradingHoursEnabled ? "HRS ON" : "HRS OFF";
-                                    btnHoursToggle.Background = tradingHoursEnabled ? Brushes.DarkSlateGray : Brushes.DarkRed; });
+                                    btnHoursToggle.Background = tradingHoursEnabled ? Brushes.DarkSlateGray : Brushes.DarkRed;
+                                    if (enableDiagLog) WriteDiagRow("TOGGLE_HOURS", tradingHoursEnabled ? "ON" : "OFF"); });
                     modeRow.Children.Add(btnModeManual);
                     modeRow.Children.Add(btnModeAuto);
                     modeRow.Children.Add(btnHoursToggle);
@@ -3568,20 +3612,23 @@ namespace NinjaTrader.NinjaScript.Strategies
                     { aggressiveExitsEnabled = !aggressiveExitsEnabled;
                       btnAggrToggle.Content = aggressiveExitsEnabled ? "AGGR ON" : "AGGR OFF";
                       btnAggrToggle.Background = aggressiveExitsEnabled ? Brushes.DarkOrange : Brushes.DarkRed;
-                      UpdateDashboardStatus("Aggressive exits " + (aggressiveExitsEnabled ? "ON" : "OFF"), Brushes.LightGoldenrodYellow); });
+                      UpdateDashboardStatus("Aggressive exits " + (aggressiveExitsEnabled ? "ON" : "OFF"), Brushes.LightGoldenrodYellow);
+                      if (enableDiagLog) WriteDiagRow("TOGGLE_AGGR", aggressiveExitsEnabled ? "ON" : "OFF"); });
                     btnAggrToggle.ToolTip = "AGGRESSIVE Exits  BE locks at +" + aggrBeAtPoints + "pt, trail starts at +" + aggrTrailActivationPts + "pt with " + aggrTrailDistPts + "pt distance, and pullback >= " + aggrPullbackAtrFactor + "×ATR within " + aggrPullbackMaxBars + " bars after entry forces a market exit. Default ON.";
                     btnChopToggle = MakeToggle(chopFilterEnabled ? "CHOP ON" : "CHOP OFF", chopFilterEnabled, (s, e) =>
                     { chopFilterEnabled = !chopFilterEnabled;
                       btnChopToggle.Content = chopFilterEnabled ? "CHOP ON" : "CHOP OFF";
                       btnChopToggle.Background = chopFilterEnabled ? Brushes.DarkSlateGray : Brushes.DarkRed;
-                      UpdateDashboardStatus("Chop filter " + (chopFilterEnabled ? "ON" : "OFF"), Brushes.LightGoldenrodYellow); });
+                      UpdateDashboardStatus("Chop filter " + (chopFilterEnabled ? "ON" : "OFF"), Brushes.LightGoldenrodYellow);
+                      if (enableDiagLog) WriteDiagRow("TOGGLE_CHOP", chopFilterEnabled ? "ON" : "OFF"); });
                     btnChopToggle.ToolTip = "CHOP filter  blocks BOTH manual and auto entries when ADX collapses, EMAs converge, recent close-range tightens, or tape fights the entry direction. Default ON.";
                     btnAdaptToggle = MakeToggle(adaptiveWindowEnabled ? "ADAPT ON" : "ADAPT OFF", adaptiveWindowEnabled, (s, e) =>
                     { adaptiveWindowEnabled = !adaptiveWindowEnabled;
                       if (!adaptiveWindowEnabled) adaptiveTightenActive = false;
                       btnAdaptToggle.Content = adaptiveWindowEnabled ? "ADAPT ON" : "ADAPT OFF";
                       btnAdaptToggle.Background = adaptiveWindowEnabled ? Brushes.DarkSlateGray : Brushes.DarkRed;
-                      UpdateDashboardStatus("Adaptive window " + (adaptiveWindowEnabled ? "ON" : "OFF"), Brushes.LightGoldenrodYellow); });
+                      UpdateDashboardStatus("Adaptive window " + (adaptiveWindowEnabled ? "ON" : "OFF"), Brushes.LightGoldenrodYellow);
+                      if (enableDiagLog) WriteDiagRow("TOGGLE_ADAPT", adaptiveWindowEnabled ? "ON" : "OFF"); });
                     btnAdaptToggle.ToolTip = "ADAPTIVE intra-day window  rolling " + adaptiveWindowSize + "-trade tracker. After " + adaptiveWindowLossThreshold + " losses in window, requires +" + adaptiveConfBoost + " min-confidence; clears after " + adaptiveWindowClearWins + " wins. Default ON.";
                     rowSmart.Children.Add(btnAggrToggle);
                     rowSmart.Children.Add(btnChopToggle);
@@ -3593,7 +3640,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                       // Reset trail max so the wider distance computes from current price, not stale peak
                       if (runnerModeActive_user) trailMaxProfitPts = 0;
                       UpdateDashboardStatus("Runner Mode " + (runnerModeActive_user ? "ON — wide trail, no aggression" : "OFF"), Brushes.LightGoldenrodYellow);
-                      Print(TAG + "Runner Mode " + (runnerModeActive_user ? "ON" : "OFF")); });
+                      Print(TAG + "Runner Mode " + (runnerModeActive_user ? "ON" : "OFF"));
+                      if (enableDiagLog) WriteDiagRow("TOGGLE_RUNNER", runnerModeActive_user ? "ON" : "OFF"); });
                     btnRunnerToggle.ToolTip = "RUNNER Mode (per-trade) — wide trail (1.5×ATR, floor 4pt), disables profit-aggression multipliers, time ratchet, trap/EMA tighten, AGGR override, and tier floors. Use when you spot a strong-trend setup and want to let the runner run. Auto-clears when position goes flat.";
                     rowSmart.Children.Add(btnRunnerToggle);
                     stack.Children.Add(rowSmart);
@@ -4057,7 +4105,14 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void WriteDiagHeader()
         {
             if (diagWriter == null || diagHeaderWritten) return;
-            diagWriter.WriteLine("DateTime,Bar,Close,VWAP,EmaF,EmaS,RSI,ATR,ADX,RawBull,RawBear,Bull,Bear,Tape,htfBias,trapScore,Pos,Qty,AvgEntry,HiddenSL,HiddenTP,TrailPx,TrailTier,ManualOff,ConsecLoss,ConsecWin,DailyPnL,Action,Detail");
+            // v14.20: extended header (39 columns) for deeper post-mortem analysis.
+            // New columns: Mode, AutoStrat, Toggles, Signal, MinConf, DistVwapAtr, VoidBars,
+            //              OpenType, ProfitPts, PeakPts.
+            diagWriter.WriteLine(
+                "DateTime,Bar,Close,VWAP,EmaF,EmaS,RSI,ATR,ADX,RawBull,RawBear,Bull,Bear,Tape,htfBias,trapScore,"
+                + "Pos,Qty,AvgEntry,HiddenSL,HiddenTP,TrailPx,TrailTier,ManualOff,ConsecLoss,ConsecWin,DailyPnL,"
+                + "Mode,AutoStrat,Toggles,Signal,MinConf,DistVwapAtr,VoidBars,OpenType,ProfitPts,PeakPts,"
+                + "Action,Detail");
             diagHeaderWritten = true;
         }
         private void WriteDiagRow(string action, string detail = "")
@@ -4073,14 +4128,63 @@ namespace NinjaTrader.NinjaScript.Strategies
                 double ax = (indAdx != null && CurrentBar > 14) ? indAdx[0] : 0;
                 int pos = openTradeDirection;
                 int qty = Position.Quantity;
+
+                // ---- New v14.20 derived diagnostics ----
+                string mode = emergencyKillActive ? "KILL"
+                            : (dailyLimitHit ? "LOSS_HALT"
+                            : (dailyProfitHit ? "PROFIT_HALT"
+                            : (autoMode ? "AUTO" : "MANUAL")));
+                string stratUsed = lastAutoStrategyUsed ?? "";
+                // Compact toggle state — "+" on, "-" off — useful to correlate behavior with config
+                string toggles = (aggressiveExitsEnabled ? "AGGR+" : "AGGR-")
+                               + (chopFilterEnabled ? "CHP+" : "CHP-")
+                               + (adaptiveWindowEnabled ? "ADP+" : "ADP-")
+                               + (runnerModeActive_user ? "RUN+" : "RUN-")
+                               + (extensionFilterEnabled ? "EXT+" : "EXT-")
+                               + (postWinSameDirCooldownEnabled ? "PW+" : "PW-")
+                               + (dirLockoutEnabled ? "DLK+" : "DLK-")
+                               + (slClusterCooldownEnabled ? "SLC+" : "SLC-")
+                               + (orderFlowFilterEnabled ? "TPE+" : "TPE-")
+                               + (newsBlackoutEnabled ? "NWS+" : "NWS-");
+                // Manual-signal label (set by UpdateManualSignal)
+                string sigLabel;
+                switch (manualSignalLevel)
+                {
+                    case 2:  sigLabel = "STRONG_BUY"; break;
+                    case 1:  sigLabel = "BUY"; break;
+                    case 0:  sigLabel = "WAIT"; break;
+                    case -1: sigLabel = "SELL"; break;
+                    case -2: sigLabel = "STRONG_SELL"; break;
+                    default: sigLabel = "?"; break;
+                }
+                // Effective min-conf reflects adaptive boost (so we know what threshold the entry actually had to clear)
+                double effMin = minSignalConfidence + (adaptiveTightenActive ? adaptiveConfBoost : 0);
+                // Distance from VWAP in ATR units (the same metric the EXTENSION filter checks)
+                double distVwapAtr = (vwapValue > 0 && at > 0) ? Math.Abs(Close[0] - vwapValue) / at : 0;
+                int openTypeOut = openTypeSet ? openType : 0;
+                // Live trade-profit metrics (zero if flat)
+                double profitPts = 0, peakPts = trailMaxProfitPts;
+                if (pos != 0 && averageEntryPrice > 0)
+                {
+                    profitPts = pos == 1
+                        ? (Close[0] - averageEntryPrice) / TickSize / NQ_TICKS_PER_POINT
+                        : (averageEntryPrice - Close[0]) / TickSize / NQ_TICKS_PER_POINT;
+                }
+
                 diagWriter.WriteLine(string.Format(
-                    "{0},{1},{2:F2},{3:F2},{4:F2},{5:F2},{6:F2},{7:F2},{8:F1},{9:F1},{10:F1},{11:F1},{12:F1},{13:F2},{14},{15:F1},{16},{17},{18:F2},{19:F2},{20:F2},{21:F2},{22},{23:F1},{24},{25},{26:F2},{27},{28}",
+                    "{0},{1},{2:F2},{3:F2},{4:F2},{5:F2},{6:F2},{7:F2},{8:F1},{9:F1},{10:F1},{11:F1},{12:F1},{13:F2},{14},{15:F1},"
+                    + "{16},{17},{18:F2},{19:F2},{20:F2},{21:F2},{22},{23:F1},{24},{25},{26:F2},"
+                    + "{27},{28},{29},{30},{31:F1},{32:F2},{33},{34},{35:F2},{36:F2},"
+                    + "{37},{38}",
                     Time[0].ToString("yyyy-MM-dd HH:mm:ss"), CurrentBar, Close[0], vwapValue,
                     ef, es, rs, at, ax, rawBullConfidence, rawBearConfidence,
                     lastBullConfidence, lastBearConfidence, cachedTapeDelta, htfBias, trapScore,
                     pos, qty, averageEntryPrice, hiddenStopPrice, hiddenTargetPrice, trailPrice,
                     (trailTierName ?? ""), manualTrailOffsetPoints, consecutiveLosses, consecutiveWins,
-                    dailyRealizedPnL, action, detail));
+                    dailyRealizedPnL,
+                    mode, stratUsed.Replace(",", ";"), toggles, sigLabel, effMin, distVwapAtr,
+                    voidBarsRemaining, openTypeOut, profitPts, peakPts,
+                    action, (detail ?? "").Replace(",", ";")));
             }
             catch (Exception ex) { Print(TAG + "DiagLog write EX: " + ex.Message); }
         }
