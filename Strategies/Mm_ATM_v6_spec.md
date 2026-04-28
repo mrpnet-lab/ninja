@@ -1147,6 +1147,7 @@ WAIT — low conf htf-against
 | **3.2** | **F2 POC / VAH / VAL / ON-high/low aware range trading** + MM stop-run-failure reversal back to POC. Needs F1 RANGE detection to gate. | §18.8.C.F2 |
 | **3.3** | **F6 Range-break continuation** (Renko brick beyond range edge = entry, no extra signal needed). Natural extension of F2. | §18.8.C.F6 |
 | **3.4** | **W3 AGGR-L1/L2** + **W4 PACE indicator**. PACE is largely subsumed by F1; mostly UI calibration of aggression vs regime. | §19.4 |
+| **3.5** | **F9 Intelligent Trail v2 — MM-aware tick-level trail (NEW, user-prioritized)**. See §19.11 below. | §19.11 |
 
 #### 🎯 Phase 4 — Polish & UX  *(target: v6 0.5.x)*
 
@@ -1485,6 +1486,68 @@ These were considered for v5 but bumped to v6 per user decision:
 - Live-only fields (`Bid`, `Ask`, `SpreadTk`, `TapeBuyVol`, `TapeSellVol`) are 0 in Strategy Analyzer / historical replay — do not interpret as "tight spread / no flow"; check `Mode != "BACKTEST"` if added later.
 - The 39→54 column expansion is **append-only** at the end-of-row (before `Action,Detail`), so any existing CSV-importer that reads by column name still works; importers that read by index need the new schema.
 - Header is rewritten only when log file is rotated daily; if you change column count mid-session you must delete the day's CSV and let the strategy re-create it.
+
+---
+
+### 19.11 F9 — Intelligent MM-Aware Trail v2 (Phase 3.5, queued)
+
+> **Origin:** user observation (Apr 28, 2026) — *"the key to be profitable is to have a very intelligent trail. It has to analyze the price in tick level and determine if it should leave room for a little go in profit or decide if the MM is trapping. We need to review logs and build a very smart trail depending on market condition and MM traps being happening. We need to review this later as part of enhancements without breaking the code and making it worse."*
+
+**Why it's queued for Phase 3.5 instead of done now:** an intelligent trail is *only* as good as the inputs that classify the market state. F9 reads:
+
+- **Regime** (F1, Phase 1.1) — TREND vs RANGE vs TRANSITION drive completely different trail behavior.
+- **MM-Trap detector** (F5, Phase 3.1) — when a stop-run is in progress, the trail must NOT tighten (that's exactly what MM is hunting).
+- **Brick streak** (Phase 0.2 — already plumbed) — a 5-brick green streak earns more breathing room than a 1-brick blip.
+- **POC/VA distance** (Phase 0.1 diag — already plumbed) — at MM-defended levels, trail tighter; in open air, trail looser.
+- **Spread + TapeBuy/Sell** (Phase 0.1 diag — already plumbed) — widening spread + lopsided aggressor = MM about to fade; tighten or exit.
+
+Building F9 today would mean hard-coding heuristics. Building F9 *after* Phases 0–3 means it can read all those signals as first-class inputs.
+
+#### Design constraints (per user)
+
+1. **Tick-level decisions, not bar-level.** Today's trail engine fires on `IsFirstTickOfBar` for tier promotion; F9 must run inside `MonitorAdaptiveTrail` on every tick when in trade.
+2. **Asymmetric "give room vs lock profit"** — the trail must *recognize* the difference between healthy pullback (give room) and MM trap (lock or exit).
+3. **No regression on the v5/v6 trail engine.** F9 ships as `intelligentTrailMode` toggle, default OFF. The existing 4-tier trail (T1-BE, T2-Strong, T3-Runner, Aggressive) stays the default code path. F9 is an *additional* tier set the user opts into.
+4. **Self-tuning from logs, not from preset thresholds.** F9 reads the `~/Documents/NinjaTrader 8/MmATM_v6_DiagLog_*.csv` files (last 30 days) on `State.DataLoaded` and computes per-regime / per-hour / per-MM-pattern trail-tightness multipliers. Falls back to safe defaults if no logs.
+5. **Reversibility.** Every F9 trail decision writes a `TRAIL_F9` diag row with `regime=… trap=… brickStreak=… spread=… distPoc=… decision=GIVE_ROOM/HOLD/TIGHTEN/EXIT_NOW reason=…` so post-mortems are trivial.
+
+#### Decision tree (preliminary — to be refined from logs)
+
+```
+on every tick when in trade && profit > 1pt:
+  classify state with (Regime, MM-Trap, BrickStreak, SpreadTk, DistPoc, AdxSlope, ProfitPts)
+
+  if MM_TRAP_DETECTED && profitPts >= 2:
+       EXIT_NOW (lock what we have — F5 already does this; F9 just confirms)
+  elif Regime in (TREND_UP/TREND_DN, agree with dir) && BrickStreak >= 3:
+       GIVE_ROOM  (loosen trail to max(2× ATR, brick-back))
+  elif Regime == RANGE && |DistPoc| < 5:
+       TIGHTEN    (POC magnetism → MM defends; tight trail at 0.7× ATR)
+  elif SpreadTk > 2× rolling_median(SpreadTk, 5min) && profitPts >= 5:
+       TIGHTEN    (spread widening = MM about to fade)
+  elif TapeBuy/TapeSell ratio reverses against trade dir for 3 consecutive ticks:
+       TIGHTEN    (aggressor flow reversed — first warning)
+  elif AdxSlope > +3 && Regime in (TREND, dir agrees):
+       HOLD       (trend strengthening — let it run, no change)
+  else:
+       use default v5/v6 trail tier (no F9 override)
+```
+
+#### Implementation gates
+
+- **Cannot start F9 before Phase 3.1 (F5) is complete** — half the inputs don't exist yet.
+- **Must replay at least 4 weeks of v6 0.1.x+ diag logs** before tuning F9 thresholds. Phase 0–2 produces this dataset as a side effect.
+- **Backtest harness:** F9 runs in shadow mode for 1 week (writes `TRAIL_F9_SHADOW` decisions but doesn't execute) before flipping to live. Compare shadow decisions vs actual exits to validate.
+
+#### Acceptance test (must pass before declaring done)
+
+Replay the worst v5 trail failures from the existing log corpus:
+
+1. **Apr 27 stop-runs** (3× identical AGGR_PULLBACK at peak=16/cur=−12/pb=28) — F9 must produce `EXIT_NOW` at peak ≥10pt instead of the −28pt stop-out.
+2. **Apr 28 morning rally** (missed +96pt) — F9 in TREND_UP + BrickStreak ≥3 must produce `GIVE_ROOM`, allowing the trade to ride past the 16pt peak that v5 trail clipped.
+3. **Apr 28 10:30 short** (−$380) — F9 must produce `TIGHTEN` or `EXIT_NOW` when SpreadTk widens 2× and TapeBuy reverses, capping the loss before −19pt.
+
+If any of the three fails, F9 stays default-OFF and we iterate before promoting.
 
 ---
 
