@@ -1100,6 +1100,152 @@ WAIT — low conf htf-against
 
 ---
 
+---
+
+## 19. v5 Active Workplan — Apr 28, 2026 onward
+
+> **Status:** v5 14.20 shipped (enhanced diag log: 39 cols, toggle logging, 10-min heartbeat). Items below are queued and will be implemented in this order in upcoming sessions. Each ships as its own toggle, default OFF where applicable, with no breaking changes to existing v5 behavior.
+>
+> *(For long-term v6 ideas — pattern memory, MM playbook, Kelly sizing, etc. — see §18 below.)*
+
+### Implementation order (agreed Apr 28, 2026)
+
+| # | Item | Scope | Why this order | Target version |
+|---|---|---|---|---|
+| 1 | **TP-line render bug + manual T+/T- on auto-mode TP** | Bug fix | Live UX issue; small | v5 14.21 |
+| 2 | **Drag SL/TP/Trail lines on chart** | UX feature | High value, clean addition | v5 14.22 |
+| 3 | **Buy/Sell Limit ±N tick offset + TTL + dashed line** | New entry mode | Independent feature | v5 14.23 |
+| 4 | **AGGR-L1 / AGGR-L2 aggression levels + PACE indicator** | New dashboard buttons | High profit potential | v5 14.24 |
+| 5 | **Lead-signal entry + trend-entry mode** | Entry timing | Needs a few days of v14.20 logs first | v5 14.25 |
+| 6 | **NinjaRenko follow mode (Off / On / Renko)** | Big feature | Largest scope; last in v5 | v5 14.26 |
+
+Items 2 and 3 from the original 7-item list (hide bot labels / stealth mode) are **deferred to v6** per user decision.
+
+### 19.1 Item 1 — TP line render bug (v5 14.21)
+
+**Symptoms (user-reported Apr 27):**
+- TP line sometimes does not appear on chart for auto OR manual entries (random).
+- When TP line *does* appear, the dashboard `TP +/-` buttons sometimes do nothing in auto mode (manual nudges not propagating to redrawn line).
+
+**Investigation plan:**
+1. Find the chart-draw call that renders the TP line. Suspect candidates: `Draw.Line`/`Draw.HorizontalLine` in the position-tracking section.
+2. Check whether the draw is gated by a stale flag (e.g. `stopsArmed`, `manualTrailEarlyStart`) that does not refresh after `T+/T-` press.
+3. Check whether `manualTpOffsetPoints` (or equivalent) is actually consumed in the auto path — manual T+/T- may only be wired to the manual order route, missing the auto route.
+4. Reproduce: enter auto trade, press TP+ on dashboard, verify diag log shows `TP_NUDGE` row and `HiddenTP` column changes; check chart line refreshes.
+
+**Fix scope:**
+- Unify TP-line render to a single helper called every tick when `Position != Flat` and `hiddenTargetPrice > 0`.
+- Make `TP+/-` buttons always mutate `hiddenTargetPrice` (and the line) regardless of entry source (auto vs manual).
+- Add `WriteDiagRow("TP_NUDGE", "by=...new=...source=auto/manual")` when buttons fire.
+
+### 19.2 Item 2 — Drag SL/TP/Trail lines on chart (v5 14.22)
+
+**Spec:**
+- Replace existing `Draw.Line` calls with **draggable** `Draw.HorizontalLine` instances tagged `MmATM_SL`, `MmATM_TP`, `MmATM_TRAIL`.
+- Behind a **DRAG ON / OFF** toggle button (default OFF) so chart panning never accidentally moves a line. *(Recommended over always-on.)*
+- Each tick, poll the line's `Y` value; if it differs from the internal value by ≥ 1 tick, snap the internal value (`hiddenStopPrice` / `hiddenTargetPrice` / `trailPrice`) and write `WriteDiagRow("DRAG_SL", "old=X new=Y")` etc.
+- **Trail-line drag:** dragging the trail freezes auto-ratchet (manual override) for the rest of the trade. A `MANUAL` badge appears in trail-tier display. Toggling the dashboard `TRL OFF -> ON` re-enables auto-ratchet (per user spec).
+
+### 19.3 Item 3 — Buy/Sell Limit ±N tick offset (v5 14.23)
+
+**Spec:**
+- Beside the existing **BUY** / **SELL** dashboard buttons, add a small ±N tick spinner (default 0).
+- N = 0 → market entry (current behavior).
+- N > 0 → limit order at:
+  - **BUY**: `Bid − N × TickSize` (waits for pullback)
+  - **SELL**: `Ask + N × TickSize` (waits for spike)
+- New **TTL spinner** (default 60s, 0 = no expiry). When the TTL elapses without fill, the working limit auto-cancels. Diag rows `LIMIT_PLACED` / `LIMIT_FILLED` / `LIMIT_TTL_CANCEL`.
+- **Dashed price line** drawn on chart while limit is working (drag-able once Item 2 is in).
+
+### 19.4 Item 4 — AGGR-L1 / AGGR-L2 + PACE indicator (v5 14.24)
+
+**Aggression levels (toggle button cycles NORM → AGGR-L1 → AGGR-L2 → NORM):**
+
+| Setting | NORM | AGGR-L1 | AGGR-L2 |
+|---|---|---|---|
+| `MinSignalConfidence` | 55 | 50 | 45 |
+| `ExtensionMaxAtrFromVwap` | 5.0 | 6.0 | 8.0 |
+| `PostWinSameDirCooldownMin` | 7 | 4 | 0 |
+| `ChopFilterEnabled` | ON | ON | OFF |
+| `MinAtrPointsToTrade` (NEW gate) | 4.0 | 3.0 | 2.0 |
+| Entry-cooldown seconds | current | half | 0 |
+
+**Auto-revert safety:** AGGR levels auto-revert to NORM when daily realized P&L drops below `−$X` (configurable; default `−$300`). Diag `AGGR_AUTOREVERT`.
+
+**PACE indicator (default OFF, behind its own toggle):**
+- Computed from: ATR(30) percentile vs last 5 sessions, bars-per-minute trade activity (from tape ticks), tape Δ swing magnitude, ADX strength.
+- 4 states displayed as a colored badge top-right of dashboard:
+
+| State | Color | Trigger | Behavior when `PACE ON` |
+|---|---|---|---|
+| `🐢 SLOW` | Gray | ATR < 40th pct & ADX < 18 | **Auto-pause** new auto-entries |
+| `🟢 SAFE` | Green | ATR 40–70th pct, ADX 18–28 | Normal trading |
+| `🟡 AGGRESSIVE` | Yellow | ATR 70–90th pct, ADX > 25 | Trending; favor longer holds |
+| `🔥 VOLATILE` | OrangeRed | ATR > 90th pct OR sudden ATR spike | **Auto-tighten Runner Mode** |
+
+When `PACE OFF` (default), badge is informational only.
+
+### 19.5 Item 5 — Lead-signal entry (v5 14.25)
+
+**Pre-work:** Analyze 3–5 days of v14.20 diag logs. Specifically:
+- Count `SIGNAL` rows with `BUY/SELL` label that *did not* result in an `ENTRY_*` row within 30s.
+- Identify what blocked them (CHOP, EXTENSION, low conf, EMA-cross-confirmation delay, etc.).
+- Quantify: would lead-entry have produced more profit on those missed setups, or more whipsaws?
+
+**Build (only after analysis confirms):**
+- New **LEAD ON/OFF** toggle (default OFF).
+- When ON, the moment manual signal flips to BUY/SELL with `dom ≥ MinSignalConfidence + 5`, queue an immediate auto-entry skipping EMA-cross-confirmation delay.
+- Restricted to **trend regime** (ADX > threshold + EMA stack + HTF agree) to avoid lead-entries in chop.
+
+### 19.6 Item 6 — NinjaRenko follow mode (v5 14.26 — biggest)
+
+**Architecture:** Add Renko 64-tick / 16-offset as a **secondary data series** via `AddRenko()`, accessed via `BarsArray[2]`. Trades fire on the primary chart's prices; Renko is a signal/management overlay only.
+
+**Configurable parameters:**
+- `RenkoBrickTicks` (default 64)
+- `RenkoOffsetTicks` (default 16)
+
+**3-mode toggle button (default OFF):**
+
+| Mode | Behavior |
+|---|---|
+| `RNK OFF` | No Renko influence (current strategy unchanged) |
+| `RNK ON` | **Augment** — entries require BOTH standard signal AND Renko brick alignment |
+| `RNK THRUST` | On 3 same-color bricks in a row, switch to wide RUNNER-style trail; otherwise behave like `RNK ON` |
+
+**Within-brick scalping (the "stuck-in-bar" detection):**
+- Track ticks-since-current-brick-open; display `Brick: 0:42` on dashboard.
+- "STUCK" detection: no progress toward either side > N seconds AND tape balanced AND price oscillating in middle 50% of brick → enable scalp mode.
+- Scalp logic: place tight limit BUY near brick low and tight limit SELL near brick high; close on opposite side touch. Cancels both when brick finally closes.
+- **Trap protection:** if a third reversal happens within the brick OR ATR spikes, kill scalp mode and revert to bar-mode trail.
+
+**Trail in Renko mode:**
+- SL = previous closed brick's far edge − 1 tick.
+- On trap detection (price reverses through brick mid) → tighten to "current brick mid + 2 ticks".
+- On thrust (3 same-color bricks) → switch to RUNNER trail (1.5×ATR, no aggression mults).
+
+**Dashboard additions:**
+- Brick state badge: `■ ■ ■` colored last 3 bricks.
+- `Brick Time: m:ss` (since current brick open).
+- `Renko Mode: OFF / ON / THRUST` indicator.
+
+### 19.7 Carry-over deferred items (already in v6 roadmap §18)
+
+These were considered for v5 but bumped to v6 per user decision:
+- **Item 2 / Stealth Mode** — hide bot-tell labels in execution `Name` column. Requires unmanaged-orders refactor (~200 lines). Stays as v6 feature K.
+- Pattern-Memory Engine, MM Playbook Detector, per-hour self-tuning, Kelly sizing, etc. — all v6.
+
+### 19.8 Working agreement
+
+- One item per session, committed individually with message `v5 14.<NN>: <description>`.
+- Each item ships behind a toggle (where applicable), default OFF unless user explicitly opts to default ON.
+- Compile check (`get_errors`) before every commit.
+- After commit, user reloads strategy in NT8 (F5) and tests. We move on only after user confirms.
+- Diag log for each new feature: at least one `ACTION` row per state change, with enough Detail to post-mortem.
+- Spec doc updated at the end of each implementation session.
+
+---
+
 ## 18. v5 Stability Lock & v6 Roadmap — "Make MM open their mouth"
 
 > **Status (Apr 27, 2026):** v5 14.19 is the **stable production line**. No more invasive changes go into v5 — only bug fixes and parameter tuning. All structural ideas below are deferred to **`Mm_ATM_v6.cs`** (new file, fork of v5 14.19).
