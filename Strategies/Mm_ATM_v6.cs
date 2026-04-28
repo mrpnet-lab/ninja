@@ -84,11 +84,26 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool   enableRenkoSeries;
         private int    renkoBrickSize;       // ticks per brick (NinzaRenko equiv: 64)
         private int    renkoBrickOffset;     // reversal offset in ticks (NinzaRenko equiv: 16)
+        // Stock NT8 Renko (BarsArray[2]) — sanity-comparison series
         private string lastBrickColor;       // "G" / "R" / ""
         private int    brickStreakCount;     // consecutive same-color bricks (1 on first)
         private double lastBrickHigh, lastBrickLow, lastBrickClose;
         private int    renkoBarsSeen;
         private int    lastProcessedRenkoBar; // dedupe — set to CurrentBars[2] of last brick processed
+        private bool   seriesAnnounced;       // one-shot diag print of BarsArray composition
+        // v6 0.2.3 — NinzaRenko (third-party) on BarsArray[3] via NT8 Custom0..Custom9 slot.
+        // This is the PRIMARY brick signal (matches what user trades off visually).
+        // Stock Renko (BarsArray[2]) is kept as a sanity comparison.
+        private bool   enableNinzaRenkoSeries;   // default ON
+        private int    ninzaCustomSlot;          // 0..9 — which Custom slot NinzaRenko is registered to in NT8
+        private bool   ninzaSeriesAdded;         // true if AddDataSeries call succeeded at Configure
+        private bool   usePrimaryAsNinzaRenko;   // v6 0.2.4 — read NR brick color from primary BarsArray[0] (typical setup)
+        private string lastNrBrickColor;         // NinzaRenko brick color
+        private int    nrBrickStreakCount;       // NinzaRenko streak
+        private double lastNrBrickHigh, lastNrBrickLow, lastNrBrickClose;
+        private int    nrBarsSeen;
+        private int    lastProcessedNrBar;
+        private const int NINZA_BIP = 3;         // BarsArray index for NinzaRenko
         #endregion
 
         // ===========================================================
@@ -636,6 +651,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                     lastBrickColor    = "";
                     brickStreakCount  = 0;
                     lastProcessedRenkoBar = -1;
+                    // v6 0.2.3 — NinzaRenko (third-party) defaults
+                    enableNinzaRenkoSeries = true;
+                    ninzaCustomSlot   = 0;       // most common default; user can change in property panel
+                    usePrimaryAsNinzaRenko = true;  // v6 0.2.4 — default ON; works when chart primary IS NinzaRenko
+                    lastNrBrickColor  = "";
+                    nrBrickStreakCount = 0;
+                    lastProcessedNrBar = -1;
                 }
                 else if (State == State.Configure)
                 {
@@ -664,6 +686,45 @@ namespace NinjaTrader.NinjaScript.Strategies
                             Value          = renkoBrickSize,
                             Value2         = renkoBrickOffset
                         });
+                        Print(TAG + "Configure: AddDataSeries Renko " + renkoBrickSize + "/" + renkoBrickOffset + " requested. BarsArray will be index 2.");
+                    }
+                    else
+                    {
+                        Print(TAG + "Configure: enableRenkoSeries=false — NO Renko series added. BrickColor will stay blank.");
+                    }
+
+                    // v6 0.2.3: NinzaRenko (third-party) on BarsArray[3] via Custom0..Custom9 slot.
+                    // NinzaRenko registers itself in NT8 under one of the Custom* enum values; the user
+                    // sees it as "NinzaRenko" in the bar-type picker. Which Custom slot it occupies
+                    // depends on NT8 install order — user can change ninzaCustomSlot in property panel.
+                    ninzaSeriesAdded = false;
+                    if (enableNinzaRenkoSeries && !usePrimaryAsNinzaRenko)
+                    {
+                        // NinzaRenko (third-party) registers itself in NT8 under a Custom BarsPeriodType
+                        // whose underlying int value depends on install order. The user selects the right
+                        // value via NinzaCustomSlot (try 100, 101, ... or whatever NinzaRenko ended up at).
+                        // The raw cast lets us reach it without naming the enum at compile time.
+                        BarsPeriodType nrType = (BarsPeriodType)ninzaCustomSlot;
+                        try
+                        {
+                            AddDataSeries(new BarsPeriod
+                            {
+                                BarsPeriodType = nrType,
+                                Value          = renkoBrickSize,
+                                Value2         = renkoBrickOffset
+                            });
+                            ninzaSeriesAdded = true;
+                            Print(TAG + "Configure: AddDataSeries NinzaRenko (BarsPeriodType=" + (int)nrType + "/" + nrType + ") " + renkoBrickSize + "/" + renkoBrickOffset + " requested. Expected at BarsArray[3].");
+                        }
+                        catch (Exception ex)
+                        {
+                            Print(TAG + "Configure: NinzaRenko AddDataSeries (BarsPeriodType int=" + ninzaCustomSlot + ") FAILED: " + ex.Message
+                                + ". Wrong slot for NinzaRenko on this NT8 install. Try a different NinzaCustomSlot value (common NinzaRenko ints: 100, 101, 102, ...). See NT8 Output window for the correct value when NinzaRenko loads on a chart.");
+                        }
+                    }
+                    else
+                    {
+                        Print(TAG + "Configure: enableNinzaRenkoSeries=false — NinzaRenko skipped.");
                     }
 
                     if (showEma)
@@ -776,7 +837,28 @@ namespace NinjaTrader.NinjaScript.Strategies
             // v6 Phase 0.2: Renko brick events (BarsArray[2] when enabled).
             // Process FIRST so diag-log brick fields stay current for primary-series rows.
             if (BarsInProgress == 2) { ProcessRenkoBar(); return; }
+            // v6 0.2.3: NinzaRenko brick events (BarsArray[3] when enabled & Custom slot correct)
+            if (BarsInProgress == NINZA_BIP) { ProcessNinzaRenkoBar(); return; }
             if (BarsInProgress != 0) return;
+            // v6 0.2.4: when primary chart IS NinzaRenko, read brick state directly from BarsArray[0].
+            // Each closed primary bar = one brick. No separate AddDataSeries needed.
+            if (enableNinzaRenkoSeries && usePrimaryAsNinzaRenko && CurrentBar >= 1)
+            {
+                ProcessPrimaryAsNinzaRenkoBar();
+            }
+            // One-shot: announce how many series are actually subscribed (helps diagnose missing Renko).
+            if (!seriesAnnounced && CurrentBar > 5)
+            {
+                seriesAnnounced = true;
+                int n = BarsArray != null ? BarsArray.Length : 0;
+                Print(TAG + "OnBarUpdate first BIP=0 fire — BarsArray.Length=" + n
+                    + " (expected 4: primary + 5min + Renko + NinzaRenko); enableRenkoSeries=" + enableRenkoSeries
+                    + " enableNinzaRenkoSeries=" + enableNinzaRenkoSeries + " ninzaCustomSlot=" + ninzaCustomSlot);
+                if (enableRenkoSeries && n < 3)
+                    Print(TAG + "WARNING: Stock Renko series NOT in BarsArray. ProcessRenkoBar will never fire. Reload strategy.");
+                if (enableNinzaRenkoSeries && n < 4)
+                    Print(TAG + "WARNING: NinzaRenko series NOT in BarsArray. Wrong Custom slot? Try a different value of NinzaCustomSlot in the property panel.");
+            }
             if (CurrentBar < BarsRequiredToTrade) return;
 
             try
@@ -3385,9 +3467,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             lastProcessedRenkoBar = b;
             renkoBarsSeen++;
             if (renkoBarsSeen == 1)
-                Print(TAG + "Renko series ALIVE — first brick seen, size=" + renkoBrickSize + "tk off=" + renkoBrickOffset + "tk");
-            // Compare current brick (just opened) against its open vs close.
-            // For a CLOSED brick we look at index 1 once available; otherwise use index 0.
+                Print(TAG + "Stock Renko series ALIVE — first brick seen, size=" + renkoBrickSize + "tk off=" + renkoBrickOffset + "tk");
             int idx = CurrentBars[2] >= 2 ? 1 : 0;
             double bOpen  = Opens[2][idx];
             double bClose = Closes[2][idx];
@@ -3401,10 +3481,76 @@ namespace NinjaTrader.NinjaScript.Strategies
             lastBrickClose = bClose;
             if (enableDiagLog)
                 WriteDiagRow("BRICK_CLOSE",
-                    "color=" + color + " streak=" + brickStreakCount
+                    "src=stock color=" + color + " streak=" + brickStreakCount
                     + " o=" + bOpen.ToString("F2") + " c=" + bClose.ToString("F2")
                     + " hi=" + bHigh.ToString("F2") + " lo=" + bLow.ToString("F2")
                     + " size=" + renkoBrickSize + "tk off=" + renkoBrickOffset + "tk");
+        }
+
+        // -----------------------------------------------------------
+        //  v6 0.2.4 — Treat primary BarsArray[0] AS NinzaRenko bricks.
+        //  Used when the chart's primary bar type IS NinzaRenko (typical user setup).
+        //  Bypasses the AddDataSeries/Custom-slot dance — each primary bar = one brick.
+        // -----------------------------------------------------------
+        private void ProcessPrimaryAsNinzaRenkoBar()
+        {
+            if (CurrentBar == lastProcessedNrBar) return;
+            lastProcessedNrBar = CurrentBar;
+            nrBarsSeen++;
+            if (nrBarsSeen == 1)
+                Print(TAG + "NinzaRenko (primary) ALIVE — reading bricks from BarsArray[0]. First bar O=" + Open[0].ToString("F2") + " C=" + Close[0].ToString("F2"));
+            // Use last fully-closed bar (index 1) when available; else current.
+            int idx = CurrentBar >= 1 ? 1 : 0;
+            double bOpen  = Open[idx];
+            double bClose = Close[idx];
+            double bHigh  = High[idx];
+            double bLow   = Low[idx];
+            string color  = bClose > bOpen ? "G" : (bClose < bOpen ? "R" : (lastNrBrickColor ?? ""));
+            if (color == lastNrBrickColor && color != "") nrBrickStreakCount++;
+            else { nrBrickStreakCount = 1; lastNrBrickColor = color; }
+            lastNrBrickHigh  = bHigh;
+            lastNrBrickLow   = bLow;
+            lastNrBrickClose = bClose;
+            ninzaSeriesAdded = true;  // mark NR active so dashboard shows color, not "off"
+            if (enableDiagLog)
+                WriteDiagRow("BRICK_CLOSE",
+                    "src=primary color=" + color + " streak=" + nrBrickStreakCount
+                    + " o=" + bOpen.ToString("F2") + " c=" + bClose.ToString("F2")
+                    + " hi=" + bHigh.ToString("F2") + " lo=" + bLow.ToString("F2"));
+        }
+
+        // -----------------------------------------------------------
+        //  Same logic as stock Renko handler but reads BarsArray[NINZA_BIP] and updates
+        //  the lastNrBrickColor / nrBrickStreakCount fields. This is the PRIMARY brick
+        //  signal (matches what user visually trades off of).
+        // -----------------------------------------------------------
+        private void ProcessNinzaRenkoBar()
+        {
+            if (BarsArray == null || BarsArray.Length <= NINZA_BIP) return;
+            if (CurrentBars[NINZA_BIP] < 1) return;
+            int b = CurrentBars[NINZA_BIP];
+            if (b == lastProcessedNrBar) return;
+            lastProcessedNrBar = b;
+            nrBarsSeen++;
+            if (nrBarsSeen == 1)
+                Print(TAG + "NinzaRenko series ALIVE (BarsPeriodType int=" + ninzaCustomSlot + ") — first brick seen, size=" + renkoBrickSize + "tk trend=" + renkoBrickOffset + "tk");
+            int idx = CurrentBars[NINZA_BIP] >= 2 ? 1 : 0;
+            double bOpen  = Opens[NINZA_BIP][idx];
+            double bClose = Closes[NINZA_BIP][idx];
+            double bHigh  = Highs[NINZA_BIP][idx];
+            double bLow   = Lows[NINZA_BIP][idx];
+            string color  = bClose > bOpen ? "G" : (bClose < bOpen ? "R" : (lastNrBrickColor ?? ""));
+            if (color == lastNrBrickColor && color != "") nrBrickStreakCount++;
+            else { nrBrickStreakCount = 1; lastNrBrickColor = color; }
+            lastNrBrickHigh  = bHigh;
+            lastNrBrickLow   = bLow;
+            lastNrBrickClose = bClose;
+            if (enableDiagLog)
+                WriteDiagRow("BRICK_CLOSE",
+                    "src=ninza color=" + color + " streak=" + nrBrickStreakCount
+                    + " o=" + bOpen.ToString("F2") + " c=" + bClose.ToString("F2")
+                    + " hi=" + bHigh.ToString("F2") + " lo=" + bLow.ToString("F2")
+                    + " size=" + renkoBrickSize + "tk trend=" + renkoBrickOffset + "tk");
         }
         #endregion
 
@@ -3869,6 +4015,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             int    snapBrickStreak = brickStreakCount;
             int    snapBrickSize   = renkoBrickSize;
             int    snapBrickOff    = renkoBrickOffset;
+            // v6 0.2.3 NinzaRenko snapshot (PRIMARY brick signal)
+            bool   snapNrOn        = enableNinzaRenkoSeries && ninzaSeriesAdded;
+            string snapNrColor     = lastNrBrickColor ?? "";
+            int    snapNrStreak    = nrBrickStreakCount;
 
             double snapAcctRealized = 0, snapAcctUnreal = 0, snapAcctBal = 0;
             bool snapAcctOk = false;
@@ -4011,24 +4161,30 @@ namespace NinjaTrader.NinjaScript.Strategies
                     lblTradeHours.Foreground = inHr ? Brushes.LimeGreen : Brushes.Gray;
 
                     // v6 0.2.1 brick row — read-only Renko 64/16 status
+                    // v6 0.2.3: shows BOTH NinzaRenko (primary) and stock Renko (sanity).
                     if (lblBrickInfo != null)
                     {
-                        if (!snapRenkoOn)
+                        if (!snapRenkoOn && !snapNrOn)
                         {
                             lblBrickInfo.Text = "Brick: off";
                             lblBrickInfo.Foreground = Brushes.DimGray;
                         }
-                        else if (string.IsNullOrEmpty(snapBrickColor))
-                        {
-                            lblBrickInfo.Text = "Brick: —  (" + snapBrickSize + "/" + snapBrickOff + ")";
-                            lblBrickInfo.Foreground = Brushes.Gray;
-                        }
                         else
                         {
-                            string colorWord = snapBrickColor == "G" ? "GREEN" : (snapBrickColor == "R" ? "RED" : snapBrickColor);
-                            lblBrickInfo.Text = "Brick: " + colorWord + " ×" + snapBrickStreak + "  (" + snapBrickSize + "/" + snapBrickOff + ")";
-                            lblBrickInfo.Foreground = snapBrickColor == "G" ? Brushes.LimeGreen
-                                                    : (snapBrickColor == "R" ? Brushes.OrangeRed : Brushes.Gray);
+                            string nrPart, srPart;
+                            // NinzaRenko part (primary)
+                            if (!snapNrOn) nrPart = "NR=off";
+                            else if (string.IsNullOrEmpty(snapNrColor)) nrPart = "NR=—";
+                            else nrPart = "NR=" + (snapNrColor == "G" ? "GREEN" : snapNrColor == "R" ? "RED" : snapNrColor) + "×" + snapNrStreak;
+                            // Stock Renko part (sanity)
+                            if (!snapRenkoOn) srPart = "SR=off";
+                            else if (string.IsNullOrEmpty(snapBrickColor)) srPart = "SR=—";
+                            else srPart = "SR=" + snapBrickColor + "×" + snapBrickStreak;
+                            lblBrickInfo.Text = "Brick: " + nrPart + "  " + srPart + "  (" + snapBrickSize + "/" + snapBrickOff + ")";
+                            // Color based on PRIMARY (NinzaRenko); fall back to stock if NR missing.
+                            string primaryColor = !string.IsNullOrEmpty(snapNrColor) ? snapNrColor : snapBrickColor;
+                            lblBrickInfo.Foreground = primaryColor == "G" ? Brushes.LimeGreen
+                                                    : (primaryColor == "R" ? Brushes.OrangeRed : Brushes.Gray);
                         }
                     }
 
@@ -4375,8 +4531,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 double distPdHiPts = prevDayHigh > 0 ? (pxClose - prevDayHigh) / tickPtMm : 0;
                 double distPdLoPts = prevDayLow  > 0 ? (pxClose - prevDayLow)  / tickPtMm : 0;
                 // Renko placeholders — filled by W6 Phase 0.2 plumbing
-                string brickColor = lastBrickColor ?? "";   // "G" / "R" / ""
-                int brickStreak = brickStreakCount;
+                // v6 0.2.3: BrickColor/Streak now report NinzaRenko (primary) when available,
+                // else stock Renko. Keeps the diag-log format stable while upgrading the source.
+                string brickColor = !string.IsNullOrEmpty(lastNrBrickColor) ? lastNrBrickColor
+                                    : (lastBrickColor ?? "");
+                int brickStreak = !string.IsNullOrEmpty(lastNrBrickColor) ? nrBrickStreakCount
+                                    : brickStreakCount;
                 // Regime placeholder — filled by F1 in Phase 1
                 string regime = "";
 
@@ -4958,6 +5118,21 @@ namespace NinjaTrader.NinjaScript.Strategies
         [NinjaScriptProperty][Range(0, 256)]
         [Display(Name = "Renko Reversal Offset (ticks)", Order = 3, GroupName = "9 - Renko")]
         public int RenkoBrickOffset { get { return renkoBrickOffset; } set { renkoBrickOffset = value; } }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Enable NinzaRenko Series (third-party)", Order = 4, GroupName = "9 - Renko",
+            Description = "Adds NinzaRenko (third-party) on BarsArray[3] using the Custom slot below. This is the PRIMARY brick signal used by the dashboard and diag log. Stock Renko (above) is kept as a sanity comparison. If NinzaRenko is not installed, leave OFF.")]
+        public bool EnableNinzaRenkoSeries { get { return enableNinzaRenkoSeries; } set { enableNinzaRenkoSeries = value; } }
+
+        [NinjaScriptProperty][Range(0, 9999)]
+        [Display(Name = "NinzaRenko BarsPeriodType (int)", Order = 5, GroupName = "9 - Renko",
+            Description = "Raw integer value of the BarsPeriodType under which NinzaRenko is registered on this NT8 install. Default 0 will likely fail — watch the NT8 Output window for the FAILED message, then try common values (100, 101, 102, ...). Once 'NinzaRenko series ALIVE (BarsPeriodType int=N)' prints, save N here.")]
+        public int NinzaCustomSlot { get { return ninzaCustomSlot; } set { ninzaCustomSlot = value; } }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Use Primary Chart AS NinzaRenko", Order = 6, GroupName = "9 - Renko",
+            Description = "When ON (default), the strategy reads NinzaRenko brick color/streak directly from the primary chart series — use this when your chart bar type is already NinzaRenko (no AddDataSeries needed). When OFF, the strategy will try to AddDataSeries using NinzaCustomSlot above.")]
+        public bool UsePrimaryAsNinzaRenko { get { return usePrimaryAsNinzaRenko; } set { usePrimaryAsNinzaRenko = value; } }
         #endregion
     }
 }
