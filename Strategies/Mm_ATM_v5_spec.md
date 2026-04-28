@@ -1229,6 +1229,88 @@ When `PACE OFF` (default), badge is informational only.
 - `Brick Time: m:ss` (since current brick open).
 - `Renko Mode: OFF / ON / THRUST` indicator.
 
+#### 19.6.A Case study — Apr 28, 2026 morning rally (the missed +96 pts)
+
+**Reference chart:** `NQ 06-26 / nnZaRenko 64`, ~07:30 → 08:55 ET. Big morning sell-off bottoms ~08:34 at ~27059, then a clean uptrend prints continuous green Renko bricks all the way to ~27155 by ~09:00.
+
+**What v5 14.20 actually did (from `MmATM_v5_DiagLog_20260428.csv`):**
+
+| Time | Close | Action | Bull | Bear | htfBias | Signal | Note |
+|---|---|---|---|---|---|---|---|
+| 08:34:09 | 27059.50 | EXIT_WIN_CLOSE | 0 | 0 | -1 | WAIT | Closed winning short ✅ |
+| 08:34:42 | 27064.75 | EXIT_WIN_CLOSE | 0 | 0 | -1 | WAIT | Closed second winner ✅ |
+| 08:35:30 | 27075.25 | SIGNAL | 10 | 20 | -1 | WAIT | Bottom in, but htfBias still −1 |
+| 08:35:45 | 27083.25 | SIGNAL | **62.5** | 0 | 0 | WAIT | Bull conf strong, htfBias just flipped |
+| 08:39:49 | 27087.75 | SIGNAL | **93.6** | 0 | 0 | **BUY** | Conf maxed |
+| 08:40:00 | 27091.25 | SIGNAL | 57.5 | 0 | 0 | **STRONG_BUY** | Strongest moment |
+| 08:40:14 | 27095.75 | SIGNAL | 60.0 | 0 | 0 | BUY |  |
+| 08:43:46 | 27107.25 | SIGNAL | 55.5 | 0 | 0 | WAIT | Pullback w/ tape +0.61 |
+| 08:47:04 | 27111.25 | SIGNAL | 52.3 | 0 | 0 | BUY |  |
+| 08:48:49 | 27119.25 | SIGNAL | 45.5 | 0 | 0 | BUY |  |
+| 08:51:32 | 27135.25 | SIGNAL | 45.0 | 0 | 0 | BUY |  |
+| 08:57:33 | 27143.50 | SIGNAL | 35.0 | 0 | 0 | BUY |  |
+| 09:00:47 | 27155.25 | SIGNAL | 45.5 | 0 | 0 | WAIT | Top of move |
+
+**Result:** **Zero `ENTRY_LONG` rows in the entire window.** The bot watched +95.75 NQ pts ≈ **+$1,915/contract** print without participating.
+
+> ⚠️ **Important context (user note Apr 28):** the 08:34 → 09:00 window is **pre-RTH** (NQ regular session opens 09:30 ET). With **`HRS ON`** (the default), auto-entries are hard-blocked here regardless of signal quality. So the "miss" is only a miss in a parallel world where the user had toggled `HRS OFF` for the morning. The case study still stands as a profile of *what Renko thrust mode would do* once it is allowed to fire — the rally itself is the realistic, repeatable pattern.
+
+Likely *additional* blockers that would still have applied even with `HRS OFF`: htfBias still recovering from −1, post-win same-direction cooldown after closing winning shorts, EMA-cross-confirmation delay, `EXTENSION` filter as price ran from VWAP.
+
+**Why Renko 64/16 + THRUST mode would have nailed this:**
+
+- 16 ticks = **4 NQ pts per brick**. The 96-pt rally = ~24 consecutive green bricks.
+- 3-brick thrust trigger fires by ~08:40 (around 27083 → 27095). Even entering on the **3rd brick close** = ~27091, exit on opposite-color brick close (which never came until ~27155) = **~64 pts capture / +$1,280** with a single contract.
+- Renko view collapses the choppy 1-min noise that kept `htfBias` and pullback filters whipsawing.
+- THRUST trail sits at "previous brick far edge − 1 tick" = always ~5–9 pts behind. No wide-stop drama, no aggressive-pullback exits.
+
+#### 19.6.B Concrete profit recommendations (built from this case)
+
+These are the **specific rules** to implement when we ship v5 14.26. Each is a numbered acceptance test we will run against the Apr 28 log.
+
+1. **Thrust entry (independent of standard signal)** — when `RNK THRUST` mode is selected, allow entry on the **close of the 3rd consecutive same-color brick** even if the standard 12+5 entry filters block (htfBias mismatch, post-win cooldown, EMA-cross delay, extension). Rationale: standard filters are tuned for 1-min bars and reject the early phase of clean Renko thrusts. Override is gated by:
+   - `MinThrustBricks = 3` (configurable, 2–4)
+   - All 3 bricks closed within `ThrustMaxMinutes = 8` (avoid stale "thrust" from sleepy session)
+   - ATR(30) > `MinAtrPointsToTrade` (still need volatility)
+   - htfBias ≠ opposite (≥ 0 for longs, ≤ 0 for shorts) — **0 is allowed** (this would have caught Apr 28)
+   - Tape average over last 30s ≥ +0.15 for longs / ≤ −0.15 for shorts
+
+2. **Brick-close trail (no time exit during thrust)** — once entered in THRUST, SL/trail = `previousBrickFarEdge − 1 tick` (long) or `previousBrickFarEdge + 1 tick` (short). **Disable** all of: AGGR_PULLBACK, peak-giveback %, time-stop, void-bar exit. Only re-enable on first opposite-color brick close. Rationale: Apr 28 had multiple shallow pullbacks (`Bull` dropped 93→55→52→45) that would have triggered standard exits while Renko bricks stayed solid green.
+
+3. **Continuation re-entry on pullback brick** — if a long position is exited by a single red brick but the **next brick prints green and closes above the red brick's high**, allow immediate re-entry (one re-try only, must be within `ReentryWindowMinutes = 4`). Counts as part of original trade for cooldown tracking. Rationale: clean Renko thrusts often print one "noise red" mid-rally; we should not be locked out for the rest of the move.
+
+4. **Within-brick scalp (stuck-bar mode)** — only active when **NOT** in an open thrust position and **NOT** in `RNK THRUST` mode (i.e. `RNK ON` only). Conditions:
+   - Current brick has been open ≥ `StuckSeconds = 90`
+   - Tape average over last 30s in `[-0.15, +0.15]` (balanced)
+   - Price oscillating in middle 50% of brick (touched both `low+25%` and `low+75%` at least twice)
+   - ATR not spiking above prior 5-bar average × 1.4
+   
+   Then place limit BUY at `brickLow + 1 tick` and limit SELL at `brickHigh − 1 tick`, qty = 1 each. First fill activates a 6-pt fixed target and 8-pt fixed stop. **Hard kill switch:** if a third intra-brick reversal happens or brick finally breaks on momentum (ATR spike), cancel both legs and revert.
+
+5. **Brick-edge dragon-stop (Renko-aware trail outside thrust)** — when in any open position and `RNK ON`, override the standard 4-tier trail with: **trail = previous closed brick's far edge − 1 tick**, but only if it tightens (ratchets, never loosens). This replaces the existing AGGR_PULLBACK distance check with a structural one — MM cannot stop-hunt below a Renko brick boundary without reversing the brick.
+
+6. **Thrust pause on doji-bricks** — if 2 consecutive bricks alternate color (G-R-G or R-G-R) within 3 minutes, mark thrust as **stalled** and revert to `RNK ON` rules. Don't exit, but stop counting bricks toward thrust streak.
+
+7. **PACE integration (when both Item 4 + Item 6 ON):**
+   - `🐢 SLOW`: don't fire thrust entries (low ATR rallies fizzle).
+   - `🟢 SAFE` / `🟡 AGGRESSIVE`: full thrust rules.
+   - `🔥 VOLATILE`: tighten thrust trail to `previousBrickFarEdge` (no extra tick of slack).
+
+8. **Diag log additions for Renko mode:**
+   - New columns: `BrickColor` (G/R), `BrickAgeSec`, `ThrustStreak` (consecutive same-color count), `RenkoMode` (OFF/ON/THRUST).
+   - New `Action` rows: `BRICK_CLOSE` (Detail = `color=G hi=27091.25 lo=27087.25 streak=3`), `THRUST_ENTRY`, `THRUST_TRAIL_RATCHET`, `THRUST_STALL`, `BRICK_REENTRY`, `STUCK_SCALP_PLACE`, `STUCK_SCALP_FILL`, `STUCK_SCALP_KILL`.
+
+**Acceptance test for v5 14.26 (run before declaring done):** Replay Apr 28, 2026 with `RNK THRUST` mode + thrust override ON. Must produce a `THRUST_ENTRY` row at the close of the 3rd green brick following the 08:34 bottom, hold (no AGGR_PULLBACK exit) until first red brick after the 09:00 top, and book ≥ **+50 NQ pts** ($1,000) realized on the move.
+
+#### 19.6.C Implementation risk notes
+
+- `AddRenko()` requires `Bars` index handling: any reference inside `OnBarUpdate` must guard with `if (BarsInProgress != 0) { /* update Renko state only */ return; }` or trades will fire on Renko closes.
+- Brick close detection: use `BarsArray[2].LastPrice` change between `IsFirstTickOfBar` events on `BarsInProgress == 2`.
+- Performance: Renko is `OnPriceChange`-equivalent — keep brick-state updates O(1).
+- **Don't** route entry orders through the Renko series; always use primary `BarsArray[0]` for entry/exit so price ladders are correct.
+- Save `RenkoBrickTicks` / `RenkoOffsetTicks` as user-properties so testers can experiment with 32/8 (faster) and 96/24 (slower) without recompile.
+- **HRS interaction:** thrust override does **not** bypass the `HRS ON` time-window filter. If the user wants to capture pre-RTH thrusts (like Apr 28's 08:34 rally), they must explicitly toggle `HRS OFF` first. We may later add an opt-in `THRUST_BYPASS_HRS` sub-toggle (default OFF) for users who specifically want overnight/pre-market thrust trading — flagged as risky and logged separately.
+
 ### 19.7 Carry-over deferred items (already in v6 roadmap §18)
 
 These were considered for v5 but bumped to v6 per user decision:
