@@ -445,6 +445,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private TextBlock lblConfBear;
         private TextBlock lblVwapVal;
         private TextBlock lblTradeHours;
+        private TextBlock lblBrickInfo;       // v6 0.2.1 — read-only Renko brick color/streak
         private TextBlock lblQtyVal;
         private TextBlock lblSlVal;
         private TextBlock lblTpVal;
@@ -3585,8 +3586,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                     // VWAP / hours
                     lblVwapVal    = MakeLabel("VWAP: —", Brushes.Yellow, 10, FontWeights.Normal, HorizontalAlignment.Left);
                     lblTradeHours = MakeLabel("Hours: —", Brushes.Gray, 10, FontWeights.Normal, HorizontalAlignment.Left);
+                    // v6 0.2.1: read-only Renko brick info (data plumbing from Phase 0.2 already maintains the values).
+                    // Hidden when Renko series is disabled. Color matches brick color so you can eyeball confluence.
+                    lblBrickInfo  = MakeLabel("Brick: —", Brushes.Gray, 10, FontWeights.Normal, HorizontalAlignment.Left);
                     stack.Children.Add(lblVwapVal);
                     stack.Children.Add(lblTradeHours);
+                    stack.Children.Add(lblBrickInfo);
 
                     stack.Children.Add(MakeSep());
 
@@ -3851,6 +3856,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             int snapSignal = manualSignalLevel;
             string snapSignalReason = manualSignalReason;
             string snapLastStrat = lastAutoStrategyUsed;
+            // v6 0.2.1 Renko brick snapshot (cheap reads of Phase 0.2 fields)
+            bool   snapRenkoOn     = enableRenkoSeries;
+            string snapBrickColor  = lastBrickColor ?? "";
+            int    snapBrickStreak = brickStreakCount;
+            int    snapBrickSize   = renkoBrickSize;
+            int    snapBrickOff    = renkoBrickOffset;
 
             double snapAcctRealized = 0, snapAcctUnreal = 0, snapAcctBal = 0;
             bool snapAcctOk = false;
@@ -3991,6 +4002,28 @@ namespace NinjaTrader.NinjaScript.Strategies
                     bool inHr = !tradingHoursEnabled || (snapTime >= tradingStartTime && snapTime < flattenTime);
                     lblTradeHours.Text = "Hours: " + (inHr ? "● open " : "○ closed ") + FormatTime(tradingStartTime) + "–" + FormatTime(flattenTime);
                     lblTradeHours.Foreground = inHr ? Brushes.LimeGreen : Brushes.Gray;
+
+                    // v6 0.2.1 brick row — read-only Renko 64/16 status
+                    if (lblBrickInfo != null)
+                    {
+                        if (!snapRenkoOn)
+                        {
+                            lblBrickInfo.Text = "Brick: off";
+                            lblBrickInfo.Foreground = Brushes.DimGray;
+                        }
+                        else if (string.IsNullOrEmpty(snapBrickColor))
+                        {
+                            lblBrickInfo.Text = "Brick: —  (" + snapBrickSize + "/" + snapBrickOff + ")";
+                            lblBrickInfo.Foreground = Brushes.Gray;
+                        }
+                        else
+                        {
+                            string colorWord = snapBrickColor == "G" ? "GREEN" : (snapBrickColor == "R" ? "RED" : snapBrickColor);
+                            lblBrickInfo.Text = "Brick: " + colorWord + " ×" + snapBrickStreak + "  (" + snapBrickSize + "/" + snapBrickOff + ")";
+                            lblBrickInfo.Foreground = snapBrickColor == "G" ? Brushes.LimeGreen
+                                                    : (snapBrickColor == "R" ? Brushes.OrangeRed : Brushes.Gray);
+                        }
+                    }
 
                     if (lblActiveStrategy != null)
                     {
