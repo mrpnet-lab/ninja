@@ -113,6 +113,34 @@ namespace NinjaTrader.NinjaScript.Strategies
         private string prevRegime    = "UNKNOWN";
         private int    regimeChangedBar;          // CurrentBar of last regime transition (for dashboard age)
         private int    regimeFlipsLast20;         // count of NR brick color flips in last 20 bricks (chop signal)
+
+        // ---- v6 1.2/1.3/1.4 — Brick Run Tracker / Wick Analyzer / MM Pattern Recorder ----
+        // All observation-only. Default OFF. When ON, populate diag log with RUN_END / WICK_TAG /
+        // MM_PATTERN rows that we mine to design Phase 2 entry/exit/trail logic.
+        // Goal: identify how many bricks the typical "runner" trend lasts so the trail can ride
+        // monster moves (we observed streaks of 30 bricks = 480 NQ pts on one playback day).
+        private bool   enableBrickAnalytics;     // master toggle for Phase 1.2-1.4 observation
+        // Run tracker (live counters):
+        private int    runCurrentLen;             // = nrBrickStreakCount but kept independent in case
+        private string runCurrentColor = "";      // "G"/"R"
+        private double runStartPrice;             // Open of first brick in current run
+        private double runMaxFavPts;              // best favorable excursion within the run (pts from runStartPrice)
+        private DateTime runStartTime;
+        private int    runMaxLast10 = 0;          // moving max of last 10 completed runs (regime helper)
+        private System.Collections.Generic.Queue<int> runLast10 = new System.Collections.Generic.Queue<int>();
+        // Brick speed (inter-arrival):
+        private DateTime lastBrickTime;
+        private double   lastBrickIntervalSec;
+        private int      fastBricksLast10;        // count of <10sec bricks in last 10
+        private System.Collections.Generic.Queue<double> brickIntervalsLast10 = new System.Collections.Generic.Queue<double>();
+        // MM pattern ring buffer (last 20 bricks):
+        private System.Collections.Generic.Queue<string> brickColorRing = new System.Collections.Generic.Queue<string>();
+        private DateTime lastMmPatternEmit;
+        // Wick analytics on most recent brick:
+        private double   lastBrickBodyPts;
+        private double   lastBrickWickUpPts;
+        private double   lastBrickWickDnPts;
+        private double   lastBrickWickRatio;     // (wickUp+wickDn)/body
         #endregion
 
         // ===========================================================
@@ -470,6 +498,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private TextBlock lblVwapVal;
         private TextBlock lblTradeHours;
         private TextBlock lblBrickInfo;       // v6 0.2.1 — read-only Renko brick color/streak
+        private TextBlock lblRunInfo;         // v6 1.2 — read-only NinzaRenko run tracker (color×len, pts captured)
         private TextBlock lblQtyVal;
         private TextBlock lblSlVal;
         private TextBlock lblTpVal;
@@ -672,6 +701,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                     prevRegime             = "UNKNOWN";
                     regimeChangedBar       = 0;
                     regimeFlipsLast20      = 0;
+                    // v6 1.2-1.4 — Brick analytics (run tracker, wick, MM pattern) defaults
+                    enableBrickAnalytics   = false;   // OFF by default — turn ON to collect data
+                    runCurrentLen          = 0;
+                    runCurrentColor        = "";
+                    runMaxFavPts           = 0;
+                    runMaxLast10           = 0;
+                    lastBrickIntervalSec   = 0;
+                    fastBricksLast10       = 0;
                 }
                 else if (State == State.Configure)
                 {
@@ -3503,6 +3540,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             double bHigh  = High[idx];
             double bLow   = Low[idx];
             string color  = bClose > bOpen ? "G" : (bClose < bOpen ? "R" : (lastNrBrickColor ?? ""));
+            string prevColor = lastNrBrickColor ?? "";
             if (color == lastNrBrickColor && color != "") nrBrickStreakCount++;
             else { nrBrickStreakCount = 1; lastNrBrickColor = color; }
             lastNrBrickHigh  = bHigh;
@@ -3514,6 +3552,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                     "src=primary color=" + color + " streak=" + nrBrickStreakCount
                     + " o=" + bOpen.ToString("F2") + " c=" + bClose.ToString("F2")
                     + " hi=" + bHigh.ToString("F2") + " lo=" + bLow.ToString("F2"));
+            // v6 1.2-1.4 brick analytics hook (label-only)
+            if (enableBrickAnalytics)
+                UpdateBrickAnalytics(color, prevColor, bOpen, bClose, bHigh, bLow);
         }
 
         // -----------------------------------------------------------
@@ -3610,7 +3651,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 r = "TREND_DN";
             else if (adx < 15 && atr < 0.6 * atrAvg)
                 r = "SQUEEZE";
-            else if (adx < 18 && Math.Abs(distVwapAtr) < 0.5 && recentFlips >= 2)
+            else if (adx < 22 && (recentFlips >= 2 || Math.Abs(distVwapAtr) < 0.5))
                 r = "CHOP";
             else
                 r = "UNKNOWN";
@@ -3627,6 +3668,123 @@ namespace NinjaTrader.NinjaScript.Strategies
                         + " atr/avg=" + (atr/atrAvg).ToString("F2") + " eStack=" + eStack
                         + " distVwapAtr=" + distVwapAtr.ToString("F2")
                         + " nr=" + nrColor + "x" + nrStreak + " flips4=" + recentFlips);
+            }
+        }
+
+        // -----------------------------------------------------------
+        //  v6 1.2/1.3/1.4 — Brick Analytics: Run Tracker + Wick Analyzer + MM Pattern Recorder.
+        //  Called from ProcessPrimaryAsNinzaRenkoBar() once per closed brick.
+        //  100% observation — no entry/exit logic touches these fields yet. Designed to feed
+        //  Phase 2.0 "Brick Mode" entry/exit logic. Goal: capture the moment a NEW brick run
+        //  starts (best entry) AND the moment MM is trapping (slow bricks + alternating colors
+        //  + small body + big wick = absorption / stop-hunt zone).
+        //  All metrics emitted as RUN_END / WICK_TAG / MM_PATTERN diag rows.
+        // -----------------------------------------------------------
+        private void UpdateBrickAnalytics(string color, string prevColor, double bOpen, double bClose, double bHigh, double bLow)
+        {
+            // ---- 1.3 wick analyzer (per-brick) ----
+            double bodyPts = Math.Abs(bClose - bOpen);
+            double wickUp  = bHigh - Math.Max(bOpen, bClose);
+            double wickDn  = Math.Min(bOpen, bClose) - bLow;
+            lastBrickBodyPts   = bodyPts;
+            lastBrickWickUpPts = wickUp;
+            lastBrickWickDnPts = wickDn;
+            lastBrickWickRatio = bodyPts > 0 ? (wickUp + wickDn) / bodyPts : 0;
+            // Tag bricks with strong rejection wicks (potential reversal precursor).
+            // Upper wick on a green brick = sellers capping; lower wick on red = buyers absorbing.
+            bool absorption =
+                (color == "G" && wickUp > bodyPts * 0.8 && wickUp >= 6)
+             || (color == "R" && wickDn > bodyPts * 0.8 && wickDn >= 6);
+            if (absorption && enableDiagLog)
+                WriteDiagRow("WICK_TAG",
+                    "absorption color=" + color
+                    + " body=" + bodyPts.ToString("F1")
+                    + " wickUp=" + wickUp.ToString("F1")
+                    + " wickDn=" + wickDn.ToString("F1")
+                    + " ratio=" + lastBrickWickRatio.ToString("F2"));
+
+            // ---- brick speed (inter-arrival) ----
+            DateTime now = Time[0];
+            if (lastBrickTime != DateTime.MinValue)
+                lastBrickIntervalSec = (now - lastBrickTime).TotalSeconds;
+            lastBrickTime = now;
+            if (lastBrickIntervalSec > 0)
+            {
+                brickIntervalsLast10.Enqueue(lastBrickIntervalSec);
+                while (brickIntervalsLast10.Count > 10) brickIntervalsLast10.Dequeue();
+                fastBricksLast10 = 0;
+                foreach (var d in brickIntervalsLast10) if (d < 10) fastBricksLast10++;
+            }
+
+            // ---- 1.2 run tracker ----
+            if (color != prevColor && prevColor != "")
+            {
+                // RUN_END: emit summary of run that just ended
+                if (enableDiagLog && runCurrentLen > 0)
+                {
+                    double runPts = Math.Abs(bClose - runStartPrice);
+                    double runDurSec = (now - runStartTime).TotalSeconds;
+                    WriteDiagRow("RUN_END",
+                        "color=" + runCurrentColor + " len=" + runCurrentLen
+                        + " pts=" + runPts.ToString("F1")
+                        + " maxFav=" + runMaxFavPts.ToString("F1")
+                        + " durSec=" + runDurSec.ToString("F0")
+                        + " startPx=" + runStartPrice.ToString("F2")
+                        + " endPx=" + bClose.ToString("F2"));
+                }
+                // Update last-10 max (regime context: "are we in a high-streak environment?")
+                if (runCurrentLen > 0)
+                {
+                    runLast10.Enqueue(runCurrentLen);
+                    while (runLast10.Count > 10) runLast10.Dequeue();
+                    runMaxLast10 = 0;
+                    foreach (var v in runLast10) if (v > runMaxLast10) runMaxLast10 = v;
+                }
+                // Start new run
+                runCurrentColor = color;
+                runCurrentLen   = 1;
+                runStartPrice   = bOpen;
+                runStartTime    = now;
+                runMaxFavPts    = 0;
+            }
+            else
+            {
+                runCurrentLen++;
+                // Track best favorable excursion within run (long run: highest hi above start;
+                // short run: lowest lo below start)
+                double favPts = runCurrentColor == "G"
+                    ? Math.Max(0, bHigh - runStartPrice)
+                    : Math.Max(0, runStartPrice - bLow);
+                if (favPts > runMaxFavPts) runMaxFavPts = favPts;
+            }
+
+            // ---- 1.4 MM pattern recorder ----
+            brickColorRing.Enqueue(color);
+            while (brickColorRing.Count > 20) brickColorRing.Dequeue();
+            // Emit MM_PATTERN snapshot every 5 minutes
+            if (enableDiagLog && (now - lastMmPatternEmit).TotalMinutes >= 5 && brickColorRing.Count >= 10)
+            {
+                lastMmPatternEmit = now;
+                System.Text.StringBuilder sb = new System.Text.StringBuilder();
+                int flips = 0; string prev = ""; int maxRunInRing = 0; int curRun = 0;
+                foreach (var c in brickColorRing)
+                {
+                    sb.Append(c);
+                    if (prev != "" && c != prev) flips++;
+                    if (c == prev) curRun++; else curRun = 1;
+                    if (curRun > maxRunInRing) maxRunInRing = curRun;
+                    prev = c;
+                }
+                double avgInterval = 0; int n = 0;
+                foreach (var d in brickIntervalsLast10) { avgInterval += d; n++; }
+                if (n > 0) avgInterval /= n;
+                WriteDiagRow("MM_PATTERN",
+                    "ring=" + sb.ToString()
+                    + " flips=" + flips
+                    + " maxRun=" + maxRunInRing
+                    + " avgIntvSec=" + avgInterval.ToString("F1")
+                    + " fast10=" + fastBricksLast10
+                    + " runMaxLast10=" + runMaxLast10);
             }
         }
         #endregion
@@ -3822,6 +3980,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                     stack.Children.Add(lblVwapVal);
                     stack.Children.Add(lblTradeHours);
                     stack.Children.Add(lblBrickInfo);
+                    lblRunInfo = MakeLabel("Run: —", Brushes.Gray, 10, FontWeights.Normal, HorizontalAlignment.Left);
+                    stack.Children.Add(lblRunInfo);
 
                     stack.Children.Add(MakeSep());
 
@@ -4096,6 +4256,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             bool   snapNrOn        = enableNinzaRenkoSeries && ninzaSeriesAdded;
             string snapNrColor     = lastNrBrickColor ?? "";
             int    snapNrStreak    = nrBrickStreakCount;
+            // v6 1.2 brick-run snapshot
+            bool   snapBrickAnOn   = enableBrickAnalytics;
+            string snapRunColor    = runCurrentColor ?? "";
+            int    snapRunLen      = runCurrentLen;
+            double snapRunMaxFav   = runMaxFavPts;
+            int    snapRunMaxLast10 = runMaxLast10;
+            int    snapFastBricks  = fastBricksLast10;
 
             double snapAcctRealized = 0, snapAcctUnreal = 0, snapAcctBal = 0;
             bool snapAcctOk = false;
@@ -4262,6 +4429,29 @@ namespace NinjaTrader.NinjaScript.Strategies
                             string primaryColor = !string.IsNullOrEmpty(snapNrColor) ? snapNrColor : snapBrickColor;
                             lblBrickInfo.Foreground = primaryColor == "G" ? Brushes.LimeGreen
                                                     : (primaryColor == "R" ? Brushes.OrangeRed : Brushes.Gray);
+                        }
+                    }
+                    // v6 1.2 — run row (only meaningful when EnableBrickAnalytics is ON)
+                    if (lblRunInfo != null)
+                    {
+                        if (!snapBrickAnOn)
+                        {
+                            lblRunInfo.Text = "Run: off";
+                            lblRunInfo.Foreground = Brushes.DimGray;
+                        }
+                        else if (string.IsNullOrEmpty(snapRunColor) || snapRunLen <= 0)
+                        {
+                            lblRunInfo.Text = "Run: —";
+                            lblRunInfo.Foreground = Brushes.Gray;
+                        }
+                        else
+                        {
+                            lblRunInfo.Text = "Run: " + snapRunColor + "×" + snapRunLen
+                                            + "  fav=" + snapRunMaxFav.ToString("F0") + "pt"
+                                            + "  max10=" + snapRunMaxLast10
+                                            + "  fast=" + snapFastBricks + "/10";
+                            lblRunInfo.Foreground = snapRunColor == "G" ? Brushes.LimeGreen
+                                                  : (snapRunColor == "R" ? Brushes.OrangeRed : Brushes.Gray);
                         }
                     }
 
@@ -5216,6 +5406,12 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "Enable Regime Classifier (label-only)", Order = 1, GroupName = "10 - Regime",
             Description = "When ON, classifies each bar as TREND_UP / TREND_DN / CHOP / SQUEEZE / UNKNOWN based on ADX, ATR, EMA stack, NinzaRenko streak, and distance from VWAP. Result is logged in the diag CSV 'Regime' column. NO entry/exit logic uses this yet — it's pure observation. Default OFF; turn ON to start collecting regime labels for post-trade analysis.")]
         public bool EnableRegimeClassifier { get { return enableRegimeClassifier; } set { enableRegimeClassifier = value; } }
+
+        // ===== v6 1.2/1.3/1.4 — Brick Analytics (Run Tracker + Wick + MM Pattern) =====
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Brick Analytics (label-only)", Order = 2, GroupName = "10 - Regime",
+            Description = "When ON, tracks NinzaRenko run length / favorable excursion / wick-rejection / brick-speed and emits RUN_END, WICK_TAG, MM_PATTERN diag rows. Adds 'Run:' row to dashboard. NO entry/exit logic uses these yet — pure observation feeding Phase 2.0 'Brick Mode' design. Default OFF.")]
+        public bool EnableBrickAnalytics { get { return enableBrickAnalytics; } set { enableBrickAnalytics = value; } }
         #endregion
     }
 }
