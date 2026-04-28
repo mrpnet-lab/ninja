@@ -1406,6 +1406,7 @@ These were considered for v5 but bumped to v6 per user decision:
 |---|---|---|---|
 | v6 0.0.0 | 2026-04-28 | Fork from v5 14.20 | Class/identifier rename to `Mm_ATM_v6`; v5 frozen for live trading |
 | v6 0.1.1 | 2026-04-28 | Phase 0 — diag log MM-analysis enhancement (no behavior change) | +15 columns (54 total). See §19.10 |
+| v6 0.1.2 | 2026-04-28 | Phase 0.1 — TP/SL line render race fix + nudge diag rows | (1) `RequestSlTpResize`/`RequestSlNudgePoints` no longer dispatch a stale Draw before the resize/nudge runs (was rendering OLD `hiddenTargetPrice`/`hiddenStopPrice`). (2) `ProcessPendingButtons` now calls `RedrawAnnotationsSafe()` immediately after `ArmHiddenStops`/`ResizeHiddenStops`/`NudgeSlPricePoints` so the chart shows the new line within the SAME tick the action ran. (3) `OnOrderUpdate` Filled path now calls `RedrawAnnotationsSafe()` right after `ArmHiddenStops()` — TP/SL lines appear synchronously with the fill instead of waiting for the next tick. (4) New `RedrawAnnotationsSafe()` helper wraps `DrawChartAnnotations` in try/catch + `CurrentBar<1` guard. (5) New diag verbs `STOPS_ARMED`, `TP_NUDGE`, `SL_NUDGE` for post-mortem of every line move. |
 
 ### 19.10 Diag log MM-analysis schema (v6 0.1.1)
 

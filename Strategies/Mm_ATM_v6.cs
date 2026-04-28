@@ -894,8 +894,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (pendingShortLimit) { pendingShortLimit = false; ExecuteShortLimitEntry(); }
             if (pendingCloseOne)   { pendingCloseOne   = false; ExecuteCloseOne(); }
             if (pendingJumpSL)     { pendingJumpSL     = false; ExecuteJumpSL(); }
-            if (pendingRearm)      { pendingRearm      = false; if (stopsArmed) ArmHiddenStops(); }
-            if (pendingSlTpResize) { pendingSlTpResize = false; if (stopsArmed) ResizeHiddenStops(); }
+            if (pendingRearm)      { pendingRearm      = false; if (stopsArmed) { ArmHiddenStops(); RedrawAnnotationsSafe(); } }
+            if (pendingSlTpResize) { pendingSlTpResize = false; if (stopsArmed) { ResizeHiddenStops(); RedrawAnnotationsSafe(); } }
             if (pendingTrailActivate) { pendingTrailActivate = false; ActivateTrailManual(); }
             if (pendingTrailNudgePoints != 0) { int n = pendingTrailNudgePoints; pendingTrailNudgePoints = 0; NudgeTrailDistancePoints(n); }
             if (pendingSlNudge != 0) { int n = pendingSlNudge; pendingSlNudge = 0; if (stopsArmed) NudgeSlPricePoints(n); }
@@ -2199,6 +2199,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (!clampAllowed && enableDiagLog) WriteDiagRow("CLAMP_SKIP", "adx=" + adxNow.ToString("F1") + " thr=" + highAdxThreshold.ToString("F1"));
             stopsArmed = true;
             if (runnerModeActive) Print(TAG + "RUNNER mode armed dir=" + openTradeDirection);
+            if (enableDiagLog) WriteDiagRow("STOPS_ARMED",
+                "dir=" + openTradeDirection + " entry=" + averageEntryPrice.ToString("F2")
+                + " sl=" + hiddenStopPrice.ToString("F2") + " tp=" + hiddenTargetPrice.ToString("F2")
+                + " slPt=" + slPoints + " tpPt=" + tpPoints + (runnerModeActive ? " RUNNER" : "")
+                + (tpClampedByPrevDay ? " PD_CLAMP" : ""));
         }
 
         // Non-destructive SL/TP resize: keeps trail, BE lock, trap state, and original SL reference intact.
@@ -2237,6 +2242,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (openTradeDirection == 1 && newSl < hiddenStopPrice) newSl = hiddenStopPrice;
                 if (openTradeDirection == -1 && newSl > hiddenStopPrice) newSl = hiddenStopPrice;
             }
+            double oldSl = hiddenStopPrice, oldTp = hiddenTargetPrice;
             hiddenStopPrice = newSl;
             hiddenTargetPrice = newTp;
             // Update originalSlPrice only if we LOOSENED (so trail backtrack respects new floor)
@@ -2244,17 +2250,29 @@ namespace NinjaTrader.NinjaScript.Strategies
             else if (openTradeDirection == -1 && newSl > originalSlPrice) originalSlPrice = newSl;
             Print(TAG + "RESIZE SL=" + hiddenStopPrice.ToString("F2") + " TP=" + hiddenTargetPrice.ToString("F2")
                 + " (slPt=" + slPoints + " tpPt=" + tpPoints + ")");
+            if (enableDiagLog)
+            {
+                if (Math.Abs(newTp - oldTp) > TickSize / 2.0)
+                    WriteDiagRow("TP_NUDGE", "src=manual old=" + oldTp.ToString("F2") + " new=" + hiddenTargetPrice.ToString("F2")
+                        + " tpPt=" + tpPoints + (tpClampedByPrevDay ? " PD_CLAMP" : ""));
+                if (Math.Abs(newSl - oldSl) > TickSize / 2.0)
+                    WriteDiagRow("SL_NUDGE", "src=resize old=" + oldSl.ToString("F2") + " new=" + hiddenStopPrice.ToString("F2")
+                        + " slPt=" + slPoints);
+            }
         }
 
         // Thread-safe trigger from WPF UI thread.
-        private void RequestSlTpResize() { pendingSlTpResize = true; if (ChartControl != null) ChartControl.Dispatcher.InvokeAsync(() => DrawChartAnnotations()); }
+        // NOTE: Do NOT redraw here — pendingSlTpResize is processed on next OnBarUpdate by
+        // ProcessPendingButtons, which calls ResizeHiddenStops THEN RedrawAnnotationsSafe.
+        // Drawing here would render the STALE hiddenTargetPrice (race condition).
+        private void RequestSlTpResize() { pendingSlTpResize = true; }
 
         // Direct SL nudge (price-space). Negative dPts = WIDEN (move away from price), positive = TIGHTEN.
         // Works correctly after JumpSL/BE-lock because it operates on hiddenStopPrice, not slPoints.
+        // NOTE: redraw happens in ProcessPendingButtons after NudgeSlPricePoints runs (avoid stale-draw race).
         private void RequestSlNudgePoints(int dPts)
         {
             pendingSlNudge += dPts;
-            if (ChartControl != null) ChartControl.Dispatcher.InvokeAsync(() => DrawChartAnnotations());
         }
 
         private void NudgeSlPricePoints(int dPts)
@@ -2306,9 +2324,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (openTradeDirection == -1 && hiddenStopPrice > originalSlPrice) originalSlPrice = hiddenStopPrice;
             }
             if (ChartControl != null) ChartControl.Dispatcher.InvokeAsync(() => UpdateAdjustLabels());
-            DrawChartAnnotations();
+            RedrawAnnotationsSafe();
             Print(TAG + "SL NUDGE " + (dPts > 0 ? "+" : "") + dPts + "pt  " + oldSl.ToString("F2") + " -> " + hiddenStopPrice.ToString("F2")
                 + "  (price=" + price.ToString("F2") + " dist=" + slDistPts.ToString("F1") + "pt)");
+            if (enableDiagLog) WriteDiagRow("SL_NUDGE", "src=manual delta=" + (dPts > 0 ? "+" : "") + dPts + "pt old=" + oldSl.ToString("F2")
+                + " new=" + hiddenStopPrice.ToString("F2") + " price=" + price.ToString("F2")
+                + (breakevenLocked ? " BE_LOCK" : ""));
             UpdateDashboardStatus("SL " + (dPts > 0 ? "tightened" : "widened") + " " + Math.Abs(dPts) + "pt -> " + hiddenStopPrice.ToString("F2"),
                 dPts > 0 ? Brushes.LimeGreen : Brushes.Yellow);
         }
@@ -2658,6 +2679,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                             : fp;
                         totalContracts = newQty;
                         ArmHiddenStops();
+                        RedrawAnnotationsSafe();   // render TP/SL lines IMMEDIATELY on fill (no wait for next tick)
                         aggressiveLimitSubmitTime = DateTime.MinValue;
                         Print(TAG + "LONG fill q=" + q + " @ " + fp.ToString("F2") + " avg=" + averageEntryPrice.ToString("F2"));
                     }
@@ -2670,6 +2692,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                             : fp;
                         totalContracts = newQty;
                         ArmHiddenStops();
+                        RedrawAnnotationsSafe();   // render TP/SL lines IMMEDIATELY on fill (no wait for next tick)
                         aggressiveLimitSubmitTime = DateTime.MinValue;
                         Print(TAG + "SHORT fill q=" + q + " @ " + fp.ToString("F2") + " avg=" + averageEntryPrice.ToString("F2"));
                     }
@@ -3241,6 +3264,17 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (volumeAtPrice != null) volumeAtPrice.Clear();
             pocLevel = vahLevel = valLevel = 0;
             Print(TAG + "Session reset " + sessionDate.ToShortDateString());
+        }
+
+        // Single-source-of-truth redraw helper. Wraps DrawChartAnnotations in try/catch
+        // because it's called from multiple threads (OnOrderUpdate, OnBarUpdate, button handlers,
+        // ProcessPendingButtons). Draw.* is safe to invoke cross-thread in NT8 8.1+, but Close[0]
+        // and indicator series can throw if accessed before first bar — defend that.
+        private void RedrawAnnotationsSafe()
+        {
+            if (CurrentBar < 1) return;
+            try { DrawChartAnnotations(); }
+            catch (Exception ex) { Print(TAG + "RedrawAnnotationsSafe EX: " + ex.Message); }
         }
 
         private void DrawChartAnnotations()
