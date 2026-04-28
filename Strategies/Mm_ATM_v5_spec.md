@@ -1441,7 +1441,114 @@ A separate scoring engine, parallel to confidence, that predicts the next MM mov
 - Auto-news scraping — keep the manual news-blackout window, scraping adds fragility.
 - Cloud / remote dashboard — local-only for security and simplicity.
 
-### 18.8 The pact
+### 18.8 v6 enhancements derived from Apr 28, 2026 NinzaRenko 64/16 study
+
+> **Source data:** `MmATM_v5_DiagLog_20260428.csv` + two NinzaRenko 64-tick / 16-offset chart screenshots (one wide-angle showing the ~400-pt overnight downtrend, one zoom showing the 9:45 AM → 12:50 PM range).
+
+#### 18.8.A The two regimes seen in one day
+
+| Regime | Window | Range / Move | Renko look | What v5 did |
+|---|---|---|---|---|
+| **Trend (overnight down)** | 00:00 → 08:34 ET | High 27439 → Low 27038 = **−401 pts** | Long stretches of solid red bricks, brief 3-brick green pullbacks that immediately re-fail | 174 SIGNAL rows, only **8 STRONG_SELL**; no entries (HRS ON pre-RTH). 2 small trail-T1-BE wins on a manual setup at the bottom |
+| **Range (RTH morning)** | 09:45 → 12:50 ET | High ~27210 → Low ~27050 ≈ **160 pts**, multiple 50-pt swings | Alternating 4–8 brick red/green legs with sharp pivots near range edges | 245 SIGNAL rows, heavy SELL bias (90 SELL + 16 STRONG_SELL vs 32 BUY + 6 STRONG_BUY) — **carryover bias from prior trend**. Mixed P&L: +$525 daily but with a −$380 loss at 10:30 going short into a bottom |
+
+**Two distinct edges to capture, each needs different machinery.**
+
+#### 18.8.B Findings the data exposed
+
+1. **STRONG signals are too rare in real trends.** 8 STRONG_SELL across an 8-hour 400-pt downtrend = the threshold is gating us out of the meat. The current `dom ≥ 75` floor for STRONG was tuned in chop; in a real Renko-confirmed trend, `dom ≥ 60` + 3-brick alignment is plenty.
+
+2. **Signal carryover into the range was costly.** After the overnight trend bottomed at 08:34, the BUY/SELL counter stayed SELL-heavy for the next 3 hours (90 vs 32). The 10:30 SHORT entry that lost −19 pts happened *because* we were still trading the dead trend's bias. Renko rotation (red→green→red→green at range edges) screamed "regime change" but our 1-min EMAs hadn't caught up.
+
+3. **Range pivots clustered at predictable levels** — eyeballing the second chart, ~27200 / ~27160 / ~27100 / ~27050 acted as repeated pivots. These are very likely **prior-day POCs / value-area edges / overnight high-low** — exactly what MM defends and runs.
+
+4. **Trail T4-Big won big once (10:35 → 10:36 = +29 pts)** but it took a winning condition (signal aligned + sharp move) that the existing trail handled fine. The losers came when **regime mis-identification** put us on the wrong side, not when trail logic failed.
+
+#### 18.8.C v6 features proposed (priority-ordered for "beat the MM")
+
+> Each feature lists its **edge hypothesis**, **rule sketch**, and **measurement** so we can validate after 2 live weeks.
+
+##### F1. Regime Classifier (the brain v5 lacks)
+
+- **Edge:** stop trading SELL signals just because EMAs lag a regime change. Each tick, classify the current regime as one of: `TREND_UP / TREND_DN / RANGE / TRANSITION / VOLATILE`. Every other v6 feature is gated by regime.
+- **Rule:** combine 5 inputs into a single state machine (Renko brick streak ≥ 5 same color → TREND_*, alternation ≤ 3 with bounded range over last 30 bricks → RANGE, ATR > 1.5× 5-day-avg → VOLATILE, regime *change* sustained 3 bricks → TRANSITION).
+- **Diag:** new `Regime` column, `REGIME_CHANGE` action row, regime-change badge on dashboard.
+- **Measure:** count "wrong-side" entries (SELL inside TREND_UP or after a confirmed regime flip) — must drop ≥ 70% vs Apr 28 baseline.
+
+##### F2. POC / Value-Area Aware Range Trading
+
+- **Edge:** the chart's 27200 / 27160 / 27100 / 27050 pivots are not random. Identify them and stop fighting them.
+- **Rule:** at session start, compute and store **prior-day POC, VAH, VAL, ON-high, ON-low, current-day developing POC**. Render them as horizontal lines on the chart (color-coded). When in `RANGE` regime, only allow:
+  - Long entries within `(POC ± 2 ticks) → VAL` zone with bullish trigger.
+  - Short entries within `(POC ± 2 ticks) → VAH` zone with bearish trigger.
+  - Block any entry if price has just **broken** a level (wait for retest or regime flip).
+- **MM-counter logic:** if price runs through ON-high/low, watch for a **failure-to-extend brick** (next brick fails to print same color beyond the level) → trade the reversal back to POC. This is the "MM stop-run trap."
+- **Diag:** `POC_LEVELS` row at session start, `LEVEL_TOUCH` rows on each pivot interaction, new dashboard mini-panel showing distance-to-nearest-level.
+- **Measure:** range-day P&L vs current; aim for ≥ +$300 on a flat 100-pt range day (Apr 28 RTH was +$525 with a loss; should be +$800+ done cleanly).
+
+##### F3. Renko Trend-Riding Mode (extends §19.6 thrust into v6)
+
+- **Edge:** the v5 14.26 thrust mode catches the entry; v6 must scale the win.
+- **Rule additions on top of v5 14.26:**
+  - **Pyramid up to 3 contracts** in a confirmed `TREND_*` regime: add 1 contract on every additional 3-brick continuation past entry, each add gets its own brick-edge trail.
+  - **Trail tightens by tier:** original entry rides far brick edge, add-1 rides previous brick edge, add-2 rides current brick mid → forces realization on first reversal while keeping core position alive.
+  - **Auto-reload on continuation:** if final position exits but next brick reasserts trend within `ContinuationWindow=2 bricks`, re-enter at half size.
+- **Measure:** a 24-brick (96-pt) Renko trend like the missed Apr 28 morning rally should produce ≥ +$2,000 per contract base + pyramid uplift.
+
+##### F4. Adaptive Signal Confidence (per-regime)
+
+- **Edge:** STRONG threshold of 75 is wrong for trends and right for chop. Make it regime-aware.
+- **Rule:** keep `MinSignalConfidence` as base, multiply by regime factor:
+  - `TREND_*`: × 0.75 (lower bar = enter earlier in confirmed trends)
+  - `RANGE`: × 1.10 (higher bar = avoid chop whipsaws)
+  - `VOLATILE`: × 1.30 (very high bar = only crystal setups)
+  - `TRANSITION`: × 2.0 (effectively block until regime confirmed)
+- **Diag:** `EffectiveMinConf` column logs the post-regime value every signal row.
+- **Measure:** trend-regime entries per hour should ~triple vs Apr 28; range-regime false-entries should halve.
+
+##### F5. MM-Trap Detector (the active counter-attack)
+
+- **Edge:** §19.6.A's Apr 27 finding (3 identical AGGR_PULLBACK exits at peak=16/cur=−12) is a textbook MM signature. Detect it and invert.
+- **Rule:** maintain a rolling 5-trade buffer of `(entryPx, peakPx, exitPx, exitReason, sideTaken)`. When **3 of last 5 same-side trades stop-out within ±2 ticks of the same level after similar peak excursion**, flip a `MM_TRAP_DETECTED` flag for the rest of the session on that side. Behavior:
+  - Block further same-side entries near that level for 30 min.
+  - On the next bounce off that level in the **opposite** direction, allow a counter-entry with `SignalConfidence × 0.5` (because the MM hand is tipped).
+- **Diag:** `MM_TRAP_DETECTED level=27087 side=SHORT count=3` row.
+- **Measure:** each trap detection should produce ≥ 1 follow-up counter-trade with positive expectancy averaged over 90 days.
+
+##### F6. Continuation Re-Entry After Range Break
+
+- **Edge:** when range finally breaks, v5 was still in "WAIT" because EMAs hadn't crossed. Brick close beyond range edge IS the trigger.
+- **Rule:** when in `RANGE` regime and Renko brick **closes beyond range edge by ≥ 1 brick**, immediately flip to `TRANSITION` then `TREND_*` if 2 more confirming bricks print. Allow entry on the 2nd post-break brick close, no extra signal needed.
+- **Measure:** range-break captures should average ≥ 30 pts on NQ within 15 min of break.
+
+##### F7. Position-State Memory Across Sessions (carry-flag)
+
+- **Edge:** the overnight 400-pt down move flipped htfBias to −1 and it stayed −1 well into the RTH range, biasing signals. We need to *reset* htfBias when a regime change is confirmed.
+- **Rule:** on `REGIME_CHANGE` event, **decay** htfBias by 50%. After 3 consecutive opposite-color bricks on the new regime, reset htfBias to 0. Persist regime/htf state across NT8 restarts in the existing pattern store.
+- **Measure:** reduce same-direction-as-prior-trend entries in first hour of new regime by ≥ 60%.
+
+##### F8. Dashboard "Regime + Levels" Strip
+
+- **Edge:** user is the final arbiter; show the bot's worldview prominently.
+- **Rule:** new top strip showing: `Regime: TREND_DN  |  Brick: ■■■■■  |  POC: 27155 (-23pt)  |  Next pivot: VAL 27090 (+42pt)  |  MM_TRAP: clear`.
+- **Measure:** user feedback after 2 live weeks.
+
+#### 18.8.D Sequencing inside v6
+
+```
+Phase 1 (foundation) :  F1 Regime Classifier  →  F4 Adaptive Confidence  →  F8 Dashboard strip
+Phase 2 (capture)    :  F3 Renko Trend-Riding (pyramid + reload)
+Phase 3 (defense)    :  F5 MM-Trap Detector  →  F2 POC/VA Aware Range  →  F6 Range-Break Continuation
+Phase 4 (memory)     :  F7 State carry  +  Pattern-Memory Engine (existing §18.3.A)
+```
+
+Each phase ships behind its own toggle in v6 and is validated against the **Apr 28 day** as benchmark before moving to the next.
+
+#### 18.8.E The "beat the MM" thesis (one paragraph)
+
+> MM win because they **see your stops**, **fade your breakouts**, and **drift price to the level that triggers max retail pain**. v5 hides our SL/TP (good). v6 must add: (1) a *regime brain* so we don't trade the prior trend's signals into the new range; (2) *level awareness* so we trade with the structural pivots MM defend instead of into them; (3) *trap detection* that records MM's repeated stop-runs and flips us to the counter-side; (4) *Renko-anchored trail* that gives MM no inch to nibble at because exits are tied to brick structure, not arbitrary point counts. Stack those four and the MM's edge is gone — they have to either let us run or commit real capital to fight, and at our size they will choose the former.
+
+### 18.9 The pact
 
 > **v5 stays alive trading real money. v6 is the lab.** When a v6 feature proves itself over 2 live weeks, we backport the *toggle* (not the implementation) into v5 14.x.x. v5's job is to be reliable. v6's job is to make MM regret showing up.
 
