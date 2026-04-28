@@ -2039,3 +2039,106 @@ Future work (deferred to 14.12):
 - Per-hour outcome heat-map for self-tuning best/worst hours.
 
 
+
+---
+
+## 20. Phase 1.2-1.5 — Brick Analytics (SHIPPED v6 1.2.0, commit 238ec69, 2026-04-28)
+
+### 20.1 What shipped
+- **Run Tracker (1.2):** `runCurrentLen`, `runCurrentColor`, `runStartPrice`, `runMaxFavPts`, `runStartTime`, `runMaxLast10`, `runLast10` queue. Emits `RUN_END color=X len=N pts=P maxFav=F durSec=S startPx=… endPx=…` on every color flip.
+- **Wick Analyzer (1.3):** per-brick `body`, `wickUp`, `wickDn`, `wickRatio`. Emits `WICK_TAG absorption color=X body=B wickUp=U wickDn=D ratio=R` when wick > 0.8× body and ≥ 6pt (MM defending price).
+- **MM Pattern Recorder (1.4):** `brickColorRing` (20 deep), `brickIntervalsLast10` queue, `fastBricksLast10` count. Emits `MM_PATTERN ring=… flips=N maxRun=N avgIntvSec=X fast10=N runMaxLast10=N` every 5 minutes.
+- **CHOP rule loosened (1.5):** `adx<22 && (recentFlips>=2 || |distVwapAtr|<0.5)` — now actually fires.
+- **Dashboard:** new `Run:` row showing color×len, fav points, max10, fast bricks. Gated by `EnableBrickAnalytics`.
+- **Property:** `EnableBrickAnalytics` Group "10 - Regime", Order 2, default OFF.
+
+### 20.2 Validation — Playback 2026-04-28 (MmATM_v6_DiagLog_20260428_Playback1.csv)
+
+**Brick statistics (75 runs, full session):**
+- Avg run length 8.09 bricks; max 30 bricks
+- Avg run favorable excursion **41.8 pt**; max **132 pt** (07:34 TREND_DN)
+- Length distribution: 12 traps (1-brick) / 10 short / 21 mid / 11 long / 10 very-long / 11 monster (≥16)
+- **1-brick trap rate confirmed at 16%** (12/75)
+- 28 "big runs" (≥8 bricks AND ≥20pt fav) — only 3 caught by current strategy
+
+**Trades:** 4 (2W/2L), - day:
+- WIN#1 09:52→09:53 R6→R9, +11.5pt (UNKNOWN regime) — tiny scalp
+- LOSS#1 10:30 R×1, - — **textbook MM trap** (entered brick #1 of new R after G run had body=4pt but maxFav=24pt → 20pt of upper wicks = MM defending top, then trap-flipped)
+- WIN#2 10:35 R×9→15, +20.25pt (TREND_DN) — only good catch
+- LOSS#2 15:35 R×8, - — distribution mode (avgIntvSec=178s, htfBias=-1, distVwap=+26.6 extended)
+
+### 20.3 The catastrophic miss
+After WIN#1 closed at 09:53:31 (+11.5pt), market entered TREND_DN with brick streak progressing 13→14→15→16→17 bricks. Strategy logged **5 consecutive `BLOCK_POST_WIN`** rows from 09:55:07-09:55:13. The market gave a **50+ point continuation runner** while we sat in 7-min cooldown. **Single highest-impact fix available.**
+
+### 20.4 Block heatmap (TREND regimes only — = missed real opportunities)
+- `BLOCK_POST_WIN` in TREND_DN: **21 events**
+- `BLOCK_EXTENSION` in TREND_DN: **13 events**
+- WAIT signals during TREND with brickStreak≥4: **54 events**
+
+---
+
+## 21. Phase 2 — Beat-the-MM Roadmap (NEXT, ordered by $$ impact)
+
+### 21.1 Phase 2.1 — Smart Cooldown (TREND-aware post-win gate)
+
+**Why first:** Single biggest waste — 21 BLOCK_POST_WIN in TREND_DN, including 5 consecutive at 09:55 covering a 50pt runner.
+
+**Rule:**
+- If `Regime in (TREND_DN, TREND_UP)` AND `brickStreak >= 4 same dir as last winner` AND `adxSlope > 0`:
+  - Reduce cooldown from 7 min → **60 sec** AND require streak >= 4 to re-enter
+- Else: keep current 7-min cooldown
+- Toggle: `EnableSmartCooldown` (default OFF)
+- Diag: `SMART_COOLDOWN_BYPASS dir=… streak=… adxSlope=… mins_since_win=…`
+
+**Expected:** catches the 09:55-09:57 runner pattern (~+50pt = /contract on a single trade we missed).
+
+### 21.2 Phase 2.2 — Extension TREND-Bypass
+
+**Why second:** 13 BLOCK_EXTENSION in TREND_DN. Strong trends extend by definition; extension guard exists to avoid chasing in chop.
+
+**Rule:**
+- If `Regime in TREND_*` AND `brickStreak <= 8` AND `adxSlope > 0` AND signal direction agrees with regime:
+  - Bypass extension block
+- Toggle: `EnableExtensionTrendBypass` (default OFF)
+- Diag: `EXTENSION_BYPASS regime=… streak=… adxSlope=…`
+
+### 21.3 Phase 2.3 — MM-Trap Re-Entry (user request, 2026-04-28)
+
+> User: *"please understand the MM traps in the brick. Once that happens and return to the same trend, we should get back in the trend with a new trade after we are trapped by MM."*
+
+**Trigger:** any `EXIT_LOSS_SL` where prior brickStreak == 1 (we got trap-flipped).
+
+**Watcher arms for 90 sec:**
+- If next 3 bricks resume **original pre-trap direction** (i.e., the trap was a fake reversal and trend continues), re-enter that direction
+- SL: tighter than usual (12pt vs 18pt — the trap zone is now mapped)
+- TP/trail: standard
+- Toggle: `EnableTrapReEntry` (default OFF)
+- Diag: `TRAP_REENTRY_ARMED original_dir=… ret=…sec` then `TRAP_REENTRY_FIRED` or `TRAP_REENTRY_EXPIRED`
+
+### 21.4 Phase 2.4 — Brick Mode Entry (the big one)
+
+**Constraints (captured from user, 2026-04-28):**
+- Skip brick #1 of new color (16% trap rate confirmed)
+- Enter on brick #2 same color if:
+  - body ≥ 6pt
+  - wickRatio ≤ 1.5 (no heavy MM defense)
+  - brick interval ≤ 30 sec (momentum, not distribution — LOSS#2 had 178s)
+  - ADX rising OR ATR > 0.8× avg
+  - NOT within 0.5 ATR of POC/VAH/VAL/prevDayH/L unless TREND_*
+- SL = previous opposite-color brick's far extreme + 4 ticks
+- Trail brick-by-brick after brick #3 (move SL to brick #2 low, then brick #4, etc.)
+- Exit on 1st opposite brick if past brick #5; wait for 2nd opposite if at bricks #2-#4
+- Toggle: `EnableBrickModeEntry` (default OFF)
+
+### 21.5 Phase 2.5 — Wick-Reject Gate
+
+LOSS#1 forensics: prior G run had body=4pt but maxFav=24pt (= 20pt upper wicks). When `WICK_TAG` count in last 5 bricks ≥ 2 against your direction, **block entry against the rejection** but **bias next entry with the reject**.
+
+---
+
+## 22. Working agreement (reaffirmed)
+- One toggle-gated item per session, default OFF
+- `get_errors` before commit
+- Commit format: `v6 0.X.Y: <desc>`
+- User F5-tests + sends new playback log between items
+- Each ship validated against real diag data before next ship
