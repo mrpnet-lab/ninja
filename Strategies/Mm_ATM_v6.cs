@@ -120,6 +120,20 @@ namespace NinjaTrader.NinjaScript.Strategies
         // Goal: identify how many bricks the typical "runner" trend lasts so the trail can ride
         // monster moves (we observed streaks of 30 bricks = 480 NQ pts on one playback day).
         private bool   enableBrickAnalytics;     // master toggle for Phase 1.2-1.4 observation
+
+        // ---- v6 2.1/2.2 — Beat-the-MM Block Bypasses (ACTIVE LOGIC, default OFF) ----
+        // Phase 2.1 Smart Cooldown: shrinks the 7-min post-win cooldown to 60s when conditions prove
+        // we're in a real trend continuation (not the MM stop-run + fade pattern the cooldown protects against).
+        // Phase 2.2 Extension TREND-Bypass: lets us follow strong trends past the VWAP-extension guard.
+        // BOTH default OFF for safety. They are RISK-INCREASING tools — they create more entries by relaxing guards.
+        // Only enable AFTER you've validated EnableRegimeClassifier and EnableBrickAnalytics on the same session.
+        private bool   enableSmartCooldown;        // Phase 2.1
+        private int    smartCooldownMinSec     = 60;   // shortened cooldown when bypass triggers
+        private int    smartCooldownStreakMin  = 4;    // require this brick-streak in trend dir to bypass
+        private bool   enableExtensionTrendBypass; // Phase 2.2
+        private int    extensionBypassStreakMax = 8;   // only bypass extension if streak <= this (still avoid late chases)
+        // adxSlope cached from regime classifier so entry guards can read it without recomputing.
+        private double lastAdxSlope;
         // Run tracker (live counters):
         private int    runCurrentLen;             // = nrBrickStreakCount but kept independent in case
         private string runCurrentColor = "";      // "G"/"R"
@@ -709,6 +723,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                     runMaxLast10           = 0;
                     lastBrickIntervalSec   = 0;
                     fastBricksLast10       = 0;
+                    // v6 2.1 — Smart Cooldown defaults (ACTIVE LOGIC, OFF by default).
+                    enableSmartCooldown        = false;
+                    smartCooldownMinSec        = 60;
+                    smartCooldownStreakMin     = 4;
+                    // v6 2.2 — Extension TREND-Bypass defaults (ACTIVE LOGIC, OFF by default).
+                    enableExtensionTrendBypass = false;
+                    extensionBypassStreakMax   = 8;
+                    lastAdxSlope               = 0;
                 }
                 else if (State == State.Configure)
                 {
@@ -2021,10 +2043,41 @@ namespace NinjaTrader.NinjaScript.Strategies
                 double minsSinceWin = (Time[0] - lastWinExitTime).TotalMinutes;
                 if (minsSinceWin < postWinSameDirCooldownMin)
                 {
-                    int remainSec = (int)((postWinSameDirCooldownMin - minsSinceWin) * 60);
-                    UpdateDashboardStatus(label + " blocked: POST-WIN cooldown " + remainSec + "s", Brushes.Orange);
-                    if (enableDiagLog) WriteDiagRow("BLOCK_POST_WIN", "dir=" + direction + " mins_since_win=" + minsSinceWin.ToString("F1") + " cooldown=" + postWinSameDirCooldownMin + "m");
-                    return false;
+                    // v6 2.1 SMART COOLDOWN BYPASS:
+                    //   The 7-min post-win cooldown exists because MM often runs our stop right after
+                    //   we exit on trail — then continues the trend. That hurts when chop, but on real
+                    //   confirmed trends we leave 50pt+ runners on the table (validated 2026-04-28: 21
+                    //   BLOCK_POST_WIN events in TREND_DN, including 5 consecutive at 09:55 covering
+                    //   a ~50pt continuation). Bypass only when ALL of these prove a true trend:
+                    //     (1) Regime classifier says TREND_UP/DN AND agrees with our trade direction
+                    //     (2) NinzaRenko brick streak ≥ smartCooldownStreakMin (default 4) in trend color
+                    //     (3) ADX slope is RISING (>0)
+                    //     (4) At least smartCooldownMinSec (default 60s) has passed since the win
+                    //   When all true, we shrink the effective cooldown to 60s instead of 7min.
+                    bool smartBypass = false;
+                    if (enableSmartCooldown)
+                    {
+                        bool regimeAgrees = (direction == 1 && currentRegime == "TREND_UP")
+                                         || (direction == -1 && currentRegime == "TREND_DN");
+                        bool brickAgrees  = (direction == 1 && lastNrBrickColor == "G" && nrBrickStreakCount >= smartCooldownStreakMin)
+                                         || (direction == -1 && lastNrBrickColor == "R" && nrBrickStreakCount >= smartCooldownStreakMin);
+                        bool adxRising    = lastAdxSlope > 0;
+                        bool minTimeOk    = (Time[0] - lastWinExitTime).TotalSeconds >= smartCooldownMinSec;
+                        smartBypass = regimeAgrees && brickAgrees && adxRising && minTimeOk;
+                        if (smartBypass && enableDiagLog)
+                            WriteDiagRow("SMART_COOLDOWN_BYPASS",
+                                "dir=" + direction + " regime=" + currentRegime
+                                + " brick=" + lastNrBrickColor + "x" + nrBrickStreakCount
+                                + " adxSlope=" + lastAdxSlope.ToString("F2")
+                                + " sec_since_win=" + (int)(Time[0] - lastWinExitTime).TotalSeconds);
+                    }
+                    if (!smartBypass)
+                    {
+                        int remainSec = (int)((postWinSameDirCooldownMin - minsSinceWin) * 60);
+                        UpdateDashboardStatus(label + " blocked: POST-WIN cooldown " + remainSec + "s", Brushes.Orange);
+                        if (enableDiagLog) WriteDiagRow("BLOCK_POST_WIN", "dir=" + direction + " mins_since_win=" + minsSinceWin.ToString("F1") + " cooldown=" + postWinSameDirCooldownMin + "m");
+                        return false;
+                    }
                 }
             }
             // Directional lockout (AUTO ONLY — manual entries bypass): block this direction if it
@@ -2053,9 +2106,40 @@ namespace NinjaTrader.NinjaScript.Strategies
                     double ratio = dist / atrNow;
                     if (ratio > extensionMaxAtrFromVwap)
                     {
-                        UpdateDashboardStatus(label + " blocked: EXTENSION " + ratio.ToString("F1") + "xATR", Brushes.Orange);
-                        if (enableDiagLog) WriteDiagRow("BLOCK_EXTENSION", "dir=" + direction + " dist=" + dist.ToString("F1") + " atr=" + atrNow.ToString("F1") + " ratio=" + ratio.ToString("F2") + " max=" + extensionMaxAtrFromVwap.ToString("F2"));
-                        return false;
+                        // v6 2.2 EXTENSION TREND-BYPASS:
+                        //   Extension guard exists because chasing late entries far from VWAP
+                        //   gives MM room to ramp price and stop us out before trend resumes.
+                        //   But strong trends extend by definition — in TREND_DN we observed
+                        //   13 BLOCK_EXTENSION events on 2026-04-28, missing real follow-through.
+                        //   Bypass when ALL of these prove the move is healthy, not late:
+                        //     (1) Regime classifier says TREND_UP/DN AND agrees with trade dir
+                        //     (2) NinzaRenko brick streak <= extensionBypassStreakMax (default 8)
+                        //         (still skip if streak is already monstrous = mean reversion risk)
+                        //     (3) ADX slope is RISING (>0)
+                        //     (4) Brick color agrees with trade direction
+                        bool trendBypass = false;
+                        if (enableExtensionTrendBypass)
+                        {
+                            bool regimeAgrees = (direction == 1 && currentRegime == "TREND_UP")
+                                             || (direction == -1 && currentRegime == "TREND_DN");
+                            bool brickAgrees  = (direction == 1 && lastNrBrickColor == "G")
+                                             || (direction == -1 && lastNrBrickColor == "R");
+                            bool streakOk     = nrBrickStreakCount > 0 && nrBrickStreakCount <= extensionBypassStreakMax;
+                            bool adxRising    = lastAdxSlope > 0;
+                            trendBypass = regimeAgrees && brickAgrees && streakOk && adxRising;
+                            if (trendBypass && enableDiagLog)
+                                WriteDiagRow("EXTENSION_BYPASS",
+                                    "dir=" + direction + " regime=" + currentRegime
+                                    + " brick=" + lastNrBrickColor + "x" + nrBrickStreakCount
+                                    + " adxSlope=" + lastAdxSlope.ToString("F2")
+                                    + " ratio=" + ratio.ToString("F2"));
+                        }
+                        if (!trendBypass)
+                        {
+                            UpdateDashboardStatus(label + " blocked: EXTENSION " + ratio.ToString("F1") + "xATR", Brushes.Orange);
+                            if (enableDiagLog) WriteDiagRow("BLOCK_EXTENSION", "dir=" + direction + " dist=" + dist.ToString("F1") + " atr=" + atrNow.ToString("F1") + " ratio=" + ratio.ToString("F2") + " max=" + extensionMaxAtrFromVwap.ToString("F2"));
+                            return false;
+                        }
                     }
                 }
             }
@@ -3610,6 +3694,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             double adx     = indAdx[0];
             double adxPrev = CurrentBar >= 5 ? indAdx[5] : adx;
             double adxSlope = adx - adxPrev;
+            lastAdxSlope = adxSlope;   // v6 2.1 cache for entry-guard bypass logic
             double atr     = indAtr[0];
             if (atr <= 0) return;
             // ATR baseline (20-bar avg) for SQUEEZE detection.
@@ -5412,6 +5497,33 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "Enable Brick Analytics (label-only)", Order = 2, GroupName = "10 - Regime",
             Description = "When ON, tracks NinzaRenko run length / favorable excursion / wick-rejection / brick-speed and emits RUN_END, WICK_TAG, MM_PATTERN diag rows. Adds 'Run:' row to dashboard. NO entry/exit logic uses these yet — pure observation feeding Phase 2.0 'Brick Mode' design. Default OFF.")]
         public bool EnableBrickAnalytics { get { return enableBrickAnalytics; } set { enableBrickAnalytics = value; } }
+
+        // ===== v6 2.1 — Smart Cooldown (Beat-the-MM block bypass, ACTIVE LOGIC) =====
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Smart Cooldown (TREND bypass)", Order = 10, GroupName = "10 - Regime",
+            Description = "PHASE 2.1 — ACTIVE LOGIC. Default OFF. When ON, the 7-min post-win cooldown is bypassed (down to 60s) ONLY when all of: (1) Regime Classifier says TREND_UP/DN matching trade dir, (2) NinzaRenko brick streak >= 4 in trend color, (3) ADX slope rising, (4) at least 60s since the win. Lets you re-board confirmed trends after a winning scalp instead of sitting in cooldown while a 50pt runner takes off (validated 2026-04-28: 5 consecutive BLOCK_POST_WIN at 09:55 covered ~50pt missed). REQUIRES EnableRegimeClassifier=ON and EnableBrickAnalytics=ON. Watch for SMART_COOLDOWN_BYPASS rows in the diag CSV. Disable if you see consecutive losses after bypass (means regime label is wrong). DO NOT enable on choppy/low-ADX days.")]
+        public bool EnableSmartCooldown { get { return enableSmartCooldown; } set { enableSmartCooldown = value; } }
+
+        [NinjaScriptProperty, Range(15, 600)]
+        [Display(Name = "  Smart Cooldown Min Seconds", Order = 11, GroupName = "10 - Regime",
+            Description = "Minimum seconds since last win before Smart Cooldown bypass can fire. Default 60. Lower = more aggressive re-entry. Only used when EnableSmartCooldown=ON.")]
+        public int SmartCooldownMinSec { get { return smartCooldownMinSec; } set { smartCooldownMinSec = value; } }
+
+        [NinjaScriptProperty, Range(2, 20)]
+        [Display(Name = "  Smart Cooldown Streak Min", Order = 12, GroupName = "10 - Regime",
+            Description = "Minimum NinzaRenko brick streak (in trend direction) required for Smart Cooldown bypass. Default 4. Higher = more selective (fewer but stronger re-entries). Only used when EnableSmartCooldown=ON.")]
+        public int SmartCooldownStreakMin { get { return smartCooldownStreakMin; } set { smartCooldownStreakMin = value; } }
+
+        // ===== v6 2.2 — Extension TREND-Bypass (Beat-the-MM block bypass, ACTIVE LOGIC) =====
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Extension TREND Bypass", Order = 20, GroupName = "10 - Regime",
+            Description = "PHASE 2.2 — ACTIVE LOGIC. Default OFF. When ON, the 'price too far from VWAP' extension block is bypassed ONLY when all of: (1) Regime Classifier says TREND_UP/DN matching trade dir, (2) NinzaRenko brick color matches dir, (3) brick streak <= 8 (skip if already monstrous — mean reversion risk), (4) ADX slope rising. Lets you follow strong trends instead of sitting out (validated 2026-04-28: 13 BLOCK_EXTENSION events in TREND_DN). REQUIRES EnableRegimeClassifier=ON. Watch for EXTENSION_BYPASS rows in the diag CSV. Disable if late-entries get stopped repeatedly (means trend was already exhausted).")]
+        public bool EnableExtensionTrendBypass { get { return enableExtensionTrendBypass; } set { enableExtensionTrendBypass = value; } }
+
+        [NinjaScriptProperty, Range(3, 30)]
+        [Display(Name = "  Extension Bypass Max Streak", Order = 21, GroupName = "10 - Regime",
+            Description = "Maximum NinzaRenko brick streak that still allows extension bypass. Default 8. Above this, the trend is likely exhausted and reversal risk dominates. Only used when EnableExtensionTrendBypass=ON.")]
+        public int ExtensionBypassStreakMax { get { return extensionBypassStreakMax; } set { extensionBypassStreakMax = value; } }
         #endregion
     }
 }
