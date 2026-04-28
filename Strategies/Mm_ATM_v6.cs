@@ -78,6 +78,16 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool   showVwap;
         private bool   showEma;
         private bool   enableDiagLog;
+        // ---- v6 Phase 0.2 Renko (data plumbing only — no logic uses these yet) ----
+        // Default ON so brick state shows up in diag log; toggleable from property panel.
+        // Read by ProcessRenkoBar (BarsInProgress==2) and WriteDiagRow (brickColor/brickStreak cols).
+        private bool   enableRenkoSeries;
+        private int    renkoBrickSize;       // ticks per brick (NinzaRenko equiv: 64)
+        private int    renkoBrickOffset;     // reversal offset in ticks (NinzaRenko equiv: 16)
+        private string lastBrickColor;       // "G" / "R" / ""
+        private int    brickStreakCount;     // consecutive same-color bricks (1 on first)
+        private double lastBrickHigh, lastBrickLow, lastBrickClose;
+        private int    renkoBarsSeen;
         #endregion
 
         // ===========================================================
@@ -617,6 +627,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                     showVwap = true;
                     showEma  = true;
                     enableDiagLog = false;
+                    // Renko 64/16 plumbing (Phase 0.2). Wired but not yet read by entry/exit logic.
+                    enableRenkoSeries = true;
+                    renkoBrickSize    = 64;
+                    renkoBrickOffset  = 16;
+                    lastBrickColor    = "";
+                    brickStreakCount  = 0;
                 }
                 else if (State == State.Configure)
                 {
@@ -630,6 +646,22 @@ namespace NinjaTrader.NinjaScript.Strategies
                     AddDataSeries(BarsPeriodType.Minute, 5);
                     indEma5mFast = EMA(BarsArray[1], 9);
                     indEma5mSlow = EMA(BarsArray[1], 21);
+
+                    // v6 Phase 0.2: Renko 64-tick / 16-offset secondary series (BarsArray[2]).
+                    // Data-plumbing only — ProcessRenkoBar updates brick color/streak fields
+                    // for diag-log MM analysis. No entry/exit logic reads these yet (W6 Phase 2.1).
+                    if (enableRenkoSeries)
+                    {
+                        // Defend against legacy templates loading with 0 values.
+                        if (renkoBrickSize   < 4) renkoBrickSize   = 64;
+                        if (renkoBrickOffset < 0) renkoBrickOffset = 16;
+                        AddDataSeries(new BarsPeriod
+                        {
+                            BarsPeriodType = BarsPeriodType.Renko,
+                            Value          = renkoBrickSize,
+                            Value2         = renkoBrickOffset
+                        });
+                    }
 
                     if (showEma)
                     {
@@ -738,6 +770,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         #region OnBarUpdate
         protected override void OnBarUpdate()
         {
+            // v6 Phase 0.2: Renko brick events (BarsArray[2] when enabled).
+            // Process FIRST so diag-log brick fields stay current for primary-series rows.
+            if (BarsInProgress == 2) { ProcessRenkoBar(); return; }
             if (BarsInProgress != 0) return;
             if (CurrentBar < BarsRequiredToTrade) return;
 
@@ -3330,6 +3365,39 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (vahLevel    > 0) Draw.HorizontalLine(this, "vpVAH", false, vahLevel, Brushes.DodgerBlue, DashStyleHelper.Dash, 1);
             if (valLevel    > 0) Draw.HorizontalLine(this, "vpVAL", false, valLevel, Brushes.DodgerBlue, DashStyleHelper.Dash, 1);
         }
+
+        // -----------------------------------------------------------
+        //  v6 Phase 0.2 — Renko brick processor (BarsArray[2], 64-tick / 16-offset).
+        //  Data plumbing only. Updates lastBrickColor / brickStreakCount + emits BRICK_CLOSE
+        //  diag rows when enabled. NO entry/exit logic reads these yet — that's W6 Phase 2.1.
+        //  Called from OnBarUpdate when BarsInProgress == 2.
+        // -----------------------------------------------------------
+        private void ProcessRenkoBar()
+        {
+            if (CurrentBars[2] < 1) return;
+            // Only act on closed bricks (IsFirstTickOfBar on the secondary fires once per new brick).
+            if (!IsFirstTickOfBar) return;
+            renkoBarsSeen++;
+            // Compare the just-CLOSED brick (Closes[2][1]) against its open (Opens[2][1]).
+            // First brick: Closes[2][1] doesn't exist yet — bail until we have history.
+            if (CurrentBars[2] < 2) { lastBrickClose = Closes[2][0]; return; }
+            double bOpen  = Opens[2][1];
+            double bClose = Closes[2][1];
+            double bHigh  = Highs[2][1];
+            double bLow   = Lows[2][1];
+            string color  = bClose > bOpen ? "G" : (bClose < bOpen ? "R" : (lastBrickColor ?? ""));
+            if (color == lastBrickColor) brickStreakCount++;
+            else { brickStreakCount = 1; lastBrickColor = color; }
+            lastBrickHigh  = bHigh;
+            lastBrickLow   = bLow;
+            lastBrickClose = bClose;
+            if (enableDiagLog)
+                WriteDiagRow("BRICK_CLOSE",
+                    "color=" + color + " streak=" + brickStreakCount
+                    + " o=" + bOpen.ToString("F2") + " c=" + bClose.ToString("F2")
+                    + " hi=" + bHigh.ToString("F2") + " lo=" + bLow.ToString("F2")
+                    + " size=" + renkoBrickSize + "tk off=" + renkoBrickOffset + "tk");
+        }
         #endregion
 
         // ===========================================================
@@ -4172,13 +4240,20 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (!enableDiagLog || diagWriter == null) return;
             if (!diagHeaderWritten) WriteDiagHeader();
+            // Always log primary-series state regardless of which BIP fired this call.
+            // (ProcessRenkoBar runs in BIP=2 — raw Close[0]/Time[0]/CurrentBar would reference
+            // the Renko brick, not the primary chart.)
+            if (CurrentBars[0] < 1) return;
+            double pxClose = Closes[0][0];
+            DateTime pxTime = Times[0][0];
+            int      pxBar   = CurrentBars[0];
             try
             {
                 double ef = indEmaFast != null ? indEmaFast[0] : 0;
                 double es = indEmaSlow != null ? indEmaSlow[0] : 0;
                 double rs = indRsi != null ? indRsi[0] : 0;
                 double at = indAtr != null ? indAtr[0] : 0;
-                double ax = (indAdx != null && CurrentBar > 14) ? indAdx[0] : 0;
+                double ax = (indAdx != null && CurrentBars[0] > 14) ? indAdx[0] : 0;
                 int pos = openTradeDirection;
                 int qty = Position.Quantity;
 
@@ -4213,15 +4288,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // Effective min-conf reflects adaptive boost (so we know what threshold the entry actually had to clear)
                 double effMin = minSignalConfidence + (adaptiveTightenActive ? adaptiveConfBoost : 0);
                 // Distance from VWAP in ATR units (the same metric the EXTENSION filter checks)
-                double distVwapAtr = (vwapValue > 0 && at > 0) ? Math.Abs(Close[0] - vwapValue) / at : 0;
+                double distVwapAtr = (vwapValue > 0 && at > 0) ? Math.Abs(pxClose - vwapValue) / at : 0;
                 int openTypeOut = openTypeSet ? openType : 0;
                 // Live trade-profit metrics (zero if flat)
                 double profitPts = 0, peakPts = trailMaxProfitPts;
                 if (pos != 0 && averageEntryPrice > 0)
                 {
                     profitPts = pos == 1
-                        ? (Close[0] - averageEntryPrice) / TickSize / NQ_TICKS_PER_POINT
-                        : (averageEntryPrice - Close[0]) / TickSize / NQ_TICKS_PER_POINT;
+                        ? (pxClose - averageEntryPrice) / TickSize / NQ_TICKS_PER_POINT
+                        : (averageEntryPrice - pxClose) / TickSize / NQ_TICKS_PER_POINT;
                 }
 
                 // ---- v6 0.1.1 MM-analysis derived metrics ----
@@ -4243,25 +4318,25 @@ namespace NinjaTrader.NinjaScript.Strategies
                 int emaStack = 0;
                 if (ef > 0 && es > 0)
                 {
-                    if (Close[0] > ef && ef > es) emaStack = 1;
-                    else if (Close[0] < ef && ef < es) emaStack = -1;
+                    if (pxClose > ef && ef > es) emaStack = 1;
+                    else if (pxClose < ef && ef < es) emaStack = -1;
                 }
                 // ADX slope (rising trend strength = positive). 5-bar look-back.
                 double adxSlope = 0;
-                if (indAdx != null && CurrentBar > 20)
+                if (indAdx != null && CurrentBars[0] > 20)
                 {
                     try { adxSlope = ax - indAdx[5]; } catch { adxSlope = 0; }
                 }
                 // Volume-profile distances (signed: + = price ABOVE level)
-                double distPocPts = pocLevel > 0 ? (Close[0] - pocLevel) / tickPtMm : 0;
-                double distVahPts = vahLevel > 0 ? (Close[0] - vahLevel) / tickPtMm : 0;
-                double distValPts = valLevel > 0 ? (Close[0] - valLevel) / tickPtMm : 0;
+                double distPocPts = pocLevel > 0 ? (pxClose - pocLevel) / tickPtMm : 0;
+                double distVahPts = vahLevel > 0 ? (pxClose - vahLevel) / tickPtMm : 0;
+                double distValPts = valLevel > 0 ? (pxClose - valLevel) / tickPtMm : 0;
                 // Prior-day H/L distances — the levels MM defends most
-                double distPdHiPts = prevDayHigh > 0 ? (Close[0] - prevDayHigh) / tickPtMm : 0;
-                double distPdLoPts = prevDayLow  > 0 ? (Close[0] - prevDayLow)  / tickPtMm : 0;
+                double distPdHiPts = prevDayHigh > 0 ? (pxClose - prevDayHigh) / tickPtMm : 0;
+                double distPdLoPts = prevDayLow  > 0 ? (pxClose - prevDayLow)  / tickPtMm : 0;
                 // Renko placeholders — filled by W6 Phase 0.2 plumbing
-                string brickColor = "";   // "G" / "R" / "" (no Renko series yet)
-                int brickStreak = 0;
+                string brickColor = lastBrickColor ?? "";   // "G" / "R" / ""
+                int brickStreak = brickStreakCount;
                 // Regime placeholder — filled by F1 in Phase 1
                 string regime = "";
 
@@ -4273,7 +4348,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     + "{44:F2},{45:F2},{46:F2},{47:F2},{48:F2},"
                     + "{49},{50},{51},"
                     + "{52},{53}",
-                    Time[0].ToString("yyyy-MM-dd HH:mm:ss"), CurrentBar, Close[0], vwapValue,
+                    pxTime.ToString("yyyy-MM-dd HH:mm:ss"), pxBar, pxClose, vwapValue,
                     ef, es, rs, at, ax, rawBullConfidence, rawBearConfidence,
                     lastBullConfidence, lastBearConfidence, cachedTapeDelta, htfBias, trapScore,
                     pos, qty, averageEntryPrice, hiddenStopPrice, hiddenTargetPrice, trailPrice,
@@ -4829,6 +4904,20 @@ namespace NinjaTrader.NinjaScript.Strategies
         [NinjaScriptProperty]
         [Display(Name = "Enable Diagnostic Log", Order = 1, GroupName = "8 - Diagnostics")]
         public bool EnableDiagLog { get { return enableDiagLog; } set { enableDiagLog = value; } }
+
+        // Group 9 — Renko (v6 Phase 0.2 plumbing — data only, no entry logic yet)
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Renko Series (64/16)", Order = 1, GroupName = "9 - Renko",
+            Description = "Adds a 64-tick / 16-offset Renko secondary series for MM-analysis (BarsArray[2]). Brick color & streak appear in the diag log. No entry/exit logic uses this yet — that ships in Phase 2.1 (W6 Renko thrust mode). Disable to reduce CPU load.")]
+        public bool EnableRenkoSeries { get { return enableRenkoSeries; } set { enableRenkoSeries = value; } }
+
+        [NinjaScriptProperty][Range(4, 256)]
+        [Display(Name = "Renko Brick Size (ticks)", Order = 2, GroupName = "9 - Renko")]
+        public int RenkoBrickSize { get { return renkoBrickSize; } set { renkoBrickSize = value; } }
+
+        [NinjaScriptProperty][Range(0, 256)]
+        [Display(Name = "Renko Reversal Offset (ticks)", Order = 3, GroupName = "9 - Renko")]
+        public int RenkoBrickOffset { get { return renkoBrickOffset; } set { renkoBrickOffset = value; } }
         #endregion
     }
 }
