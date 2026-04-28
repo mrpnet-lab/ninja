@@ -1255,6 +1255,12 @@ When `PACE OFF` (default), badge is informational only.
 
 > ⚠️ **Important context (user note Apr 28):** the 08:34 → 09:00 window is **pre-RTH** (NQ regular session opens 09:30 ET). With **`HRS ON`** (the default), auto-entries are hard-blocked here regardless of signal quality. So the "miss" is only a miss in a parallel world where the user had toggled `HRS OFF` for the morning. The case study still stands as a profile of *what Renko thrust mode would do* once it is allowed to fire — the rally itself is the realistic, repeatable pattern.
 
+> 🤝 **Division of responsibility (confirmed Apr 28):**
+> - **User decides WHEN to allow trading** — toggling `HRS ON/OFF` (and `AUTO/MANUAL`) is a deliberate human risk decision based on session context, news, account size, fatigue, etc. The bot does not auto-disable HRS.
+> - **Strategy decides HOW to extract profit** — once HRS is OFF and AUTO is ON, the bot is responsible for entering smart, trailing intelligently against MM stop-hunts, and exiting only when structure breaks. No "I would have entered but…" excuses; the rules in §19.6.B must produce a real `THRUST_ENTRY` and ride the move with brick-edge trail.
+>
+> This split means §19.6 success is measured the day the user flips `HRS OFF` on a setup like Apr 28: did the bot pull the trigger, did it stay on, did it bank the move? That is the bar.
+
 Likely *additional* blockers that would still have applied even with `HRS OFF`: htfBias still recovering from −1, post-win same-direction cooldown after closing winning shorts, EMA-cross-confirmation delay, `EXTENSION` filter as price ran from VWAP.
 
 **Why Renko 64/16 + THRUST mode would have nailed this:**
