@@ -88,6 +88,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int    brickStreakCount;     // consecutive same-color bricks (1 on first)
         private double lastBrickHigh, lastBrickLow, lastBrickClose;
         private int    renkoBarsSeen;
+        private int    lastProcessedRenkoBar; // dedupe — set to CurrentBars[2] of last brick processed
         #endregion
 
         // ===========================================================
@@ -634,6 +635,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     renkoBrickOffset  = 16;
                     lastBrickColor    = "";
                     brickStreakCount  = 0;
+                    lastProcessedRenkoBar = -1;
                 }
                 else if (State == State.Configure)
                 {
@@ -3372,22 +3374,27 @@ namespace NinjaTrader.NinjaScript.Strategies
         //  Data plumbing only. Updates lastBrickColor / brickStreakCount + emits BRICK_CLOSE
         //  diag rows when enabled. NO entry/exit logic reads these yet — that's W6 Phase 2.1.
         //  Called from OnBarUpdate when BarsInProgress == 2.
+        //  v6 0.2.2: dedupe via lastProcessedRenkoBar instead of IsFirstTickOfBar (which
+        //  can be unreliable on secondary series under Calculate.OnBarClose).
         // -----------------------------------------------------------
         private void ProcessRenkoBar()
         {
             if (CurrentBars[2] < 1) return;
-            // Only act on closed bricks (IsFirstTickOfBar on the secondary fires once per new brick).
-            if (!IsFirstTickOfBar) return;
+            int b = CurrentBars[2];
+            if (b == lastProcessedRenkoBar) return;   // already processed this brick index
+            lastProcessedRenkoBar = b;
             renkoBarsSeen++;
-            // Compare the just-CLOSED brick (Closes[2][1]) against its open (Opens[2][1]).
-            // First brick: Closes[2][1] doesn't exist yet — bail until we have history.
-            if (CurrentBars[2] < 2) { lastBrickClose = Closes[2][0]; return; }
-            double bOpen  = Opens[2][1];
-            double bClose = Closes[2][1];
-            double bHigh  = Highs[2][1];
-            double bLow   = Lows[2][1];
+            if (renkoBarsSeen == 1)
+                Print(TAG + "Renko series ALIVE — first brick seen, size=" + renkoBrickSize + "tk off=" + renkoBrickOffset + "tk");
+            // Compare current brick (just opened) against its open vs close.
+            // For a CLOSED brick we look at index 1 once available; otherwise use index 0.
+            int idx = CurrentBars[2] >= 2 ? 1 : 0;
+            double bOpen  = Opens[2][idx];
+            double bClose = Closes[2][idx];
+            double bHigh  = Highs[2][idx];
+            double bLow   = Lows[2][idx];
             string color  = bClose > bOpen ? "G" : (bClose < bOpen ? "R" : (lastBrickColor ?? ""));
-            if (color == lastBrickColor) brickStreakCount++;
+            if (color == lastBrickColor && color != "") brickStreakCount++;
             else { brickStreakCount = 1; lastBrickColor = color; }
             lastBrickHigh  = bHigh;
             lastBrickLow   = bLow;
