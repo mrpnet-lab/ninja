@@ -104,6 +104,15 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int    nrBarsSeen;
         private int    lastProcessedNrBar;
         private const int NINZA_BIP = 3;         // BarsArray index for NinzaRenko
+
+        // ---- v6 1.1 — F1 Regime Classifier (label-only) ----
+        // Pure observation. Populates `Regime` diag column + dashboard row (Phase 1.2).
+        // NO entry/exit logic reads currentRegime yet — that arrives in Phase 2.x.
+        private bool   enableRegimeClassifier;   // default OFF
+        private string currentRegime = "UNKNOWN";
+        private string prevRegime    = "UNKNOWN";
+        private int    regimeChangedBar;          // CurrentBar of last regime transition (for dashboard age)
+        private int    regimeFlipsLast20;         // count of NR brick color flips in last 20 bricks (chop signal)
         #endregion
 
         // ===========================================================
@@ -657,6 +666,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                     lastNrBrickColor  = "";
                     nrBrickStreakCount = 0;
                     lastProcessedNrBar = -1;
+                    // v6 1.1 — F1 Regime Classifier defaults (label-only, OFF by default).
+                    enableRegimeClassifier = false;
+                    currentRegime          = "UNKNOWN";
+                    prevRegime             = "UNKNOWN";
+                    regimeChangedBar       = 0;
+                    regimeFlipsLast20      = 0;
                 }
                 else if (State == State.Configure)
                 {
@@ -890,6 +905,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                         WriteDiagRow("HEARTBEAT", "tradesToday=" + dailyTradeCount + " openDca=" + openDcaCount);
                     }
                 }
+
+                // -------- v6 1.1: F1 Regime Classifier (label-only, default OFF) --------
+                // Runs every bar after warmup; result stored in currentRegime, surfaces in diag log.
+                // Cheap (a few comparisons + 4-bar brick-flip scan), so safe to leave on.
+                if (enableRegimeClassifier && IsFirstTickOfBar)
+                    UpdateRegimeClassifier();
 
                 // -------- CRITICAL pending button paths --------
                 ProcessPendingButtons();
@@ -3528,6 +3549,86 @@ namespace NinjaTrader.NinjaScript.Strategies
                     + " hi=" + bHigh.ToString("F2") + " lo=" + bLow.ToString("F2")
                     + " size=" + renkoBrickSize + "tk trend=" + renkoBrickOffset + "tk");
         }
+
+        // -----------------------------------------------------------
+        //  v6 1.1 — F1 Regime Classifier (label-only, default OFF).
+        //  Combines NinzaRenko brick streak + ADX/ADX-slope + ATR + EMA stack +
+        //  distance-to-VWAP-in-ATRs into one of:
+        //     TREND_UP / TREND_DN / CHOP / SQUEEZE / UNKNOWN
+        //  Pure observation. Result lives in currentRegime, surfaces in diag log Regime
+        //  column and (Phase 1.2) the dashboard "Regime:" row. NO trade logic reads it yet.
+        //  Designed to be cheap (a few comparisons + a 4-bar brick scan) so safe every bar.
+        //  Goal of this classifier: identify the moments MM bots/algos are most active
+        //  (CHOP = stop-hunt zone, SQUEEZE = compression-then-breakout) and the moments
+        //  they're trapped (TREND_UP/DN with strong streak) so downstream phases can
+        //  weight signals to BEAT the MM rather than fight it.
+        // -----------------------------------------------------------
+        private void UpdateRegimeClassifier()
+        {
+            if (CurrentBar < 25 || indAdx == null || indAtr == null) return;
+            double adx     = indAdx[0];
+            double adxPrev = CurrentBar >= 5 ? indAdx[5] : adx;
+            double adxSlope = adx - adxPrev;
+            double atr     = indAtr[0];
+            if (atr <= 0) return;
+            // ATR baseline (20-bar avg) for SQUEEZE detection.
+            double atrAvg = 0; int atrCnt = 0;
+            for (int i = 0; i < 20 && i < CurrentBar; i++) { atrAvg += indAtr[i]; atrCnt++; }
+            if (atrCnt > 0) atrAvg /= atrCnt; else atrAvg = atr;
+            // EMA stack proxy.
+            int eStack = 0;
+            if (indEmaFast != null && indEmaSlow != null)
+            {
+                double ef = indEmaFast[0], es = indEmaSlow[0], px = Close[0];
+                if (px > ef && ef > es) eStack = 1;
+                else if (px < ef && ef < es) eStack = -1;
+            }
+            // Distance from VWAP in ATR multiples.
+            double distVwapAtr = 0;
+            if (vwapValue > 0) distVwapAtr = (Close[0] - vwapValue) / atr;
+            // NinzaRenko brick info — streak (consecutive same-color) + recent flip count.
+            string nrColor = lastNrBrickColor ?? "";
+            int    nrStreak = nrBrickStreakCount;
+            // Approx "flip count in last 4 bricks" using primary bars (NinzaRenko=primary).
+            // Not an exact brick history; good enough as a chop tell.
+            int recentFlips = 0;
+            for (int i = 0; i < 4 && i + 1 < CurrentBar; i++)
+            {
+                int s0 = Math.Sign(Close[i]   - Open[i]);
+                int s1 = Math.Sign(Close[i+1] - Open[i+1]);
+                if (s0 != 0 && s1 != 0 && s0 != s1) recentFlips++;
+            }
+            regimeFlipsLast20 = recentFlips;  // reused name; really last-4 here, cheap
+
+            // ----- classification rules (v1, conservative) -----
+            string r;
+            if (adx >= 22 && adxSlope > 0 && eStack == 1
+                && nrColor == "G" && nrStreak >= 3 && distVwapAtr >  0.5)
+                r = "TREND_UP";
+            else if (adx >= 22 && adxSlope > 0 && eStack == -1
+                && nrColor == "R" && nrStreak >= 3 && distVwapAtr < -0.5)
+                r = "TREND_DN";
+            else if (adx < 15 && atr < 0.6 * atrAvg)
+                r = "SQUEEZE";
+            else if (adx < 18 && Math.Abs(distVwapAtr) < 0.5 && recentFlips >= 2)
+                r = "CHOP";
+            else
+                r = "UNKNOWN";
+
+            if (r != currentRegime)
+            {
+                prevRegime = currentRegime;
+                currentRegime = r;
+                regimeChangedBar = CurrentBar;
+                if (enableDiagLog)
+                    WriteDiagRow("REGIME_CHANGE",
+                        "from=" + prevRegime + " to=" + r
+                        + " adx=" + adx.ToString("F1") + " slope=" + adxSlope.ToString("F2")
+                        + " atr/avg=" + (atr/atrAvg).ToString("F2") + " eStack=" + eStack
+                        + " distVwapAtr=" + distVwapAtr.ToString("F2")
+                        + " nr=" + nrColor + "x" + nrStreak + " flips4=" + recentFlips);
+            }
+        }
         #endregion
 
         // ===========================================================
@@ -4514,7 +4615,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 int brickStreak = !string.IsNullOrEmpty(lastNrBrickColor) ? nrBrickStreakCount
                                     : brickStreakCount;
                 // Regime placeholder — filled by F1 in Phase 1
-                string regime = "";
+                string regime = currentRegime ?? "";
 
                 diagWriter.WriteLine(string.Format(
                     "{0},{1},{2:F2},{3:F2},{4:F2},{5:F2},{6:F2},{7:F2},{8:F1},{9:F1},{10:F1},{11:F1},{12:F1},{13:F2},{14},{15:F1},"
@@ -5109,6 +5210,12 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "Use Primary Chart AS NinzaRenko", Order = 6, GroupName = "9 - Renko",
             Description = "When ON (default), the strategy reads NinzaRenko brick color/streak directly from the primary chart series — use this when your chart bar type is already NinzaRenko (no AddDataSeries needed). When OFF, the strategy will try to AddDataSeries using NinzaCustomSlot above.")]
         public bool UsePrimaryAsNinzaRenko { get { return usePrimaryAsNinzaRenko; } set { usePrimaryAsNinzaRenko = value; } }
+
+        // ===== v6 1.1 — F1 Regime Classifier =====
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Regime Classifier (label-only)", Order = 1, GroupName = "10 - Regime",
+            Description = "When ON, classifies each bar as TREND_UP / TREND_DN / CHOP / SQUEEZE / UNKNOWN based on ADX, ATR, EMA stack, NinzaRenko streak, and distance from VWAP. Result is logged in the diag CSV 'Regime' column. NO entry/exit logic uses this yet — it's pure observation. Default OFF; turn ON to start collecting regime labels for post-trade analysis.")]
+        public bool EnableRegimeClassifier { get { return enableRegimeClassifier; } set { enableRegimeClassifier = value; } }
         #endregion
     }
 }
