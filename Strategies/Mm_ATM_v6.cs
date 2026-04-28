@@ -134,6 +134,29 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int    extensionBypassStreakMax = 8;   // only bypass extension if streak <= this (still avoid late chases)
         // adxSlope cached from regime classifier so entry guards can read it without recomputing.
         private double lastAdxSlope;
+
+        // ---- v6 2.3 — Brick-Trail Mode (lets monster runs run; default OFF) ----
+        // 2026-04-28 WIN#2 forensic: entered SHORT @ 27126.50 brick #9, trail kicked us out at
+        // 27106.50 brick #15 (+20pt = $400). Run continued to brick #30 with maxFav=132pt = $2640
+        // missed. Brick-trail solves it: trail price = previous closed brick's far extreme + buffer.
+        // Each new same-direction brick ratchets the trail one brick at a time. First opposite-color
+        // brick that prints will pierce the trail instantly = clean exit on actual reversal signal.
+        private bool   enableBrickTrail;            // master toggle, default OFF
+        private int    brickTrailMinStreak = 4;     // require >= N same-color bricks before brick-trail engages
+        private double brickTrailBufferTicks = 4;   // ticks above prev-brick-high (SHORT) / below low (LONG)
+        private bool   brickTrailRequireTrendRegime = true; // require regime=TREND_DN (SHORT) / TREND_UP (LONG)
+        // Cache prior brick high/low so trail can ratchet one brick behind the just-closed brick.
+        private double prevNrBrickHigh;
+        private double prevNrBrickLow;
+
+        // ---- v6 2.4 — UNKNOWN-Regime Auto-Block (prevents the -$370/-$375 trades; default OFF) ----
+        // 2026-04-28 forensic: BOTH losses (LOSS#1 R×1 -$370, LOSS#2 R×8 -$375) entered with
+        // currentRegime="UNKNOWN". The classifier is uncertain ⇒ we should be too. This guard
+        // blocks AUTO entries when regime=UNKNOWN unless the brick streak + ADX slope prove
+        // momentum is real. Manual entries always pass (you override).
+        private bool enableUnknownRegimeBlock;       // default OFF
+        private int  unknownBlockMinStreak = 6;      // require streak >= N to enter in UNKNOWN
+        private double unknownBlockMinAdxSlope = 0;  // require ADX slope >= this to enter in UNKNOWN
         // Run tracker (live counters):
         private int    runCurrentLen;             // = nrBrickStreakCount but kept independent in case
         private string runCurrentColor = "";      // "G"/"R"
@@ -731,6 +754,17 @@ namespace NinjaTrader.NinjaScript.Strategies
                     enableExtensionTrendBypass = false;
                     extensionBypassStreakMax   = 8;
                     lastAdxSlope               = 0;
+                    // v6 2.3 — Brick-Trail Mode defaults (ACTIVE LOGIC, OFF by default).
+                    enableBrickTrail              = false;
+                    brickTrailMinStreak           = 4;
+                    brickTrailBufferTicks         = 4;
+                    brickTrailRequireTrendRegime  = true;
+                    prevNrBrickHigh               = 0;
+                    prevNrBrickLow                = 0;
+                    // v6 2.4 — UNKNOWN regime block defaults (ACTIVE LOGIC, OFF by default).
+                    enableUnknownRegimeBlock = false;
+                    unknownBlockMinStreak    = 6;
+                    unknownBlockMinAdxSlope  = 0;
                 }
                 else if (State == State.Configure)
                 {
@@ -1378,6 +1412,73 @@ namespace NinjaTrader.NinjaScript.Strategies
                 : (averageEntryPrice - price) / tickPt;
             if (profitPts > trailMaxProfitPts) trailMaxProfitPts = profitPts;
 
+            // ===========================================================
+            //  v6 2.3 \u2014 BRICK-TRAIL MODE (Beat-the-MM monster-run capture)
+            // ---------------------------------------------------------
+            //  When ALL conditions are met, the entire ATR/tier trail logic below is BYPASSED
+            //  and the trail is anchored to the previous CLOSED brick's far extreme + buffer:
+            //   \u2022 SHORT trail = lastNrBrickHigh + buffer ticks   (ratchets DOWN as new R bricks print)
+            //   \u2022 LONG  trail = lastNrBrickLow  - buffer ticks   (ratchets UP   as new G bricks print)
+            //  The first opposite-color brick that prints will instantly pierce the trail
+            //  at its own extreme = clean exit on the actual reversal signal, not on a wick.
+            //  Conditions:
+            //   1) EnableBrickTrail = ON
+            //   2) Brick color matches trade direction (R while SHORT, G while LONG)
+            //   3) Brick streak >= BrickTrailMinStreak (default 4)
+            //   4) (optional, default ON) currentRegime is TREND_DN for SHORT / TREND_UP for LONG
+            //   5) trailMaxProfitPts >= dynamicActivation (we are in profit beyond entry noise)
+            // ===========================================================
+            bool brickTrailEngaged = false;
+            if (enableBrickTrail && nrBrickStreakCount >= brickTrailMinStreak
+                && lastNrBrickHigh > 0 && lastNrBrickLow > 0
+                && trailMaxProfitPts >= (aggressiveExitsEnabled ? aggrTrailActivationPts : trailActivationPoints))
+            {
+                bool brickAgrees = (openTradeDirection == -1 && lastNrBrickColor == "R")
+                                || (openTradeDirection ==  1 && lastNrBrickColor == "G");
+                bool regimeOk = !brickTrailRequireTrendRegime
+                              || (openTradeDirection == -1 && currentRegime == "TREND_DN")
+                              || (openTradeDirection ==  1 && currentRegime == "TREND_UP");
+                if (brickAgrees && regimeOk)
+                {
+                    double bufPt = brickTrailBufferTicks * TickSize;
+                    double btPrice = openTradeDirection == -1
+                        ? Math.Round((lastNrBrickHigh + bufPt) / TickSize) * TickSize
+                        : Math.Round((lastNrBrickLow  - bufPt) / TickSize) * TickSize;
+                    // Only ratchet INWARD (never loosen) and only if currently active OR newly arming.
+                    bool first = !trailActive;
+                    if (first
+                        || (openTradeDirection == -1 && btPrice < trailPrice)
+                        || (openTradeDirection ==  1 && btPrice > trailPrice))
+                    {
+                        trailPrice = btPrice;
+                        trailActive = true;
+                        trailTierName = "BrickTrail";
+                        if (enableDiagLog && first)
+                            WriteDiagRow("BRICK_TRAIL_ARMED",
+                                "dir=" + openTradeDirection + " streak=" + nrBrickStreakCount
+                                + " brickHi=" + lastNrBrickHigh.ToString("F2")
+                                + " brickLo=" + lastNrBrickLow.ToString("F2")
+                                + " trail=" + trailPrice.ToString("F2"));
+                    }
+                    brickTrailEngaged = true;
+                    // Hit detection (same logic as bottom of method but local for clarity).
+                    bool hit = (openTradeDirection == -1 && price >= trailPrice)
+                            || (openTradeDirection ==  1 && price <= trailPrice);
+                    if (hit)
+                    {
+                        lastExitReason = "TRAIL_BrickTrail";
+                        if (enableDiagLog)
+                            WriteDiagRow("BRICK_TRAIL_HIT",
+                                "dir=" + openTradeDirection + " px=" + price.ToString("F2")
+                                + " trail=" + trailPrice.ToString("F2") + " profit=" + profitPts.ToString("F1") + "pt");
+                        if (openTradeDirection == 1) ExitLong(); else if (openTradeDirection == -1) ExitShort();
+                        pendingExit = true;
+                        return;
+                    }
+                    return; // Brick-trail in charge \u2014 skip the legacy ATR/tier logic entirely.
+                }
+            }
+
             double atrPts = indAtr[0] / tickPt;
             double dynamicActivation = aggressiveExitsEnabled
                 ? aggrTrailActivationPts
@@ -2022,6 +2123,29 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     UpdateDashboardStatus(label + " blocked: CHOP " + chopReason, Brushes.Orange);
                     if (enableDiagLog) WriteDiagRow("BLOCK_CHOP", chopReason);
+                    return false;
+                }
+            }
+            // v6 2.4 — UNKNOWN-Regime Auto-Block (AUTO ONLY — manual entries bypass).
+            //   The Regime Classifier marks a bar UNKNOWN when none of TREND_UP/DN/CHOP/SQUEEZE
+            //   conditions are clearly met. 2026-04-28 forensic showed BOTH losses (-$370, -$375)
+            //   entered with regime=UNKNOWN. When uncertain, the safer move is to wait. We allow
+            //   entries in UNKNOWN ONLY when momentum proves itself: brick streak >= N AND ADX slope
+            //   >= threshold AND brick color agrees with trade direction.
+            if (!isManual && enableUnknownRegimeBlock && currentRegime == "UNKNOWN")
+            {
+                bool brickAgrees = (direction == 1 && lastNrBrickColor == "G")
+                                || (direction == -1 && lastNrBrickColor == "R");
+                bool streakOk    = nrBrickStreakCount >= unknownBlockMinStreak;
+                bool adxOk       = lastAdxSlope >= unknownBlockMinAdxSlope;
+                if (!brickAgrees || !streakOk || !adxOk)
+                {
+                    UpdateDashboardStatus(label + " blocked: UNKNOWN regime", Brushes.Orange);
+                    if (enableDiagLog) WriteDiagRow("BLOCK_UNKNOWN_REGIME",
+                        "dir=" + direction + " brick=" + lastNrBrickColor + "x" + nrBrickStreakCount
+                        + " adxSlope=" + lastAdxSlope.ToString("F2")
+                        + " need brick=" + (direction == 1 ? "G" : "R") + " streak>=" + unknownBlockMinStreak
+                        + " adxSlope>=" + unknownBlockMinAdxSlope);
                     return false;
                 }
             }
@@ -3627,6 +3751,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             string prevColor = lastNrBrickColor ?? "";
             if (color == lastNrBrickColor && color != "") nrBrickStreakCount++;
             else { nrBrickStreakCount = 1; lastNrBrickColor = color; }
+            // v6 2.3 — cache PRIOR closed brick extremes BEFORE overwriting with the just-closed brick.
+            // Brick-trail uses these so a new same-color brick ratchets stop one brick behind, while
+            // a fresh opposite-color brick will pierce the trail at its own extreme = clean exit.
+            prevNrBrickHigh = lastNrBrickHigh;
+            prevNrBrickLow  = lastNrBrickLow;
             lastNrBrickHigh  = bHigh;
             lastNrBrickLow   = bLow;
             lastNrBrickClose = bClose;
@@ -5524,6 +5653,43 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "  Extension Bypass Max Streak", Order = 21, GroupName = "10 - Regime",
             Description = "Maximum NinzaRenko brick streak that still allows extension bypass. Default 8. Above this, the trend is likely exhausted and reversal risk dominates. Only used when EnableExtensionTrendBypass=ON.")]
         public int ExtensionBypassStreakMax { get { return extensionBypassStreakMax; } set { extensionBypassStreakMax = value; } }
+
+        // ===== v6 2.3 — Brick-Trail Mode (lets monster runs run, ACTIVE LOGIC) =====
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Brick-Trail Mode", Order = 30, GroupName = "10 - Regime",
+            Description = "PHASE 2.3 — ACTIVE LOGIC. Default OFF. When ON and ALL of (1) brick color agrees with trade dir, (2) brick streak >= BrickTrailMinStreak, (3) regime is TREND matching dir (if BrickTrailRequireTrendRegime=ON), (4) trade is in profit beyond activation — the trail is anchored to the previous CLOSED brick's far extreme + buffer ticks. Each new same-direction brick ratchets the trail one brick. First opposite-color brick pierces the trail = clean exit on actual reversal (not a wick). VALIDATED on 2026-04-28 WIN#2: legacy trail exited at +$400 (brick #15) but run continued to brick #30 with maxFav=132pt = ~$2640 missed. Brick-trail would have ridden the full move. REQUIRES EnableRegimeClassifier=ON. Watch for BRICK_TRAIL_ARMED + BRICK_TRAIL_HIT diag rows. DO NOT enable in chop — it gives back more on reversals.")]
+        public bool EnableBrickTrail { get { return enableBrickTrail; } set { enableBrickTrail = value; } }
+
+        [NinjaScriptProperty, Range(2, 20)]
+        [Display(Name = "  Brick-Trail Min Streak", Order = 31, GroupName = "10 - Regime",
+            Description = "Minimum NinzaRenko brick streak before Brick-Trail Mode engages. Default 4. Lower = engages sooner (catches more runners but more whipsaw on small runs). Higher = engages only on confirmed runners (safer but misses early-run profit).")]
+        public int BrickTrailMinStreak { get { return brickTrailMinStreak; } set { brickTrailMinStreak = value; } }
+
+        [NinjaScriptProperty, Range(1, 20)]
+        [Display(Name = "  Brick-Trail Buffer Ticks", Order = 32, GroupName = "10 - Regime",
+            Description = "Ticks above prev brick HIGH (SHORT) or below prev brick LOW (LONG) for the trail price. Default 4 (=1 NQ point). Lower = tighter (more wick stops). Higher = looser (gives back more on reversal).")]
+        public double BrickTrailBufferTicks { get { return brickTrailBufferTicks; } set { brickTrailBufferTicks = value; } }
+
+        [NinjaScriptProperty]
+        [Display(Name = "  Brick-Trail Require TREND Regime", Order = 33, GroupName = "10 - Regime",
+            Description = "When ON (default), Brick-Trail Mode only engages when currentRegime is TREND_DN (SHORT) or TREND_UP (LONG). Turn OFF to let brick-trail engage in UNKNOWN regimes too — riskier but catches runs the classifier doesn't label.")]
+        public bool BrickTrailRequireTrendRegime { get { return brickTrailRequireTrendRegime; } set { brickTrailRequireTrendRegime = value; } }
+
+        // ===== v6 2.4 — UNKNOWN-Regime Auto-Block (prevents low-conviction losses, ACTIVE LOGIC) =====
+        [NinjaScriptProperty]
+        [Display(Name = "Enable UNKNOWN-Regime Block", Order = 40, GroupName = "10 - Regime",
+            Description = "PHASE 2.4 — ACTIVE LOGIC. Default OFF. When ON, AUTO entries are BLOCKED when currentRegime='UNKNOWN' UNLESS all of: (1) brick color matches trade dir, (2) brick streak >= UnknownBlockMinStreak, (3) ADX slope >= UnknownBlockMinAdxSlope. VALIDATED on 2026-04-28: BOTH losses (-$370, -$375) entered with regime=UNKNOWN. With this ON+streak=6, both would have been blocked. Manual entries always pass. REQUIRES EnableRegimeClassifier=ON. Watch for BLOCK_UNKNOWN_REGIME diag rows. DO NOT enable if you want to test the regime classifier's coverage — turn ON only after you verify TREND labels are firing on your instrument.")]
+        public bool EnableUnknownRegimeBlock { get { return enableUnknownRegimeBlock; } set { enableUnknownRegimeBlock = value; } }
+
+        [NinjaScriptProperty, Range(2, 20)]
+        [Display(Name = "  UNKNOWN Block Min Streak", Order = 41, GroupName = "10 - Regime",
+            Description = "Minimum NinzaRenko brick streak (in trade dir color) required to enter when regime=UNKNOWN. Default 6. Lower = more entries (catches early moves the classifier hasn't labeled). Higher = more selective (only super-strong momentum bypasses the block).")]
+        public int UnknownBlockMinStreak { get { return unknownBlockMinStreak; } set { unknownBlockMinStreak = value; } }
+
+        [NinjaScriptProperty, Range(-5.0, 10.0)]
+        [Display(Name = "  UNKNOWN Block Min AdxSlope", Order = 42, GroupName = "10 - Regime",
+            Description = "Minimum ADX slope (positive=rising trend strength) to enter when regime=UNKNOWN. Default 0 (just non-negative). Increase to 1-2 for stricter trend confirmation.")]
+        public double UnknownBlockMinAdxSlope { get { return unknownBlockMinAdxSlope; } set { unknownBlockMinAdxSlope = value; } }
         #endregion
     }
 }

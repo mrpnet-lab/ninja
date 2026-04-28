@@ -2222,3 +2222,113 @@ Both bypasses are **risk-increasing** (they create entries that didn't exist bef
 ———
 
 **Next phases queued:** 2.3 MM-Trap Re-Entry, 2.4 Brick Mode Entry, 2.5 Wick-Reject Gate. Will be designed after we validate Phase 2.1+2.2 against 2-3 sessions of real data.
+
+
+---
+
+## 24. Phase 2.3 + 2.4 SHIPPED (v6 2.4.0, 2026-04-28)
+
+> Result of Playback3 forensic: same 4 trades as Playback1 (defaults OFF), same -$285 day. The two losers (-$370, -$375) BOTH entered with `Regime=UNKNOWN`. The big winner (WIN#2) was exited at +$400 by the legacy ATR/tier trail at brick #15, but the run continued unimpeded to brick #30 with `maxFav=132pt` = ~$2640 missed. These two facts drove Phase 2.3 + 2.4.
+
+### 24.1 Phase 2.3 â€” Brick-Trail Mode (the monster-run capture)
+
+**Toggle:** `EnableBrickTrail` (Group "10 - Regime", Order 30). Default OFF.
+
+**What it does:** when ALL conditions are met, the entire ATR/tier trail logic is BYPASSED and the trail is anchored to the previous closed brick's far extreme + buffer ticks:
+- SHORT trail = `lastNrBrickHigh + BrickTrailBufferTicks` (ratchets DOWN as new R bricks print)
+- LONG trail = `lastNrBrickLow - BrickTrailBufferTicks` (ratchets UP as new G bricks print)
+
+**Conditions (all must be true to engage):**
+1. `EnableBrickTrail = ON`
+2. Brick color matches trade direction
+3. Brick streak â‰¥ `BrickTrailMinStreak` (default 4)
+4. (optional, default ON) `currentRegime = TREND_DN` (SHORT) or `TREND_UP` (LONG)
+5. Trade is in profit beyond activation threshold
+
+**The first opposite-color brick prints â†’ its high pierces the trail â†’ clean exit on real reversal**, not a wick.
+
+**Diag rows:** `BRICK_TRAIL_ARMED` (first activation), `BRICK_TRAIL_HIT` (exit fired).
+
+**Tunable:**
+| Property | Default | Effect |
+|---|---|---|
+| `BrickTrailMinStreak` | 4 | Lower = engages sooner (more whipsaw); higher = waits for confirmed runners |
+| `BrickTrailBufferTicks` | 4 (=1 NQ pt) | Lower = tighter (more wick stops); higher = looser |
+| `BrickTrailRequireTrendRegime` | ON | OFF lets brick-trail engage in UNKNOWN too â€” riskier, catches more |
+
+**Counterfactual on WIN#2 (10:35:41 SHORT @ 27126.50, exited 10:35:55 @ 27106.50, +$400):**
+- Brick #15 closed @ 27102.75. Brick-trail at brick #15 = `27098.50 + 1pt = 27099.50`
+- Run continued: brick #16 @ 27099, #17 @ 27095, ... #30 @ 27043 (last R brick low â‰ˆ 27042.25)
+- Final brick-trail before opposite color = `27042.25 + 1pt = 27043.25`
+- First G brick at 10:39:55 closed @ 27071, **high = 27071** â†’ trail @ 27043.25 not hit yet, but next G brick at 10:41:38 high pierced
+- Estimated exit â‰ˆ 27050 â†’ profit â‰ˆ **76pt = $1520/contract** (vs $400 actual)
+
+### 24.2 Phase 2.4 â€” UNKNOWN-Regime Auto-Block (the loss preventer)
+
+**Toggle:** `EnableUnknownRegimeBlock` (Group "10 - Regime", Order 40). Default OFF.
+
+**What it does:** AUTO entries blocked when `currentRegime = "UNKNOWN"` UNLESS all of:
+1. Brick color matches trade direction
+2. Brick streak â‰¥ `UnknownBlockMinStreak` (default 6)
+3. `lastAdxSlope` â‰¥ `UnknownBlockMinAdxSlope` (default 0)
+
+**Manual entries always pass.**
+
+**Diag rows:** `BLOCK_UNKNOWN_REGIME` with the failed condition reasons.
+
+**Counterfactual on Playback3 losses:**
+- LOSS#1 (10:30 RÃ—1 UNKNOWN): streak=1 < 6 â†’ **BLOCKED** (saves -$370)
+- LOSS#2 (15:35 RÃ—8 UNKNOWN): streak=8 â‰¥ 6 âœ“ but `adxSlope` was negative there â†’ **BLOCKED** if you set MinAdxSlope=0 strict, or set MinStreak=10 to block this case
+
+### 24.3 âœ… How to enable (recommended sequence)
+
+**Prerequisites (must be ON):**
+- `Enable Regime Classifier` = ON
+- `Enable Brick Analytics` = ON
+- `Enable Diag Log` = ON
+
+**Day-by-day rollout:**
+
+| Day | Settings to add | Expected effect |
+|---|---|---|
+| **A** Baseline | Prerequisites only | Same as before â€” confirms log structure |
+| **B** Loss-preventer | `EnableUnknownRegimeBlock = ON` | Trade count goes DOWN (good â€” drops losers) |
+| **C** Profit-extender | + `EnableBrickTrail = ON` | Same trade count, average winner GROWS |
+| **D** Re-board runners | + `EnableSmartCooldown = ON` | More entries on continuation moves |
+| **E** Follow extensions | + `EnableExtensionTrendBypass = ON` | More entries on strong trends |
+
+**Stop and report log if any of these:**
+- 2+ consecutive losses â†’ step back one day's setting
+- `BRICK_TRAIL_HIT` exits losing money (means trail engaged in chop; raise `BrickTrailMinStreak` to 6 or set `BrickTrailRequireTrendRegime = ON`)
+- All entries blocked for hours (raise `UnknownBlockMinStreak` to 4 to relax)
+
+### 24.4 âš  When NOT to enable
+
+| Setting | Skip when... |
+|---|---|
+| `EnableBrickTrail` | Regime classifier mislabels chop as TREND on your instrument |
+| `EnableUnknownRegimeBlock` | You're testing the classifier itself (it'll mask the issue) |
+| News days (FOMC, CPI, NFP) | Disable ALL Phase 2 toggles â€” regimes flip too fast |
+
+### 24.5 Risk note
+
+These are now the FIRST tools in the strategy that actually CHANGE exits and entries based on regime/brick analytics. The 2.3 brick-trail can give back more than legacy trail on **fake breakouts** in chop (one bad brick reversal vs a tight trail tier). Mitigated by `BrickTrailRequireTrendRegime = ON` default.
+
+The 2.4 UNKNOWN block reduces trade count. If your day is ALL UNKNOWN regime (classifier hasn't tuned to your market), you'll trade nothing â€” that's the safety mechanism, but it also means zero profit. Run baseline first.
+
+### 24.6 Combined expected impact (from 2026-04-28 data)
+
+| Metric | Playback3 actual | With 2.3 + 2.4 ON (estimated) |
+|---|---|---|
+| Trades | 4 | 2 (losers blocked) |
+| WIN#1 P&L | +$230 | +$230 (unchanged, run was short) |
+| LOSS#1 P&L | -$370 | $0 (blocked) |
+| WIN#2 P&L | +$405 | **+$1500** (brick-trail rides to brick #25-30) |
+| LOSS#2 P&L | -$375 | $0 (blocked) |
+| **Day total** | **-$285** | **+$1730** |
+
+Adding 2.1 Smart Cooldown on top would re-enter the 19â†’30 brick continuation after WIN#2 = additional **+$800-1200** estimated.
+
+---
+
+**Phase 2.5 queued:** Wick-Reject entry gate (block entries against fresh `WICK_TAG` patterns), MM-Trap Re-Entry (auto re-enter original direction after a 1-streak trap-flip stops us out).
