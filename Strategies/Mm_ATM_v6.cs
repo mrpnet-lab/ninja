@@ -344,7 +344,6 @@ namespace NinjaTrader.NinjaScript.Strategies
         // ===========================================================
         #region Trail state
         private bool   trailActive;
-        private bool   manualTrailMode;        // legacy flag (kept for backward refs); no longer pauses ratchet
         private bool   manualTrailEarlyStart;  // TRL NOW set this -> activation profit threshold bypassed
         private double manualTrailOffsetPoints; // signed offset added to auto trail distance (− = tighter, + = looser)
         private double trailPrice;
@@ -1305,27 +1304,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 : Math.Max(trailActivationPoints, atrPts * 0.4);
             bool htfAgrees = (openTradeDirection == 1 && htfBias > 0) || (openTradeDirection == -1 && htfBias < 0);
 
-            // AGGR ADVERSE EXIT (DEPRECATED HERE — now runs at top of MonitorHiddenStops so it can
-            // preempt the static SL). Kept as a no-op fallback for safety.
-            if (false && aggressiveExitsEnabled && aggrAdverseExitEnabled
-                && (CurrentBar - entryBar) <= aggrAdverseMaxBars
-                && trailMaxProfitPts < aggrAdverseDisarmPeak
-                && lastFastReversalBar != CurrentBar)
-            {
-                double adverse = -profitPts;
-                double adverseTrigger = Math.Max(aggrAdverseMinPts, aggrAdverseAtrFactor * atrPts);
-                if (adverse >= adverseTrigger)
-                {
-                    lastFastReversalBar = CurrentBar;
-                    lastExitReason = "AGGR_ADVERSE";
-                    if (enableDiagLog) WriteDiagRow("AGGR_ADVERSE_EXIT", "adv=" + adverse.ToString("F1") + " trig=" + adverseTrigger.ToString("F1") + " bars=" + (CurrentBar - entryBar));
-                    if (openTradeDirection == 1) ExitLong();
-                    else if (openTradeDirection == -1) ExitShort();
-                    pendingExit = true;
-                    return;
-                }
-            }
-
             // AGGRESSIVE PULLBACK EXIT (anti-MM-trap): once we've been in profit beyond activation,
             // any retracement >= aggrPullbackAtrFactor*ATR within aggrPullbackMaxBars of entry
             // forces a market exit so MM stop-runs can't flip a winner into a loser.
@@ -1367,7 +1345,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                     return;
                 }
                 trailActive = true;
-                manualTrailMode = false;
                 // Runner Mode override: single wide distance, ignore all aggression sources.
                 double dist;
                 if (runnerModeActive_user)
@@ -2285,7 +2262,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             entryBar = CurrentBar;
             // reset trail state on every arm — user nudges from prior trade are CLEARED
             trailActive = false; trailPrice = 0; trailMaxProfitPts = 0; trailTierName = "";
-            manualTrailMode = false;
             manualTrailEarlyStart = false;
             manualTrailOffsetPoints = 0;
             trapScore = 0; trapDetected = false; trapBarsInTrade = 0; trapEscapeBars = 0;
