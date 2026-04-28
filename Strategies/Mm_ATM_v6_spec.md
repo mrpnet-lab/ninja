@@ -1104,24 +1104,90 @@ WAIT — low conf htf-against
 
 ---
 
-## 19. v6 Active Workplan — Apr 28, 2026 onward
+## 19. v6 Active Workplan — Apr 28, 2026 onward (PHASED)
 
-> **Status:** v6 14.20 shipped (enhanced diag log: 39 cols, toggle logging, 10-min heartbeat). Items below are queued and will be implemented in this order in upcoming sessions. Each ships as its own toggle, default OFF where applicable, with no breaking changes to existing v5 behavior.
->
-> *(For long-term v6 ideas — pattern memory, MM playbook, Kelly sizing, etc. — see §18 below.)*
+> **Status:** Forked from `Mm_ATM_v5.cs` v5 14.20. v5 is **frozen** for live trading; v6 receives all new work. Each phase ships behind toggles default OFF. Commits use `v6 0.X.Y: <desc>` numbering.
 
-### Implementation order (agreed Apr 28, 2026)
+### Phased build order (agreed Apr 28, 2026 — supersedes the original 6-item flat list)
 
-| # | Item | Scope | Why this order | Target version |
-|---|---|---|---|---|
-| 1 | **TP-line render bug + manual T+/T- on auto-mode TP** | Bug fix | Live UX issue; small | v6 14.21 |
-| 2 | **Drag SL/TP/Trail lines on chart** | UX feature | High value, clean addition | v6 14.22 |
-| 3 | **Buy/Sell Limit ±N tick offset + TTL + dashed line** | New entry mode | Independent feature | v6 14.23 |
-| 4 | **AGGR-L1 / AGGR-L2 aggression levels + PACE indicator** | New dashboard buttons | High profit potential | v6 14.24 |
-| 5 | **Lead-signal entry + trend-entry mode** | Entry timing | Needs a few days of v14.20 logs first | v6 14.25 |
-| 6 | **NinjaRenko follow mode (Off / On / Renko)** | Big feature | Largest scope; last in v5 | v6 14.26 |
+> **Why phased:** F1 Regime Classifier is the keystone — every later feature reads regime. Building anything else first means rewriting it once F1 lands. We interleave **one quick UX win up front** (TP bug) and the **highest-leverage capture feature right after foundation** (Renko thrust) so we get felt value early.
 
-Items 2 and 3 from the original 7-item list (hide bot labels / stealth mode) are **deferred to v6** per user decision.
+#### 🛠️ Phase 0 — Housekeeping  *(target: v6 0.1.x)*
+
+| # | Task | Spec ref | Why first |
+|---|---|---|---|
+| **0.1** | **B1+B2** TP-line render bug + T+/T- propagation fix | §19.1 | Live UX pain. Small, contained, validates the v6 codebase ships clean before bigger surgery. |
+| **0.2** | Add **secondary Renko 64/16 series** via `AddRenko()` + brick-state tracker (data plumbing only, no behavior change). New diag columns: `BrickColor`, `BrickAgeSec`, `ThrustStreak`, `RenkoMode`. | §19.6.C | Both F1 and W6/F3 need it. Build the data pipe once, used by everything after. |
+
+#### 🧠 Phase 1 — The Brain (foundation, the most important phase)  *(target: v6 0.2.x)*
+
+| # | Feature | Spec ref | Why |
+|---|---|---|---|
+| **1.1** | **F1 Regime Classifier** — TREND_UP/DN, RANGE, TRANSITION, VOLATILE state machine reading Renko streaks + ATR + range bounds. New `Regime` diag column + `REGIME_CHANGE` action rows. | §18.8.C.F1 | Every other feature gates on this. |
+| **1.2** | **F7 htfBias decay on regime change** + persistent state across NT8 restarts. | §18.8.C.F7 | Directly fixes Apr 28 10:30 −$380 carryover-bias loss. Tiny add once F1 emits `REGIME_CHANGE`. |
+| **1.3** | **F8 Dashboard "Regime + Levels" strip** (top of dashboard, Regime + Brick streak + nearest-level placeholder). | §18.8.C.F8 | Makes F1 visible so user can validate the classifier in real time before letting it gate trades. |
+| **1.4** | **F4 Adaptive signal confidence per regime** (TREND ×0.75, RANGE ×1.10, VOLATILE ×1.30, TRANSITION ×2.0, default OFF for first 2 weeks of observation). | §18.8.C.F4 | This is where F1 starts *changing behavior*. Default OFF until classifier is trusted. |
+
+> ✅ **Phase 1 success bar:** Replay Apr 28; classifier correctly emits `TREND_DN` 00:00→08:34, `TRANSITION` 08:34→09:30, `RANGE` 09:45→12:50. With F4 ON, the 10:30 wrong-side SHORT entry would be blocked.
+
+#### ⚡ Phase 2 — Capture (turn the brain into money)  *(target: v6 0.3.x)*
+
+| # | Feature | Spec ref | Why now |
+|---|---|---|---|
+| **2.1** | **W6 NinjaRenko follow mode** (RNK OFF/ON/THRUST toggle, brick-edge trail, 3-brick thrust override). Default `RNK OFF`. | §19.6 | Single biggest profit lever. Foundation in place; let it fire entries. |
+| **2.2** | **F3 Renko Trend-Riding pyramid** (add 1 contract per 3-brick continuation, tier-tightening trail, auto-reload on continuation). Default OFF until W6 has 5 clean live thrusts. | §18.8.C.F3 | Stacks on W6 once thrust is proven. |
+
+> ✅ **Phase 2 success bar:** Replay Apr 28 with HRS OFF + RNK THRUST ON → must produce `THRUST_ENTRY` after 3rd green brick post-08:34, ride to ≥+50 pts, no AGGR_PULLBACK exit. With F3 also ON: ≥+$2,000 on the same move.
+
+#### 🛡️ Phase 3 — Defense (stop losing to MM)  *(target: v6 0.4.x)*
+
+| # | Feature | Spec ref |
+|---|---|---|
+| **3.1** | **F5 MM-Trap Detector** (3+ stop-outs at same level → block same-side; allow counter-side at half conf). Pure post-trade analytics, no order-routing changes. Cheapest defense win — Apr 27 already shows the pattern. | §18.8.C.F5 |
+| **3.2** | **F2 POC / VAH / VAL / ON-high/low aware range trading** + MM stop-run-failure reversal back to POC. Needs F1 RANGE detection to gate. | §18.8.C.F2 |
+| **3.3** | **F6 Range-break continuation** (Renko brick beyond range edge = entry, no extra signal needed). Natural extension of F2. | §18.8.C.F6 |
+| **3.4** | **W3 AGGR-L1/L2** + **W4 PACE indicator**. PACE is largely subsumed by F1; mostly UI calibration of aggression vs regime. | §19.4 |
+
+#### 🎯 Phase 4 — Polish & UX  *(target: v6 0.5.x)*
+
+| # | Feature | Spec ref |
+|---|---|---|
+| **4.1** | **W1 Drag SL/TP/Trail lines on chart** (DRAG ON/OFF toggle). | §19.2 |
+| **4.2** | **W2 Buy/Sell Limit ±N tick offset + TTL + dashed line**. | §19.3 |
+| **4.3** | **W5 Lead-signal entry** — now informed by 3+ months of v6 logs from earlier phases. | §19.5 |
+
+#### 🧬 Phase 5 — Memory & long-term edge  *(target: v6 0.6.x and beyond)*
+
+| # | Feature | Spec ref |
+|---|---|---|
+| **5.1** | **Pattern-Memory Engine** (90-day fingerprint heatmap → size scaling). | §18.3.A |
+| **5.2** | **MM Playbook Detector** (formalized version of F5). | §18.3.B |
+| **5.3** | **Per-hour self-tuning**. | §18.3.C |
+| **5.4** | **Kelly sizing**. | §18.3.D |
+| **5.5** | **Fib + Candle Reversal Scalp Module** (engulf, hammer, doji-with-tail at 38.2 / 50 / 61.8 levels). | §18.3.F |
+| **5.6** | **V-Fakeout Filter** (sharp move → 3-bar consolidation → reverse engulf detection). | §18.3.G |
+| **5.7** | **Stealth Mode** (hide bot-tell `Name` field, deferred from v5). | §18.3.E |
+| **5.8** | **Spread / Slippage Awareness**. | §18.3.H |
+
+### Ordering principles applied
+
+- **Foundation before features** — F1 must precede everything that reads regime.
+- **Quick UX win early** — TP bug in Phase 0 validates the v6 codebase ships clean.
+- **Highest-profit feature right after foundation** — W6 + F3 in Phase 2 (Apr 28 missed +$1,915 rally is too big to leave for last).
+- **Defensive features after capture** — losses bleed slower than missed wins explode opportunity cost.
+- **Memory/learning features last** — they need months of v6 log data to be useful.
+- **Existing v5 internals**: only refactor when a new feature *forces* it (e.g. trail engine in Phase 2 to add brick-edge mode). No "clean it up just because" — preserves stability.
+
+### Candle-pattern coverage
+
+Already documented across the spec, scheduled in Phase 5:
+- **§18.3.F** — Fib + Candle Reversal Scalp Module (engulf, hammer, doji-with-tail at fib levels) → Phase 5.5
+- **§18.3.G** — V-Fakeout Filter (sharp move → consolidation → reverse engulf) → Phase 5.6
+- **§19.6.B Rule 6** — Doji-brick thrust pause (already part of W6 Renko mode) → ships in Phase 2.1
+
+### Detailed feature specifications (referenced by phases above)
+
+> The §19.1 – §19.8 subsections below contain the full per-feature specs originally written as a flat 6-item list. The phase plan above tells you **when** each gets built; these subsections tell you **how**.
 
 ### 19.1 Item 1 — TP line render bug (v6 14.21)
 
@@ -1327,12 +1393,94 @@ These were considered for v5 but bumped to v6 per user decision:
 
 ### 19.8 Working agreement
 
-- One item per session, committed individually with message `v6 14.<NN>: <description>`.
+- One item per session, committed individually with message `v6 0.<phase>.<patch>: <description>`.
 - Each item ships behind a toggle (where applicable), default OFF unless user explicitly opts to default ON.
 - Compile check (`get_errors`) before every commit.
 - After commit, user reloads strategy in NT8 (F5) and tests. We move on only after user confirms.
 - Diag log for each new feature: at least one `ACTION` row per state change, with enough Detail to post-mortem.
 - Spec doc updated at the end of each implementation session.
+
+### 19.9 v6 Changelog
+
+| Version | Date | Scope | Notes |
+|---|---|---|---|
+| v6 0.0.0 | 2026-04-28 | Fork from v5 14.20 | Class/identifier rename to `Mm_ATM_v6`; v5 frozen for live trading |
+| v6 0.1.1 | 2026-04-28 | Phase 0 — diag log MM-analysis enhancement (no behavior change) | +15 columns (54 total). See §19.10 |
+
+### 19.10 Diag log MM-analysis schema (v6 0.1.1)
+
+> **Goal:** capture every parameter needed to reverse-engineer MM behavior, validate future v6 features against historical sessions, and feed pattern-memory + MM-trap detection without recompiling. Default ON. File: `~/Documents/NinjaTrader 8/MmATM_v6_DiagLog_YYYYMMDD.csv`.
+
+#### Full column list (54)
+
+**Block 1 — Bar / indicator state (16 cols)** *[unchanged from v14.20]*
+
+`DateTime, Bar, Close, VWAP, EmaF, EmaS, RSI, ATR, ADX, RawBull, RawBear, Bull, Bear, Tape, htfBias, trapScore`
+
+**Block 2 — Position / risk state (11 cols)** *[unchanged]*
+
+`Pos, Qty, AvgEntry, HiddenSL, HiddenTP, TrailPx, TrailTier, ManualOff, ConsecLoss, ConsecWin, DailyPnL`
+
+**Block 3 — Configuration & decision context (10 cols)** *[unchanged from v14.20]*
+
+`Mode, AutoStrat, Toggles, Signal, MinConf, DistVwapAtr, VoidBars, OpenType, ProfitPts, PeakPts`
+
+**Block 4 — MM-analysis NEW (15 cols, v6 0.1.1)**
+
+| Column | Source | Why for MM analysis |
+|---|---|---|
+| `Bid` | `GetCurrentBid(0)` (live only, 0 in replay) | Tick-level bid for spread + slippage post-mortem |
+| `Ask` | `GetCurrentAsk(0)` (live only, 0 in replay) | Tick-level ask |
+| `SpreadTk` | `(Ask−Bid)/TickSize` rounded | **MM tell #1** — MM widens spread to fade retail; spread spikes correlate with stop-runs and ladder-pulls |
+| `TapeBuyVol` | `tapeAskVol` (rolling 30s) | Aggressor BUY volume — separated from delta so we can see *who* is hitting the offer |
+| `TapeSellVol` | `tapeBidVol` (rolling 30s) | Aggressor SELL volume |
+| `EmaStack` | `+1` if `Close > EmaF > EmaS`, `−1` inverse, `0` mixed | Fast trend proxy used by F4 until F1 Regime ships; matches the "EMA-stack" gate already in entry filters |
+| `AdxSlope` | `ADX[0] − ADX[5]` | Trend acceleration (rising = trend strengthening). Captures the "ADX 9→18 chop" signature flagged in v5 §16 |
+| `DistPocPts` | `(Close − pocLevel) / pt`, signed (+ above) | Distance to developing-day POC. Seeds **F2 POC/VA aware range trading** |
+| `DistVahPts` | `(Close − vahLevel) / pt` | Distance to Value Area High |
+| `DistValPts` | `(Close − valLevel) / pt` | Distance to Value Area Low |
+| `DistPdHiPts` | `(Close − prevDayHigh) / pt` | Distance to prior-day high — **the level MM defends most**; prior-day-clamp logic uses this |
+| `DistPdLoPts` | `(Close − prevDayLow) / pt` | Distance to prior-day low |
+| `BrickColor` | `"G" / "R" / ""` | Renko 64/16 brick color. Empty until **W6 Phase 0.2** plumbing wires the secondary series |
+| `BrickStreak` | int | Consecutive same-color brick count. Empty/0 until W6 Phase 0.2 |
+| `Regime` | `"" / "TREND_UP" / "TREND_DN" / "RANGE" / "TRANSITION" / "VOLATILE"` | F1 Regime classifier output. Empty until **F1 Phase 1.1** |
+
+**Block 5 — Event (2 cols)** *[unchanged]*
+
+`Action, Detail`
+
+#### Action verbs already in use (§14, §16, §17 evidence) — preserved unchanged
+
+`SIGNAL · ENTRY_LONG · ENTRY_SHORT · EXIT_WIN_TP · EXIT_WIN_BE · EXIT_WIN_TRAIL_<tier> · EXIT_WIN_CLOSE · EXIT_LOSS_SL · EXIT_LOSS_TRAIL · EXIT_AGGR_PULLBACK · EXIT_REVERSAL · EXIT_TIMESTOP · EXIT_VOID · EXIT_MANUAL · BLOCK_<reason> · TOGGLE_<feature> · MODE_CHANGE · HEARTBEAT · TP_NUDGE · SL_NUDGE`
+
+#### Action verbs queued for new phases
+
+| Phase | New verb | When fired |
+|---|---|---|
+| 0.2 | `BRICK_CLOSE` | New Renko brick prints. Detail: `color=G hi=27091.25 lo=27087.25 streak=3` |
+| 1.1 | `REGIME_CHANGE` | F1 classifier flips state. Detail: `from=TREND_DN to=TRANSITION reason=brick_alt_3` |
+| 2.1 | `THRUST_ENTRY · THRUST_TRAIL_RATCHET · THRUST_STALL · BRICK_REENTRY · STUCK_SCALP_PLACE · STUCK_SCALP_FILL · STUCK_SCALP_KILL` | W6 Renko mode events |
+| 3.1 | `MM_TRAP_DETECTED · MM_TRAP_COUNTER_ENTRY` | F5 MM-Trap detector |
+| 3.2 | `LEVEL_TOUCH · POC_LEVELS` | F2 POC/VA range trader |
+
+#### Post-mortem queries unlocked by the new schema
+
+| Question | Filter expression |
+|---|---|
+| "Did MM widen spread before stopping us out?" | `SpreadTk > median(SpreadTk last 5min) * 2` in 60s before any `EXIT_LOSS_*` |
+| "Were we trading INTO a major level when we lost?" | `Action="EXIT_LOSS_SL" AND ABS(DistPdHiPts) < 5` (or PdLo / Poc / Vah / Val) |
+| "Did htfBias carry over from prior trend at loss time?" | (use new `Regime` once F1 ships) `Action="EXIT_LOSS_*" AND Regime="RANGE" AND htfBias != 0` |
+| "Are we entering on the right side of EMA stack?" | `Action="ENTRY_LONG" AND EmaStack < 1` → suspect filter weakness |
+| "When does ADX rise predict our wins?" | `AdxSlope > 3 AND Action LIKE "EXIT_WIN_*"` vs `AdxSlope < -3 AND Action LIKE "EXIT_WIN_*"` correlation |
+| "How often did POC act as MM defense (rejection)?" | Count price excursions: `cross(Close, pocLevel)` followed by re-cross within 3 bars |
+| "Daily volume-imbalance regime?" | `SUM(TapeBuyVol)/SUM(TapeBuyVol+TapeSellVol)` per hour |
+
+#### Notes for downstream tooling
+
+- All numeric distances are in **NQ points** (1 pt = 4 ticks = $20).
+- Live-only fields (`Bid`, `Ask`, `SpreadTk`, `TapeBuyVol`, `TapeSellVol`) are 0 in Strategy Analyzer / historical replay — do not interpret as "tight spread / no flow"; check `Mode != "BACKTEST"` if added later.
+- The 39→54 column expansion is **append-only** at the end-of-row (before `Action,Detail`), so any existing CSV-importer that reads by column name still works; importers that read by index need the new schema.
+- Header is rewritten only when log file is rotated daily; if you change column count mid-session you must delete the day's CSV and let the strategy re-create it.
 
 ---
 

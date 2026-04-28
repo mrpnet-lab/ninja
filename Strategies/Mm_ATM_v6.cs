@@ -4106,12 +4106,31 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (diagWriter == null || diagHeaderWritten) return;
             // v14.20: extended header (39 columns) for deeper post-mortem analysis.
-            // New columns: Mode, AutoStrat, Toggles, Signal, MinConf, DistVwapAtr, VoidBars,
-            //              OpenType, ProfitPts, PeakPts.
+            //   Added: Mode, AutoStrat, Toggles, Signal, MinConf, DistVwapAtr, VoidBars,
+            //          OpenType, ProfitPts, PeakPts.
+            // v6 0.1.1 (Apr 28, 2026): MM-analysis columns added (now 54 cols total).
+            //   Added: Bid, Ask, SpreadTk, TapeBuyVol, TapeSellVol, EmaStack, AdxSlope,
+            //          DistPocPts, DistVahPts, DistValPts, DistPdHiPts, DistPdLoPts,
+            //          BrickColor, BrickStreak, Regime.
+            //   Why each:
+            //     Bid/Ask/SpreadTk     - MM widens spread to fade retail; rolling spread spikes
+            //                            correlate with stop-runs.
+            //     TapeBuy/SellVol      - separated buy vs sell aggressor volume (cachedTapeDelta
+            //                            collapses both into one number; raw helps post-mortem).
+            //     EmaStack             - +1/0/-1 fast trend proxy (used until F1 Regime is built).
+            //     AdxSlope             - ADX[0]-ADX[5], rising trend strength = +.
+            //     DistPoc/Vah/Val      - distance to volume-profile pivots (positive = above level)
+            //                            seeds the F2 POC/VA-aware range trader.
+            //     DistPdHi/PdLo        - distance to prior-day H/L (the levels MM defends most).
+            //     BrickColor/Streak    - Renko 64/16 brick state (filled by W6/Phase 0.2 plumbing).
+            //     Regime               - F1 classifier output (filled in Phase 1).
             diagWriter.WriteLine(
                 "DateTime,Bar,Close,VWAP,EmaF,EmaS,RSI,ATR,ADX,RawBull,RawBear,Bull,Bear,Tape,htfBias,trapScore,"
                 + "Pos,Qty,AvgEntry,HiddenSL,HiddenTP,TrailPx,TrailTier,ManualOff,ConsecLoss,ConsecWin,DailyPnL,"
                 + "Mode,AutoStrat,Toggles,Signal,MinConf,DistVwapAtr,VoidBars,OpenType,ProfitPts,PeakPts,"
+                + "Bid,Ask,SpreadTk,TapeBuyVol,TapeSellVol,EmaStack,AdxSlope,"
+                + "DistPocPts,DistVahPts,DistValPts,DistPdHiPts,DistPdLoPts,"
+                + "BrickColor,BrickStreak,Regime,"
                 + "Action,Detail");
             diagHeaderWritten = true;
         }
@@ -4171,11 +4190,55 @@ namespace NinjaTrader.NinjaScript.Strategies
                         : (averageEntryPrice - Close[0]) / TickSize / NQ_TICKS_PER_POINT;
                 }
 
+                // ---- v6 0.1.1 MM-analysis derived metrics ----
+                double tickPtMm = NQ_TICKS_PER_POINT * TickSize;
+                // Bid/Ask + spread (live only; historical replay returns 0)
+                double bidPx = 0, askPx = 0; int spreadTk = 0;
+                if (State == State.Realtime)
+                {
+                    try
+                    {
+                        bidPx = GetCurrentBid(0);
+                        askPx = GetCurrentAsk(0);
+                        if (bidPx > 0 && askPx > 0 && askPx > bidPx)
+                            spreadTk = (int)Math.Round((askPx - bidPx) / TickSize);
+                    }
+                    catch { }
+                }
+                // EMA stack: +1 = Close > EmaF > EmaS (bull stack), -1 = inverse, 0 = mixed
+                int emaStack = 0;
+                if (ef > 0 && es > 0)
+                {
+                    if (Close[0] > ef && ef > es) emaStack = 1;
+                    else if (Close[0] < ef && ef < es) emaStack = -1;
+                }
+                // ADX slope (rising trend strength = positive). 5-bar look-back.
+                double adxSlope = 0;
+                if (indAdx != null && CurrentBar > 20)
+                {
+                    try { adxSlope = ax - indAdx[5]; } catch { adxSlope = 0; }
+                }
+                // Volume-profile distances (signed: + = price ABOVE level)
+                double distPocPts = pocLevel > 0 ? (Close[0] - pocLevel) / tickPtMm : 0;
+                double distVahPts = vahLevel > 0 ? (Close[0] - vahLevel) / tickPtMm : 0;
+                double distValPts = valLevel > 0 ? (Close[0] - valLevel) / tickPtMm : 0;
+                // Prior-day H/L distances — the levels MM defends most
+                double distPdHiPts = prevDayHigh > 0 ? (Close[0] - prevDayHigh) / tickPtMm : 0;
+                double distPdLoPts = prevDayLow  > 0 ? (Close[0] - prevDayLow)  / tickPtMm : 0;
+                // Renko placeholders — filled by W6 Phase 0.2 plumbing
+                string brickColor = "";   // "G" / "R" / "" (no Renko series yet)
+                int brickStreak = 0;
+                // Regime placeholder — filled by F1 in Phase 1
+                string regime = "";
+
                 diagWriter.WriteLine(string.Format(
                     "{0},{1},{2:F2},{3:F2},{4:F2},{5:F2},{6:F2},{7:F2},{8:F1},{9:F1},{10:F1},{11:F1},{12:F1},{13:F2},{14},{15:F1},"
                     + "{16},{17},{18:F2},{19:F2},{20:F2},{21:F2},{22},{23:F1},{24},{25},{26:F2},"
                     + "{27},{28},{29},{30},{31:F1},{32:F2},{33},{34},{35:F2},{36:F2},"
-                    + "{37},{38}",
+                    + "{37:F2},{38:F2},{39},{40:F0},{41:F0},{42},{43:F1},"
+                    + "{44:F2},{45:F2},{46:F2},{47:F2},{48:F2},"
+                    + "{49},{50},{51},"
+                    + "{52},{53}",
                     Time[0].ToString("yyyy-MM-dd HH:mm:ss"), CurrentBar, Close[0], vwapValue,
                     ef, es, rs, at, ax, rawBullConfidence, rawBearConfidence,
                     lastBullConfidence, lastBearConfidence, cachedTapeDelta, htfBias, trapScore,
@@ -4184,6 +4247,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                     dailyRealizedPnL,
                     mode, stratUsed.Replace(",", ";"), toggles, sigLabel, effMin, distVwapAtr,
                     voidBarsRemaining, openTypeOut, profitPts, peakPts,
+                    bidPx, askPx, spreadTk, tapeAskVol, tapeBidVol, emaStack, adxSlope,
+                    distPocPts, distVahPts, distValPts, distPdHiPts, distPdLoPts,
+                    brickColor, brickStreak, regime,
                     action, (detail ?? "").Replace(",", ";")));
             }
             catch (Exception ex) { Print(TAG + "DiagLog write EX: " + ex.Message); }
