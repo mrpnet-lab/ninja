@@ -142,6 +142,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         // Each new same-direction brick ratchets the trail one brick at a time. First opposite-color
         // brick that prints will pierce the trail instantly = clean exit on actual reversal signal.
         private bool   enableBrickTrail;            // master toggle, default OFF
+        // v6 2.7.3 - When ON (default), BrickMode (and brick-flip exit + in-bar trail) only apply to
+        // AUTO-opened trades. Manual trades keep the legacy ATR/tier trail visualization the user
+        // expects. Set OFF to apply BrickMode universally (e.g. backtesting brick exits on manual fills).
+        private bool   brickModeAutoOnly = true;
         private int    brickTrailMinStreak = 4;     // require >= N same-color bricks before brick-trail engages
         private double brickTrailBufferTicks = 4;   // ticks above prev-brick-high (SHORT) / below low (LONG)
         private bool   brickTrailRequireTrendRegime = true; // require regime=TREND_DN (SHORT) / TREND_UP (LONG)
@@ -477,6 +481,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         // ===========================================================
         #region Trail state
         private bool   trailActive;
+        // v6 2.7.3 - Tracks whether the currently open position was opened by manual click vs auto.
+        // Used to gate BrickMode (default: auto-only) so manual trades keep the legacy ATR trail
+        // display the user is accustomed to. Reset in ResetPositionState.
+        private bool   lastEntryWasManual;
         private bool   manualTrailEarlyStart;  // TRL NOW set this -> activation profit threshold bypassed
         private double manualTrailOffsetPoints; // signed offset added to auto trail distance (− = tighter, + = looser)
         private double trailPrice;
@@ -815,6 +823,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     lastAdxSlope               = 0;
                     // v6 2.3 — Brick-Trail Mode defaults (ACTIVE LOGIC, OFF by default).
                     enableBrickTrail              = false;
+                    brickModeAutoOnly             = true;
                     brickTrailMinStreak           = 4;
                     brickTrailBufferTicks         = 4;
                     brickTrailRequireTrendRegime  = true;
@@ -1479,8 +1488,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             // firing at +5pt while brick-trail was waiting for streak=4).
             bool brickAgreesPos = (openTradeDirection == -1 && lastNrBrickColor == "R")
                                || (openTradeDirection ==  1 && lastNrBrickColor == "G");
+            // v6 2.7.3 - BrickMode now respects auto-only toggle. Manual entries fall through to the
+            // legacy ATR/tier trail so the user gets the trail visualization they're used to.
             bool brickModeActive = enableBrickTrail && openTradeDirection != 0
-                                && brickAgreesPos && nrBrickStreakCount >= 2;
+                                && brickAgreesPos && nrBrickStreakCount >= 2
+                                && !(brickModeAutoOnly && lastEntryWasManual);
             // Allow execution when master toggle is off ONLY if user explicitly armed via TRL NOW
             // (manualTrailEarlyStart) or trail was already active before toggle was flipped.
             if (averageEntryPrice <= 0) return;
@@ -1511,7 +1523,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             // Trigger 1: confirmed brick flip (set by ProcessPrimaryAsNinzaRenkoBar on opposite-color close).
             // v6 2.7.1 - fires whenever EnableBrickTrail is ON (not just after tier engagement) so
             // brick-flip works even on early entries (streak 2-3) before the trail tier matures.
-            if (pendingBrickFlipExit && enableBrickTrail)
+            // v6 2.7.3 - skip when manual + BrickModeAutoOnly (legacy ATR trail handles manual exits).
+            bool brickAutoGate = !(brickModeAutoOnly && lastEntryWasManual);
+            if (pendingBrickFlipExit && enableBrickTrail && brickAutoGate)
             {
                 pendingBrickFlipExit = false;
                 lastExitReason = "TRAIL_BrickTrail_Flip";
@@ -1555,7 +1569,24 @@ namespace NinjaTrader.NinjaScript.Strategies
             // can't override the brick exits. Brick-flip + in-bar are the only exit triggers.
             if (brickModeActive)
             {
-                // Mark info-only tier so dashboard reflects we're in brick-mode (no price-stop fires)
+                // v6 2.7.3 - VISIBILITY FIX: compute and ratchet a trailPrice from the streak body
+                // anchors so the dashboard / diag log show a meaningful trail (was 0.00 before).
+                // This is INFORMATIONAL ONLY - actual exits are still brick-flip + in-bar trail.
+                if (streakMinBodyHigh < double.MaxValue && streakMaxBodyLow > double.MinValue)
+                {
+                    double bufPt = brickTrailBufferTicks * TickSize;
+                    double anchorPx = openTradeDirection == -1 ? streakMinBodyHigh : streakMaxBodyLow;
+                    double btPrice = openTradeDirection == -1
+                        ? Math.Round((anchorPx + bufPt) / TickSize) * TickSize
+                        : Math.Round((anchorPx - bufPt) / TickSize) * TickSize;
+                    bool first = !trailActive || trailPrice <= 0;
+                    if (first
+                        || (openTradeDirection == -1 && btPrice < trailPrice)
+                        || (openTradeDirection ==  1 && btPrice > trailPrice))
+                    {
+                        trailPrice = btPrice;
+                    }
+                }
                 if (trailTierName != "BrickTrail") trailTierName = "BrickMode";
                 trailActive = true; // suppress re-activation path below
                 return;
@@ -2575,6 +2606,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             EnterLong(contracts, " ");
             activeEntrySignals.Add(" ");
             openTradeDirection = 1;
+            lastEntryWasManual = isManual;
             lastEntryWallTime  = State == State.Realtime ? DateTime.Now : Time[0];
             enteredThisBar = true;
             // qty + avg recomputed in OnOrderUpdate.Filled (do NOT pre-increment)
@@ -2610,6 +2642,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             EnterShort(contracts, " ");
             activeEntrySignals.Add(" ");
             openTradeDirection = -1;
+            lastEntryWasManual = isManual;
             lastEntryWallTime  = State == State.Realtime ? DateTime.Now : Time[0];
             enteredThisBar = true;
             Print(TAG + "ENTER SHORT #" + openDcaCount + " qty=" + contracts);
@@ -3185,6 +3218,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             aggressiveLimitSubmitTime = DateTime.MinValue;
             activeEntrySignals.Clear();
             trailPrice = 0; trailActive = false; trailMaxProfitPts = 0; trailTierName = "";
+            lastEntryWasManual = false;
             // v6 2.6 — clear brick-trail per-trade state on flat (anchor stays per-streak).
             pendingBrickFlipExit = false;
             lastSameColorBrickTime = DateTime.MinValue;
@@ -5912,6 +5946,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "Enable Brick-Trail Mode", Order = 30, GroupName = "10 - Regime",
             Description = "PHASE 2.3 — ACTIVE LOGIC. Default OFF. When ON and ALL of (1) brick color agrees with trade dir, (2) brick streak >= BrickTrailMinStreak, (3) regime is TREND matching dir (if BrickTrailRequireTrendRegime=ON), (4) trade is in profit beyond activation — the trail is anchored to the previous CLOSED brick's far extreme + buffer ticks. Each new same-direction brick ratchets the trail one brick. First opposite-color brick pierces the trail = clean exit on actual reversal (not a wick). VALIDATED on 2026-04-28 WIN#2: legacy trail exited at +$400 (brick #15) but run continued to brick #30 with maxFav=132pt = ~$2640 missed. Brick-trail would have ridden the full move. REQUIRES EnableRegimeClassifier=ON. Watch for BRICK_TRAIL_ARMED + BRICK_TRAIL_HIT diag rows. DO NOT enable in chop — it gives back more on reversals.")]
         public bool EnableBrickTrail { get { return enableBrickTrail; } set { enableBrickTrail = value; } }
+
+        [NinjaScriptProperty]
+        [Display(Name = "  BrickMode Auto-Only", Order = 30, GroupName = "10 - Regime",
+            Description = "PHASE 2.7.3 — When ON (default), brick-mode logic (BrickMode trail tier, brick-flip exit, in-bar trail) only applies to AUTO-opened trades. MANUAL trades (BUY MKT, SELL MKT, etc.) keep the legacy ATR/tier trail visualization with displayed trail price. Set OFF to apply brick-mode universally.")]
+        public bool BrickModeAutoOnly { get { return brickModeAutoOnly; } set { brickModeAutoOnly = value; } }
 
         [NinjaScriptProperty, Range(2, 20)]
         [Display(Name = "  Brick-Trail Min Streak", Order = 31, GroupName = "10 - Regime",
