@@ -155,6 +155,19 @@ namespace NinjaTrader.NinjaScript.Strategies
         // in-bar giveback fires at 8pt retrace from peak. Lower (30) = tighter (more scratches on
         // wicks). Higher (75) = wider (more giveback before exit). 100 = full-brick (legacy 16pt).
         private double brickTrailTightnessPct = 50.0;
+        // v6 2.7.6 - When ON (default), BrickMode also enforces price-stop exit when price crosses
+        // the displayed trail price (only after peak >= MinPeak). Without this the trail is shown
+        // but never enforced - only brick-flip and in-bar exits fire.
+        private bool   brickTrailPriceStopEnabled = true;
+        // v6 2.7.6 - Min peak profit (pts) before BrickMode price-stop is allowed to fire. Acts as
+        // a TRAP filter: small peaks are likely noise / not real moves. Default 8pt (half-brick).
+        private double brickTrailPriceStopMinPeakPts = 8.0;
+        // v6 2.7.6 - When price reaches within ExtremeNearPct of brick high (LONG) / low (SHORT),
+        // tighten the trail to ExtremeTightnessPct of brick (vs normal Tightness%). Default: when
+        // price within 25% of brick top, trail tightens to 25% of brick (4pt vs 8pt). Encourages
+        // locking profit at exhaustion / brick-extreme rejections.
+        private double brickTrailExtremeNearPct       = 25.0;
+        private double brickTrailExtremeTightnessPct  = 25.0;
         private int    brickTrailMinStreak = 4;     // require >= N same-color bricks before brick-trail engages
         private double brickTrailBufferTicks = 4;   // ticks above prev-brick-high (SHORT) / below low (LONG)
         private bool   brickTrailRequireTrendRegime = true; // require regime=TREND_DN (SHORT) / TREND_UP (LONG)
@@ -840,6 +853,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                     brickModeAutoOnly             = true;
                     trlNowOverridesBrick          = true;
                     brickTrailTightnessPct        = 50.0;
+                    brickTrailPriceStopEnabled    = true;
+                    brickTrailPriceStopMinPeakPts = 8.0;
+                    brickTrailExtremeNearPct      = 25.0;
+                    brickTrailExtremeTightnessPct = 25.0;
                     brickTrailMinStreak           = 4;
                     brickTrailBufferTicks         = 4;
                     brickTrailRequireTrendRegime  = true;
@@ -1601,6 +1618,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // brick from current close). Brick body anchor protects against wick stop-runs;
                 // half-brick anchor locks profit when price runs many bricks ahead of last body.
                 // Result: trail rides ~8pt behind price (with 64-tk bricks) instead of 30+pt.
+                // v6 2.7.6 - EXTREME TIGHTENING: when price near brick top (LONG) / bottom (SHORT),
+                // tighten further to ExtremeTightnessPct (default 25% = 4pt). Encourages locking
+                // profit at exhaustion / wick rejection at brick extreme.
                 if (streakMinBodyHigh < double.MaxValue && streakMaxBodyLow > double.MinValue)
                 {
                     double bufPt = brickTrailBufferTicks * TickSize;
@@ -1608,10 +1628,22 @@ namespace NinjaTrader.NinjaScript.Strategies
                     double bodyTrail = openTradeDirection == -1
                         ? Math.Round((anchorPx + bufPt) / TickSize) * TickSize
                         : Math.Round((anchorPx - bufPt) / TickSize) * TickSize;
-                    // Half-brick (or tightnessPct of brick) candidate from CURRENT close.
                     double brickPts2 = renkoBrickSize > 0 ? renkoBrickSize / (double)NQ_TICKS_PER_POINT : 0;
-                    double tightOff = (brickPts2 > 0 && brickTrailTightnessPct > 0)
-                        ? brickPts2 * brickTrailTightnessPct / 100.0
+                    // Determine if price is NEAR the brick extreme (top for LONG, bottom for SHORT).
+                    bool nearExtreme = false;
+                    if (brickPts2 > 0 && lastNrBrickHigh > 0 && lastNrBrickLow > 0
+                        && brickTrailExtremeNearPct > 0)
+                    {
+                        double brkRange = Math.Max(brickPts2, (lastNrBrickHigh - lastNrBrickLow) / (TickSize * NQ_TICKS_PER_POINT));
+                        double nearBand = brkRange * brickTrailExtremeNearPct / 100.0;
+                        if (openTradeDirection == 1)
+                            nearExtreme = (lastNrBrickHigh - price) / (TickSize * NQ_TICKS_PER_POINT) <= nearBand;
+                        else
+                            nearExtreme = (price - lastNrBrickLow) / (TickSize * NQ_TICKS_PER_POINT) <= nearBand;
+                    }
+                    double effPct = nearExtreme ? brickTrailExtremeTightnessPct : brickTrailTightnessPct;
+                    double tightOff = (brickPts2 > 0 && effPct > 0)
+                        ? brickPts2 * effPct / 100.0
                         : 0;
                     double tightTrail = bodyTrail; // fallback if disabled
                     if (tightOff > 0)
@@ -1621,7 +1653,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                             ? Math.Round((price - tightOff * tickPt2) / TickSize) * TickSize
                             : Math.Round((price + tightOff * tickPt2) / TickSize) * TickSize;
                     }
-                    // Pick the TIGHTER (closer to price) of body vs tight.
                     double btPrice = openTradeDirection == 1
                         ? Math.Max(bodyTrail, tightTrail)
                         : Math.Min(bodyTrail, tightTrail);
@@ -1631,6 +1662,27 @@ namespace NinjaTrader.NinjaScript.Strategies
                         || (openTradeDirection ==  1 && btPrice > trailPrice))
                     {
                         trailPrice = btPrice;
+                    }
+                    // v6 2.7.6 - PRICE-STOP EXIT: enforce the displayed trail. Trap suppression via
+                    // MinPeakPts gate (default 8pt = half-brick) - tiny peaks don't fire (likely noise).
+                    if (brickTrailPriceStopEnabled
+                        && trailPrice > 0
+                        && trailMaxProfitPts >= brickTrailPriceStopMinPeakPts
+                        && ((openTradeDirection ==  1 && price <= trailPrice)
+                         || (openTradeDirection == -1 && price >= trailPrice)))
+                    {
+                        lastExitReason = "TRAIL_BrickTrail_PxStop";
+                        if (enableDiagLog)
+                            WriteDiagRow("BRICK_TRAIL_HIT",
+                                "reason=px_stop" + (nearExtreme ? "_extreme" : "")
+                                + " peak=" + trailMaxProfitPts.ToString("F1")
+                                + "pt cur=" + profitPts.ToString("F1")
+                                + "pt trail=" + trailPrice.ToString("F2")
+                                + " px=" + price.ToString("F2")
+                                + " effPct=" + effPct.ToString("F0"));
+                        if (openTradeDirection == 1) ExitLong(); else if (openTradeDirection == -1) ExitShort();
+                        pendingExit = true;
+                        return;
                     }
                 }
                 if (trailTierName != "BrickTrail") trailTierName = "BrickMode";
@@ -6010,6 +6062,26 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "  BrickTrail Tightness %", Order = 30, GroupName = "10 - Regime",
             Description = "PHASE 2.7.5 — % of brick size used for BrickMode trail distance and in-bar giveback. Default 50 = HALF-BRICK. With 64-tick (16pt) bricks: trail rides 8pt behind close, in-bar exit fires at 8pt retrace from peak (was fixed 16pt = full brick). Lower (30) = tighter, more wick scratches. Higher (75) = wider, more giveback. 100 = full-brick (legacy). Trail picks the TIGHTER of body-anchor vs half-brick-from-close so wick immunity is preserved.")]
         public double BrickTrailTightnessPct { get { return brickTrailTightnessPct; } set { brickTrailTightnessPct = value; } }
+
+        [NinjaScriptProperty]
+        [Display(Name = "  BrickTrail PriceStop Enabled", Order = 30, GroupName = "10 - Regime",
+            Description = "PHASE 2.7.6 — When ON (default), BrickMode also enforces price-stop exit when price crosses the displayed trail price (gated by MinPeak). Without this the trail is informational only — exits fire only on brick-flip / in-bar / giveback. Set OFF to revert to display-only trail.")]
+        public bool BrickTrailPriceStopEnabled { get { return brickTrailPriceStopEnabled; } set { brickTrailPriceStopEnabled = value; } }
+
+        [NinjaScriptProperty, Range(2.0, 30.0)]
+        [Display(Name = "  BrickTrail PriceStop MinPeak (pts)", Order = 30, GroupName = "10 - Regime",
+            Description = "PHASE 2.7.6 — TRAP filter. BrickMode price-stop exit only fires after peak profit reaches this many points. Default 8 (half-brick). Lower (4) = even tiny moves get protected (more scratches). Higher (15) = only protects after meaningful runs. Prevents insta-exit on noise / spread / first-tick fills.")]
+        public double BrickTrailPriceStopMinPeakPts { get { return brickTrailPriceStopMinPeakPts; } set { brickTrailPriceStopMinPeakPts = value; } }
+
+        [NinjaScriptProperty, Range(0.0, 50.0)]
+        [Display(Name = "  BrickTrail Extreme NearPct", Order = 30, GroupName = "10 - Regime",
+            Description = "PHASE 2.7.6 — When LONG and price within this % of brick HIGH (or SHORT and within this % of brick LOW), trail tightens to ExtremeTightnessPct instead of normal Tightness%. Default 25 = tightens when price within top/bottom 25% of brick range. 0 = disabled (no extreme tightening).")]
+        public double BrickTrailExtremeNearPct { get { return brickTrailExtremeNearPct; } set { brickTrailExtremeNearPct = value; } }
+
+        [NinjaScriptProperty, Range(10.0, 75.0)]
+        [Display(Name = "  BrickTrail Extreme Tightness %", Order = 30, GroupName = "10 - Regime",
+            Description = "PHASE 2.7.6 — Tightness % to use when price is near brick extreme (see ExtremeNearPct). Default 25 = quarter-brick (4pt with 64-tk bricks) vs normal 50 (8pt). Encourages locking profit at exhaustion / wick-rejection points. Trail still ratchets inward only.")]
+        public double BrickTrailExtremeTightnessPct { get { return brickTrailExtremeTightnessPct; } set { brickTrailExtremeTightnessPct = value; } }
 
         [NinjaScriptProperty, Range(2, 20)]
         [Display(Name = "  Brick-Trail Min Streak", Order = 31, GroupName = "10 - Regime",
