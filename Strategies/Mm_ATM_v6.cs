@@ -1698,7 +1698,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                         return;
                     }
                 }
-                if (trailTierName != "BrickTrail") trailTierName = "BrickMode";
+                // v6 2.7.8 - DORMANT indicator: when price-stop is gated (peak < MinPeak or
+                // retrace < MinRetrace), tag the tier name so the dashboard / log makes it
+                // visually obvious the displayed trail won't fire yet (hard SL is the active
+                // safety net). Cleared automatically once both gates open.
+                bool dormant = brickTrailPriceStopEnabled
+                    && (trailMaxProfitPts < brickTrailPriceStopMinPeakPts
+                     || (trailMaxProfitPts - profitPts) < brickTrailPriceStopMinRetracePts);
+                if (trailTierName != "BrickTrail")
+                    trailTierName = dormant ? "BrickMode*DORMANT" : "BrickMode";
                 trailActive = true; // suppress re-activation path below
                 return;
             }
