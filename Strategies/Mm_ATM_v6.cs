@@ -168,6 +168,12 @@ namespace NinjaTrader.NinjaScript.Strategies
         // locking profit at exhaustion / brick-extreme rejections.
         private double brickTrailExtremeNearPct       = 25.0;
         private double brickTrailExtremeTightnessPct  = 25.0;
+        // v6 2.7.7 - Min retrace from peak (pts) required for price-stop exit to fire. Filters
+        // mid-brick wiggle / wick noise crossing tight body anchors. Default 5pt. Without this,
+        // a 1-2pt cross of the body anchor (which can sit only ~4pt below peak during fast runs)
+        // exits prematurely on noise. Set lower (3) for very tight scalp mode, higher (8) to let
+        // the trail breathe.
+        private double brickTrailPriceStopMinRetracePts = 5.0;
         private int    brickTrailMinStreak = 4;     // require >= N same-color bricks before brick-trail engages
         private double brickTrailBufferTicks = 4;   // ticks above prev-brick-high (SHORT) / below low (LONG)
         private bool   brickTrailRequireTrendRegime = true; // require regime=TREND_DN (SHORT) / TREND_UP (LONG)
@@ -857,6 +863,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     brickTrailPriceStopMinPeakPts = 8.0;
                     brickTrailExtremeNearPct      = 25.0;
                     brickTrailExtremeTightnessPct = 25.0;
+                    brickTrailPriceStopMinRetracePts = 5.0;
                     brickTrailMinStreak           = 4;
                     brickTrailBufferTicks         = 4;
                     brickTrailRequireTrendRegime  = true;
@@ -1665,9 +1672,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                     }
                     // v6 2.7.6 - PRICE-STOP EXIT: enforce the displayed trail. Trap suppression via
                     // MinPeakPts gate (default 8pt = half-brick) - tiny peaks don't fire (likely noise).
+                    // v6 2.7.7 - MIN-RETRACE gate: also require peak-cur >= MinRetracePts. Without this,
+                    // body anchor (which often sits ~4pt below peak inside a fast run) exits on a 1-2pt
+                    // mid-brick wiggle. Default 5pt = at least one-tick-of-noise + 4pt real retrace.
+                    double retraceFromPeak = trailMaxProfitPts - profitPts;
                     if (brickTrailPriceStopEnabled
                         && trailPrice > 0
                         && trailMaxProfitPts >= brickTrailPriceStopMinPeakPts
+                        && retraceFromPeak >= brickTrailPriceStopMinRetracePts
                         && ((openTradeDirection ==  1 && price <= trailPrice)
                          || (openTradeDirection == -1 && price >= trailPrice)))
                     {
@@ -1677,6 +1689,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 "reason=px_stop" + (nearExtreme ? "_extreme" : "")
                                 + " peak=" + trailMaxProfitPts.ToString("F1")
                                 + "pt cur=" + profitPts.ToString("F1")
+                                + "pt retrace=" + retraceFromPeak.ToString("F1")
                                 + "pt trail=" + trailPrice.ToString("F2")
                                 + " px=" + price.ToString("F2")
                                 + " effPct=" + effPct.ToString("F0"));
@@ -6082,6 +6095,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "  BrickTrail Extreme Tightness %", Order = 30, GroupName = "10 - Regime",
             Description = "PHASE 2.7.6 — Tightness % to use when price is near brick extreme (see ExtremeNearPct). Default 25 = quarter-brick (4pt with 64-tk bricks) vs normal 50 (8pt). Encourages locking profit at exhaustion / wick-rejection points. Trail still ratchets inward only.")]
         public double BrickTrailExtremeTightnessPct { get { return brickTrailExtremeTightnessPct; } set { brickTrailExtremeTightnessPct = value; } }
+
+        [NinjaScriptProperty, Range(0.0, 20.0)]
+        [Display(Name = "  BrickTrail PriceStop MinRetrace (pts)", Order = 30, GroupName = "10 - Regime",
+            Description = "PHASE 2.7.7 — NOISE FILTER. BrickMode price-stop exit only fires when peak-cur >= this many points. Without this, the wick-immune body anchor (which sits ~4pt below peak during fast runs) exits on a 1-2pt mid-brick wiggle. Default 5pt. Set 0 to disable (revert to bare price-stop). Higher (8) for choppy markets, lower (3) for extreme scalp mode.")]
+        public double BrickTrailPriceStopMinRetracePts { get { return brickTrailPriceStopMinRetracePts; } set { brickTrailPriceStopMinRetracePts = value; } }
 
         [NinjaScriptProperty, Range(2, 20)]
         [Display(Name = "  Brick-Trail Min Streak", Order = 31, GroupName = "10 - Regime",
