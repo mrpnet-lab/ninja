@@ -163,6 +163,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double   brickTrailGivebackMinPeakPts   = 20.0;
         private int      brickTrailGivebackStallSec     = 45;
         private DateTime lastSameColorBrickTime         = DateTime.MinValue;
+        // v6 2.6.2 - PROFIT-LOCK at brick close (catches violent V-reversal bricks that finish past breakeven).
+        // Independent of giveback (which is tick-based / time-gated). Profit-lock fires at the SAME bar a
+        // big reversal brick closes, so a single 20pt+ reversal brick can't wipe a 30pt+ peak winner.
+        private double   brickTrailProfitLockMinPeakPts    = 20.0;
+        private int      brickTrailProfitLockGivebackPct   = 35;
         // (v6 2.5 N-back lookback was REMOVED in 2.6 — the body-extreme anchor is monotonic by construction
         //  and exit is brick-close based, so an Nth-back anchor is no longer needed.)
         // Cache prior brick high/low so trail can ratchet one brick behind the just-closed brick.
@@ -782,6 +787,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                     brickTrailMaxGivebackPct      = 0;
                     brickTrailGivebackMinPeakPts  = 20.0;
                     brickTrailGivebackStallSec    = 45;
+                    brickTrailProfitLockMinPeakPts  = 20.0;
+                    brickTrailProfitLockGivebackPct = 35;
                     prevNrBrickHigh               = 0;
                     prevNrBrickLow                = 0;
                     // v6 2.4 — UNKNOWN regime block defaults (ACTIVE LOGIC, OFF by default).
@@ -3832,6 +3839,29 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 lastSameColorBrickTime = Time[0];
             }
+            // v6 2.6.2 - PROFIT-LOCK at brick close (wick-immune, catches violent V-reversals).
+            // Once peak profit reached >= MinPeakPts AND profit-at-this-brick-close has retraced
+            // past the giveback threshold, mark for exit. Uses the brick CLOSE price (not wick) so
+            // MM intra-brick spikes can't trigger it. Catches the case where a single big reversal
+            // brick wipes out most of the run BEFORE brick-flip exit fires (e.g. PB8 trade #1).
+            if (openTradeDirection != 0 && enableBrickTrail && trailTierName == "BrickTrail"
+                && brickTrailProfitLockGivebackPct > 0
+                && trailMaxProfitPts >= brickTrailProfitLockMinPeakPts)
+            {
+                double profitAtBrickClose = openTradeDirection == 1
+                    ? (bClose - averageEntryPrice) / tickPt
+                    : (averageEntryPrice - bClose) / tickPt;
+                double floorPts = trailMaxProfitPts * (1.0 - brickTrailProfitLockGivebackPct / 100.0);
+                if (profitAtBrickClose < floorPts)
+                {
+                    pendingBrickFlipExit = true; // reuse the existing exit pipeline
+                    if (enableDiagLog)
+                        WriteDiagRow("BRICK_PROFIT_LOCK",
+                            "peak=" + trailMaxProfitPts.ToString("F1") + "pt floor=" + floorPts.ToString("F1")
+                            + "pt brickClose=" + bClose.ToString("F2")
+                            + " profitAtClose=" + profitAtBrickClose.ToString("F1") + "pt");
+                }
+            }
             ninzaSeriesAdded = true;  // mark NR active so dashboard shows color, not "off"
             if (enableDiagLog)
                 WriteDiagRow("BRICK_CLOSE",
@@ -5762,6 +5792,16 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "  Brick-Trail Giveback Stall Sec", Order = 36, GroupName = "10 - Regime",
             Description = "Giveback safety STALL-GATE — only fires after this many seconds since the last same-direction brick closed. Default 45. While new same-color bricks are still printing, the run is alive and giveback is suppressed. Only used when BrickTrailMaxGivebackPct > 0.")]
         public int BrickTrailGivebackStallSec { get { return brickTrailGivebackStallSec; } set { brickTrailGivebackStallSec = value; } }
+
+        [NinjaScriptProperty, Range(5, 100)]
+        [Display(Name = "  Brick-Trail Profit-Lock Min Peak (pts)", Order = 37, GroupName = "10 - Regime",
+            Description = "PHASE 2.6.2 — Wick-immune profit-lock at BRICK CLOSE. Once peak profit reaches this many points, every new brick close checks the profit-lock floor. Default 20. Below this peak, only brick-flip exit is active.")]
+        public double BrickTrailProfitLockMinPeakPts { get { return brickTrailProfitLockMinPeakPts; } set { brickTrailProfitLockMinPeakPts = value; } }
+
+        [NinjaScriptProperty, Range(0, 80)]
+        [Display(Name = "  Brick-Trail Profit-Lock Giveback %", Order = 38, GroupName = "10 - Regime",
+            Description = "PHASE 2.6.2 — % of peak profit allowed to bleed at BRICK CLOSE before exiting. Default 35. Catches violent V-reversal bricks that wipe most of the run in a single 20pt+ reversal brick (e.g. PB8 trade #1: peak +31.75pt then G-flip brick erased it before brick-flip exit could fire). Lower (e.g. 25) = lock more profit, more whipsaw on noisy trends. Higher (e.g. 50) = let runs breathe more, risk giving back more on V-reversals. 0 = disabled (only brick-flip exit). Wick-immune (uses brick CLOSE price, not tick).")]
+        public int BrickTrailProfitLockGivebackPct { get { return brickTrailProfitLockGivebackPct; } set { brickTrailProfitLockGivebackPct = value; } }
 
         // ===== v6 2.4 — UNKNOWN-Regime Auto-Block (prevents low-conviction losses, ACTIVE LOGIC) =====
         [NinjaScriptProperty]
