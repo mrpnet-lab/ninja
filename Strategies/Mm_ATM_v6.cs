@@ -178,9 +178,24 @@ namespace NinjaTrader.NinjaScript.Strategies
         // same trend if it resumes. Default GivebackPts=16 (one brick height) is wide enough to ignore
         // normal continuation-brick wicks but will catch any genuine V-reversal long before the opposite
         // brick closes (which has a structural ~20pt cost from the NinzaRenko 16-tick offset).
+        // v6 2.6.4 - STALL-GATE: in-bar trail now only fires when the run is STALLED (no same-color
+        // brick in last InBarTrailStallSec) - during a healthy continuation streak it stays disarmed.
+        // PB10 forensic: trade #1 exited brick 21 R during 25+ brick R streak, trade #2 exited brick
+        // 17 R during 30+ brick R streak. Without stall-gate, a normal mid-streak retrace kills runs.
         private bool     inBarTrailEnabled                  = true;
         private double   inBarTrailMinPeakPts               = 25.0;
         private double   inBarTrailGivebackPts              = 16.0;
+        private int      inBarTrailStallSec                 = 25;
+        // v6 2.7 - EARLY-ENTRY ON FLIP: bypass UNKNOWN/CHOP/HTF blocks when a FRESH brick flip just
+        // produced N consecutive same-color bricks AND price has moved >= 1 ATR from VWAP. This
+        // catches the start of monster runs that current 'wait for ADX confirmation' logic misses.
+        // PB8/9/10 forensic: every trade entered brick 8-13 of 22-30 brick runs, missing 30-50pt of
+        // initial move. With this override, would have entered brick 3-4 instead.
+        private bool     enableEarlyEntryOnFlip             = true;
+        private int      earlyEntryMinStreak                = 3;
+        private int      earlyEntryMaxStreak                = 6;
+        private double   earlyEntryMinDistVwapAtr           = 0.8;
+        private bool     earlyEntryAlsoBypassHtf            = true;
         // (v6 2.5 N-back lookback was REMOVED in 2.6 — the body-extreme anchor is monotonic by construction
         //  and exit is brick-close based, so an Nth-back anchor is no longer needed.)
         // Cache prior brick high/low so trail can ratchet one brick behind the just-closed brick.
@@ -805,6 +820,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                     inBarTrailEnabled               = true;
                     inBarTrailMinPeakPts            = 25.0;
                     inBarTrailGivebackPts           = 16.0;
+                    inBarTrailStallSec              = 25;
+                    enableEarlyEntryOnFlip          = true;
+                    earlyEntryMinStreak             = 3;
+                    earlyEntryMaxStreak             = 6;
+                    earlyEntryMinDistVwapAtr        = 0.8;
+                    earlyEntryAlsoBypassHtf         = true;
                     prevNrBrickHigh               = 0;
                     prevNrBrickLow                = 0;
                     // v6 2.4 — UNKNOWN regime block defaults (ACTIVE LOGIC, OFF by default).
@@ -1488,7 +1509,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             // current tick price (not brick close) so it can catch V-reversals BEFORE the opposite
             // brick closes - which is the structural ~20pt giveback weakness of brick-flip exit.
             // Default giveback (16pt) is wide enough that normal continuation-brick wicks won't trip it.
+            // v6 2.6.4 - STALL-GATE: only arm when no same-color brick in last InBarTrailStallSec.
+            // While the trend is still printing same-color bricks the run is alive - never interrupt.
+            bool inBarStalled = lastSameColorBrickTime != DateTime.MinValue
+                && (Time[0] - lastSameColorBrickTime).TotalSeconds >= inBarTrailStallSec;
             if (inBarTrailEnabled && enableBrickTrail && trailTierName == "BrickTrail"
+                && inBarStalled
                 && trailMaxProfitPts >= inBarTrailMinPeakPts
                 && profitPts < trailMaxProfitPts - inBarTrailGivebackPts)
             {
@@ -1498,7 +1524,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                         "reason=in_bar peak=" + trailMaxProfitPts.ToString("F1")
                         + "pt cur=" + profitPts.ToString("F1")
                         + "pt giveback=" + inBarTrailGivebackPts.ToString("F1")
-                        + "pt px=" + price.ToString("F2"));
+                        + "pt stallSec=" + ((int)(Time[0] - lastSameColorBrickTime).TotalSeconds)
+                        + " px=" + price.ToString("F2"));
                 if (openTradeDirection == 1) ExitLong(); else if (openTradeDirection == -1) ExitShort();
                 pendingExit = true;
                 return;
@@ -2194,6 +2221,32 @@ namespace NinjaTrader.NinjaScript.Strategies
         //  ENTRY / EXIT EXECUTION
         // ===========================================================
         #region Entries & exits
+
+        // v6 2.7 - EARLY-ENTRY ON FLIP HELPER.
+        // Returns true when the brick chart shows a FRESH same-color flip with adequate VWAP
+        // distance, indicating the start of a real run that the regime classifier hasn't caught
+        // up to yet (ADX is lagging). When true, regime/HTF blocks are bypassed.
+        // Conditions:
+        //   - feature enabled
+        //   - brick color matches intended trade direction
+        //   - brick streak between [Min, Max] (fresh, not late)
+        //   - price has moved >= MinDistVwapAtr ATRs from VWAP in trade direction (real move, not chop)
+        private bool IsEarlyFlipEntry(int direction)
+        {
+            if (!enableEarlyEntryOnFlip) return false;
+            if (direction == 0) return false;
+            string needColor = direction == 1 ? "G" : "R";
+            if (lastNrBrickColor != needColor) return false;
+            if (nrBrickStreakCount < earlyEntryMinStreak) return false;
+            if (nrBrickStreakCount > earlyEntryMaxStreak) return false;
+            double atr = indAtr != null && indAtr.IsValidDataPoint(0) ? indAtr[0] : 0;
+            if (atr <= 0 || vwapValue <= 0) return false;
+            double distVwapAtr = (Close[0] - vwapValue) / atr;
+            if (direction == 1  && distVwapAtr <  earlyEntryMinDistVwapAtr) return false;
+            if (direction == -1 && distVwapAtr > -earlyEntryMinDistVwapAtr) return false;
+            return true;
+        }
+
         private bool CanEnterTrade(string label, bool isManual, int direction)
         {
             if (pendingExit) { UpdateDashboardStatus(label + " blocked: exit pending", Brushes.Orange); return false; }
@@ -2202,9 +2255,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             // News blackout (manual + auto)
             if (newsBlackoutEnabled && IsInNewsBlackout())
             { UpdateDashboardStatus(label + " blocked: NEWS blackout ±" + newsBlackoutWindowMin + "min", Brushes.Orange); if (enableDiagLog) WriteDiagRow("BLOCK_NEWS", label); return false; }
+            // v6 2.7 - EARLY-ENTRY ON FLIP: pre-compute once, used by CHOP/UNKNOWN/HTF blocks below.
+            bool earlyFlip = !isManual && IsEarlyFlipEntry(direction);
             // Chop filter (AUTO ONLY — manual entries bypass): protect capital when ADX collapses,
             // EMAs converge, close-range collapses, OR tape is fighting the entry direction.
-            if (!isManual && chopFilterEnabled)
+            if (!isManual && chopFilterEnabled && !earlyFlip)
             {
                 string chopReason;
                 if (IsChoppy(direction, out chopReason))
@@ -2220,7 +2275,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             //   entered with regime=UNKNOWN. When uncertain, the safer move is to wait. We allow
             //   entries in UNKNOWN ONLY when momentum proves itself: brick streak >= N AND ADX slope
             //   >= threshold AND brick color agrees with trade direction.
-            if (!isManual && enableUnknownRegimeBlock && currentRegime == "UNKNOWN")
+            if (!isManual && enableUnknownRegimeBlock && currentRegime == "UNKNOWN" && !earlyFlip)
             {
                 bool brickAgrees = (direction == 1 && lastNrBrickColor == "G")
                                 || (direction == -1 && lastNrBrickColor == "R");
@@ -2427,8 +2482,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             bool nearL = prevDayLow  > 0 && Close[0] >= prevDayLow                 && Close[0] < prevDayLow  + atrNow * 0.5;
 
             // HTF block
-            bool htfBlockL = htfBias < 0 || sessionConfirmedBias < 0;
-            bool htfBlockS = htfBias > 0 || sessionConfirmedBias > 0;
+            // v6 2.7 - HTF override: when EarlyEntryAlsoBypassHtf=ON and a fresh same-color brick
+            // flip with adequate VWAP distance is in progress, allow the trade against htfBias.
+            // This catches afternoon trend-flip days (e.g. 04-28 PB had 26-brick G run with 0 LONGs).
+            bool earlyFlipL = enableEarlyEntryOnFlip && earlyEntryAlsoBypassHtf && IsEarlyFlipEntry(1);
+            bool earlyFlipS = enableEarlyEntryOnFlip && earlyEntryAlsoBypassHtf && IsEarlyFlipEntry(-1);
+            bool htfBlockL = (htfBias < 0 || sessionConfirmedBias < 0) && !earlyFlipL;
+            bool htfBlockS = (htfBias > 0 || sessionConfirmedBias > 0) && !earlyFlipS;
 
             // Order-flow tape block (only realtime; data-driven)
             double tape = orderFlowFilterEnabled ? cachedTapeDelta : 0;
@@ -5860,6 +5920,37 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "  In-Bar Tick Trail Giveback (pts)", Order = 41, GroupName = "10 - Regime",
             Description = "PHASE 2.6.3 — Max points price can retrace from peak before in-bar exit fires. Default 16 (one brick height) — wide enough to ignore normal continuation-brick wicks, tight enough to save 12+pt vs brick-flip on V-reversals. Lower (8-12) = more aggressive, more whipsaw. Higher (20-25) = looser, more like brick-flip.")]
         public double InBarTrailGivebackPts { get { return inBarTrailGivebackPts; } set { inBarTrailGivebackPts = value; } }
+
+        [NinjaScriptProperty, Range(0, 120)]
+        [Display(Name = "  In-Bar Tick Trail Stall Sec", Order = 42, GroupName = "10 - Regime",
+            Description = "PHASE 2.6.4 — In-bar trail STALL-GATE. Only fires after this many seconds since last same-direction brick closed. Default 25. While new same-color bricks are still printing, the run is alive and in-bar trail stays disarmed (so normal mid-streak retracements don't kill monster runs). Set to 0 to make in-bar trail always-on (PB10 behavior — too aggressive).")]
+        public int InBarTrailStallSec { get { return inBarTrailStallSec; } set { inBarTrailStallSec = value; } }
+
+        // ===== v6 2.7 — EARLY-ENTRY ON FLIP =====
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Early-Entry On Flip", Order = 50, GroupName = "10 - Regime",
+            Description = "PHASE 2.7 — Bypass UNKNOWN/CHOP regime blocks (and HTF block, if EarlyEntryAlsoBypassHtf=ON) when a FRESH same-color brick flip is in progress with adequate VWAP distance. Catches the start of monster runs that ADX-based regime detection misses (ADX lags 5-8 bricks). PB8/9/10 forensic: every trade entered brick 8-13 of 22-30 brick runs, missing 30-50pt of initial move. With this ON, would enter brick 3-4 instead. Default ON.")]
+        public bool EnableEarlyEntryOnFlip { get { return enableEarlyEntryOnFlip; } set { enableEarlyEntryOnFlip = value; } }
+
+        [NinjaScriptProperty, Range(2, 8)]
+        [Display(Name = "  Early-Entry Min Streak", Order = 51, GroupName = "10 - Regime",
+            Description = "PHASE 2.7 — Minimum same-color brick streak (after a flip) for the override to engage. Default 3 — confirms direction without missing the move.")]
+        public int EarlyEntryMinStreak { get { return earlyEntryMinStreak; } set { earlyEntryMinStreak = value; } }
+
+        [NinjaScriptProperty, Range(3, 15)]
+        [Display(Name = "  Early-Entry Max Streak", Order = 52, GroupName = "10 - Regime",
+            Description = "PHASE 2.7 — Maximum brick streak — past this, the move is no longer 'fresh' and we fall back to normal regime gating. Default 6.")]
+        public int EarlyEntryMaxStreak { get { return earlyEntryMaxStreak; } set { earlyEntryMaxStreak = value; } }
+
+        [NinjaScriptProperty, Range(0.0, 3.0)]
+        [Display(Name = "  Early-Entry Min |Dist VWAP / ATR|", Order = 53, GroupName = "10 - Regime",
+            Description = "PHASE 2.7 — Minimum |(Close-VWAP) / ATR| in trade direction for override. Default 0.8 — confirms a real impulsive move (not chop near VWAP).")]
+        public double EarlyEntryMinDistVwapAtr { get { return earlyEntryMinDistVwapAtr; } set { earlyEntryMinDistVwapAtr = value; } }
+
+        [NinjaScriptProperty]
+        [Display(Name = "  Early-Entry Also Bypass HTF Bias", Order = 54, GroupName = "10 - Regime",
+            Description = "PHASE 2.7 — When ON, the Early-Entry override also bypasses the HTF (higher-timeframe) bias block. Catches afternoon trend-flip days (e.g. 04-28: 26-brick afternoon G run with 0 LONGs because htfBias was still -1). Default ON.")]
+        public bool EarlyEntryAlsoBypassHtf { get { return earlyEntryAlsoBypassHtf; } set { earlyEntryAlsoBypassHtf = value; } }
 
         // ===== v6 2.4 — UNKNOWN-Regime Auto-Block (prevents low-conviction losses, ACTIVE LOGIC) =====
         [NinjaScriptProperty]
