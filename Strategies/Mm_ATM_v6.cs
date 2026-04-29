@@ -1463,6 +1463,15 @@ namespace NinjaTrader.NinjaScript.Strategies
         #region Adaptive Trail
         private void MonitorAdaptiveTrail()
         {
+            // v6 2.7.1 - BRICK-MODE PRIORITY: when brick-trail is enabled AND brick agrees with our
+            // position with a streak >= 2, the BRICK exits (flip + in-bar) take exclusive control.
+            // Legacy ATR/tier trail and AGGR_PULLBACK are SUPPRESSED so they can't kill a real run
+            // before brick-trail engagement matures (PB11 trades 2 & 4 lost ~$1500 to T2-Strong
+            // firing at +5pt while brick-trail was waiting for streak=4).
+            bool brickAgreesPos = (openTradeDirection == -1 && lastNrBrickColor == "R")
+                               || (openTradeDirection ==  1 && lastNrBrickColor == "G");
+            bool brickModeActive = enableBrickTrail && openTradeDirection != 0
+                                && brickAgreesPos && nrBrickStreakCount >= 2;
             // Allow execution when master toggle is off ONLY if user explicitly armed via TRL NOW
             // (manualTrailEarlyStart) or trail was already active before toggle was flipped.
             if (averageEntryPrice <= 0) return;
@@ -1491,7 +1500,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             //  the current streak so the ratchet is monotonic by construction (no Nth-back guesswork).
             // ===========================================================
             // Trigger 1: confirmed brick flip (set by ProcessPrimaryAsNinzaRenkoBar on opposite-color close).
-            if (pendingBrickFlipExit && enableBrickTrail && trailTierName == "BrickTrail")
+            // v6 2.7.1 - fires whenever EnableBrickTrail is ON (not just after tier engagement) so
+            // brick-flip works even on early entries (streak 2-3) before the trail tier matures.
+            if (pendingBrickFlipExit && enableBrickTrail)
             {
                 pendingBrickFlipExit = false;
                 lastExitReason = "TRAIL_BrickTrail_Flip";
@@ -1511,9 +1522,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             // Default giveback (16pt) is wide enough that normal continuation-brick wicks won't trip it.
             // v6 2.6.4 - STALL-GATE: only arm when no same-color brick in last InBarTrailStallSec.
             // While the trend is still printing same-color bricks the run is alive - never interrupt.
+            // v6 2.7.1 - fires in BRICK-MODE (not just BrickTrail tier) so early entries are protected.
             bool inBarStalled = lastSameColorBrickTime != DateTime.MinValue
                 && (Time[0] - lastSameColorBrickTime).TotalSeconds >= inBarTrailStallSec;
-            if (inBarTrailEnabled && enableBrickTrail && trailTierName == "BrickTrail"
+            if (inBarTrailEnabled && brickModeActive
                 && inBarStalled
                 && trailMaxProfitPts >= inBarTrailMinPeakPts
                 && profitPts < trailMaxProfitPts - inBarTrailGivebackPts)
@@ -1528,6 +1540,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                         + " px=" + price.ToString("F2"));
                 if (openTradeDirection == 1) ExitLong(); else if (openTradeDirection == -1) ExitShort();
                 pendingExit = true;
+                return;
+            }
+            // v6 2.7.1 - BRICK-MODE: short-circuit BEFORE legacy ATR trail / AGGR_PULLBACK so they
+            // can't override the brick exits. Brick-flip + in-bar are the only exit triggers.
+            if (brickModeActive)
+            {
+                // Mark info-only tier so dashboard reflects we're in brick-mode (no price-stop fires)
+                if (trailTierName != "BrickTrail") trailTierName = "BrickMode";
+                trailActive = true; // suppress re-activation path below
                 return;
             }
             bool brickTrailEngaged = false;
