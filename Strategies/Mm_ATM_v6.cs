@@ -146,6 +146,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         // AUTO-opened trades. Manual trades keep the legacy ATR/tier trail visualization the user
         // expects. Set OFF to apply BrickMode universally (e.g. backtesting brick exits on manual fills).
         private bool   brickModeAutoOnly = true;
+        // v6 2.7.4 - When ON (default), pressing TRL NOW (or nudging trail) BYPASSES BrickMode for
+        // the rest of the trade so the aggressive ATR trail can lock profit. Set OFF to keep
+        // BrickMode's wide trail even after user presses TRL NOW (rarely useful).
+        private bool   trlNowOverridesBrick = true;
         private int    brickTrailMinStreak = 4;     // require >= N same-color bricks before brick-trail engages
         private double brickTrailBufferTicks = 4;   // ticks above prev-brick-high (SHORT) / below low (LONG)
         private bool   brickTrailRequireTrendRegime = true; // require regime=TREND_DN (SHORT) / TREND_UP (LONG)
@@ -486,6 +490,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         // display the user is accustomed to. Reset in ResetPositionState.
         private bool   lastEntryWasManual;
         private bool   manualTrailEarlyStart;  // TRL NOW set this -> activation profit threshold bypassed
+        // v6 2.7.4 - When TRUE, BrickMode short-circuit is BYPASSED so the legacy aggressive ATR
+        // trail (with price-stop exit) takes over. Set by ActivateTrailManual (TRL NOW button) and
+        // by NudgeTrailDistancePoints. Cleared on flat in ResetPositionState. The user can disable
+        // the override entirely via TrlNowOverridesBrick property (default ON).
+        private bool   aggrTrailOverride;
         private double manualTrailOffsetPoints; // signed offset added to auto trail distance (− = tighter, + = looser)
         private double trailPrice;
         private double trailMaxProfitPts;
@@ -824,6 +833,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     // v6 2.3 — Brick-Trail Mode defaults (ACTIVE LOGIC, OFF by default).
                     enableBrickTrail              = false;
                     brickModeAutoOnly             = true;
+                    trlNowOverridesBrick          = true;
                     brickTrailMinStreak           = 4;
                     brickTrailBufferTicks         = 4;
                     brickTrailRequireTrendRegime  = true;
@@ -1490,9 +1500,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                                || (openTradeDirection ==  1 && lastNrBrickColor == "G");
             // v6 2.7.3 - BrickMode now respects auto-only toggle. Manual entries fall through to the
             // legacy ATR/tier trail so the user gets the trail visualization they're used to.
+            // v6 2.7.4 - TRL NOW (aggrTrailOverride) also bypasses BrickMode - lets user lock profit
+            // aggressively even on auto-trades when they see exhaustion / want to scalp the brick.
             bool brickModeActive = enableBrickTrail && openTradeDirection != 0
                                 && brickAgreesPos && nrBrickStreakCount >= 2
-                                && !(brickModeAutoOnly && lastEntryWasManual);
+                                && !(brickModeAutoOnly && lastEntryWasManual)
+                                && !(trlNowOverridesBrick && aggrTrailOverride);
             // Allow execution when master toggle is off ONLY if user explicitly armed via TRL NOW
             // (manualTrailEarlyStart) or trail was already active before toggle was flipped.
             if (averageEntryPrice <= 0) return;
@@ -2757,6 +2770,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             // reset trail state on every arm — user nudges from prior trade are CLEARED
             trailActive = false; trailPrice = 0; trailMaxProfitPts = 0; trailTierName = "";
             manualTrailEarlyStart = false;
+            aggrTrailOverride     = false;
             manualTrailOffsetPoints = 0;
             trapScore = 0; trapDetected = false; trapBarsInTrade = 0; trapEscapeBars = 0;
             stopHuntSuspendBars = 0;
@@ -2943,6 +2957,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             // If trail already active, just lock it tighter NOW (re-anchor at aggressive distance).
             // If not active, set the early-start flag — next tick of MonitorAdaptiveTrail will arm it.
             manualTrailEarlyStart = true;
+            aggrTrailOverride     = true;
             if (trailActive)
             {
                 // Re-anchor immediately at aggressive distance.
@@ -3219,6 +3234,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             activeEntrySignals.Clear();
             trailPrice = 0; trailActive = false; trailMaxProfitPts = 0; trailTierName = "";
             lastEntryWasManual = false;
+            aggrTrailOverride  = false;
             // v6 2.6 — clear brick-trail per-trade state on flat (anchor stays per-streak).
             pendingBrickFlipExit = false;
             lastSameColorBrickTime = DateTime.MinValue;
@@ -5951,6 +5967,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "  BrickMode Auto-Only", Order = 30, GroupName = "10 - Regime",
             Description = "PHASE 2.7.3 — When ON (default), brick-mode logic (BrickMode trail tier, brick-flip exit, in-bar trail) only applies to AUTO-opened trades. MANUAL trades (BUY MKT, SELL MKT, etc.) keep the legacy ATR/tier trail visualization with displayed trail price. Set OFF to apply brick-mode universally.")]
         public bool BrickModeAutoOnly { get { return brickModeAutoOnly; } set { brickModeAutoOnly = value; } }
+
+        [NinjaScriptProperty]
+        [Display(Name = "  TRL NOW overrides BrickMode", Order = 30, GroupName = "10 - Regime",
+            Description = "PHASE 2.7.4 — When ON (default), pressing TRL NOW (or nudging trail SL) on an AUTO trade BYPASSES BrickMode for the rest of that trade so the legacy aggressive ATR trail can lock profit at the user-chosen distance. Without this, BrickMode would keep overriding the manual lock with its wide brick-anchor trail. Cleared automatically when position goes flat.")]
+        public bool TrlNowOverridesBrick { get { return trlNowOverridesBrick; } set { trlNowOverridesBrick = value; } }
 
         [NinjaScriptProperty, Range(2, 20)]
         [Display(Name = "  Brick-Trail Min Streak", Order = 31, GroupName = "10 - Regime",
