@@ -145,12 +145,20 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int    brickTrailMinStreak = 4;     // require >= N same-color bricks before brick-trail engages
         private double brickTrailBufferTicks = 4;   // ticks above prev-brick-high (SHORT) / below low (LONG)
         private bool   brickTrailRequireTrendRegime = true; // require regime=TREND_DN (SHORT) / TREND_UP (LONG)
-        // v6 2.5 — N-back anchor: instead of anchoring to the just-closed brick, anchor to the brick N steps
-        // behind it within the current same-color streak. Lets high-streak runs absorb 1–2 bricks of pullback
-        // as noise instead of triggering an exit. Lookback=0 reproduces the original “prev brick” behavior.
-        private int    brickTrailLookback = 2;
-        private System.Collections.Generic.List<double> nrBrickHighHist = new System.Collections.Generic.List<double>();
-        private System.Collections.Generic.List<double> nrBrickLowHist  = new System.Collections.Generic.List<double>();
+        // v6 2.6 — Brick-Trail v2: brick-close-based exit (wick-immune) + body-extreme anchor.
+        // streakMinBodyHigh = running min of brick BODY high (max(open,close)) across current streak — SHORT anchor.
+        // streakMaxBodyLow  = running max of brick BODY low  (min(open,close)) across current streak — LONG  anchor.
+        // Body (not wick) ignores intra-brick spikes that MM uses to fake reversals.
+        private double streakMinBodyHigh = double.MaxValue;
+        private double streakMaxBodyLow  = double.MinValue;
+        // Set by ProcessPrimaryAsNinzaRenkoBar when a NEW brick of OPPOSITE color closes while we hold a position
+        // and brick-trail is enabled. MonitorAdaptiveTrail consumes the flag and exits at market.
+        private bool   pendingBrickFlipExit;
+        // Max % of peak profit we'll allow to bleed before we exit anyway (catches stalls/wicks where
+        // bricks haven't flipped yet but the move is clearly dying). 0 = disabled. Default 50.
+        private int    brickTrailMaxGivebackPct = 50;
+        // (v6 2.5 N-back lookback was REMOVED in 2.6 — the body-extreme anchor is monotonic by construction
+        //  and exit is brick-close based, so an Nth-back anchor is no longer needed.)
         // Cache prior brick high/low so trail can ratchet one brick behind the just-closed brick.
         private double prevNrBrickHigh;
         private double prevNrBrickLow;
@@ -765,7 +773,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     brickTrailMinStreak           = 4;
                     brickTrailBufferTicks         = 4;
                     brickTrailRequireTrendRegime  = true;
-                    brickTrailLookback            = 2;
+                    brickTrailMaxGivebackPct      = 50;
                     prevNrBrickHigh               = 0;
                     prevNrBrickLow                = 0;
                     // v6 2.4 — UNKNOWN regime block defaults (ACTIVE LOGIC, OFF by default).
@@ -1420,21 +1428,30 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (profitPts > trailMaxProfitPts) trailMaxProfitPts = profitPts;
 
             // ===========================================================
-            //  v6 2.3 \u2014 BRICK-TRAIL MODE (Beat-the-MM monster-run capture)
-            // ---------------------------------------------------------
-            //  When ALL conditions are met, the entire ATR/tier trail logic below is BYPASSED
-            //  and the trail is anchored to the previous CLOSED brick's far extreme + buffer:
-            //   \u2022 SHORT trail = lastNrBrickHigh + buffer ticks   (ratchets DOWN as new R bricks print)
-            //   \u2022 LONG  trail = lastNrBrickLow  - buffer ticks   (ratchets UP   as new G bricks print)
-            //  The first opposite-color brick that prints will instantly pierce the trail
-            //  at its own extreme = clean exit on the actual reversal signal, not on a wick.
-            //  Conditions:
-            //   1) EnableBrickTrail = ON
-            //   2) Brick color matches trade direction (R while SHORT, G while LONG)
-            //   3) Brick streak >= BrickTrailMinStreak (default 4)
-            //   4) (optional, default ON) currentRegime is TREND_DN for SHORT / TREND_UP for LONG
-            //   5) trailMaxProfitPts >= dynamicActivation (we are in profit beyond entry noise)
+            //  v6 2.6 - BRICK-TRAIL v2 (wick-immune, brick-close-based)
+            //  Replaces v6 2.3/2.5 price-tick exits which were vulnerable to MM wick stop-runs.
+            //  Three exit triggers, in priority order:
+            //    1) BRICK FLIP   - first opposite-color brick closes while engaged (definitive reversal)
+            //    2) GIVEBACK     - peak profit eroded past BrickTrailMaxGivebackPct (catches stalls)
+            //    3) trail price  - INFORMATIONAL ONLY (displayed/logged, NOT used for exit anymore)
+            //  Anchor uses brick BODY extremes (max/min of open,close) NOT wicks - MM intra-brick
+            //  spikes can no longer fake the trail. Tracking is a running min(SHORT)/max(LONG) across
+            //  the current streak so the ratchet is monotonic by construction (no Nth-back guesswork).
             // ===========================================================
+            // Trigger 1: confirmed brick flip (set by ProcessPrimaryAsNinzaRenkoBar on opposite-color close).
+            if (pendingBrickFlipExit && enableBrickTrail && trailTierName == "BrickTrail")
+            {
+                pendingBrickFlipExit = false;
+                lastExitReason = "TRAIL_BrickTrail_Flip";
+                if (enableDiagLog)
+                    WriteDiagRow("BRICK_TRAIL_HIT",
+                        "reason=brick_flip color=" + lastNrBrickColor + " streak=" + nrBrickStreakCount
+                        + " px=" + price.ToString("F2") + " profit=" + profitPts.ToString("F1") + "pt"
+                        + " peak=" + trailMaxProfitPts.ToString("F1") + "pt");
+                if (openTradeDirection == 1) ExitLong(); else if (openTradeDirection == -1) ExitShort();
+                pendingExit = true;
+                return;
+            }
             bool brickTrailEngaged = false;
             if (enableBrickTrail && nrBrickStreakCount >= brickTrailMinStreak
                 && lastNrBrickHigh > 0 && lastNrBrickLow > 0
@@ -1445,21 +1462,16 @@ namespace NinjaTrader.NinjaScript.Strategies
                 bool regimeOk = !brickTrailRequireTrendRegime
                               || (openTradeDirection == -1 && currentRegime == "TREND_DN")
                               || (openTradeDirection ==  1 && currentRegime == "TREND_UP");
-                if (brickAgrees && regimeOk)
+                bool haveAnchor = streakMinBodyHigh < double.MaxValue && streakMaxBodyLow > double.MinValue;
+                if (brickAgrees && regimeOk && haveAnchor)
                 {
                     double bufPt = brickTrailBufferTicks * TickSize;
-                    // v6 2.5 — N-back anchor. Index 0 = oldest brick in current streak, Count-1 = just-closed.
-                    // Lookback=0 ⇒ just-closed (legacy behavior). Lookback=2 ⇒ brick that closed 2 steps ago.
-                    // Falls back to the oldest available brick if streak is shorter than lookback+1.
-                    int hCount = nrBrickHighHist.Count;
-                    int idxN   = (hCount > 0) ? Math.Max(0, hCount - 1 - brickTrailLookback) : -1;
-                    double anchorHigh = (idxN >= 0) ? nrBrickHighHist[idxN] : lastNrBrickHigh;
-                    double anchorLow  = (idxN >= 0) ? nrBrickLowHist[idxN]  : lastNrBrickLow;
+                    double anchorPx = openTradeDirection == -1 ? streakMinBodyHigh : streakMaxBodyLow;
                     double btPrice = openTradeDirection == -1
-                        ? Math.Round((anchorHigh + bufPt) / TickSize) * TickSize
-                        : Math.Round((anchorLow  - bufPt) / TickSize) * TickSize;
-                    // Only ratchet INWARD (never loosen) and only if currently active OR newly arming.
-                    bool first = !trailActive;
+                        ? Math.Round((anchorPx + bufPt) / TickSize) * TickSize
+                        : Math.Round((anchorPx - bufPt) / TickSize) * TickSize;
+                    // Ratchet INWARD only - INFORMATIONAL trail price for display/diag (no price exit).
+                    bool first = !trailActive || trailTierName != "BrickTrail";
                     if (first
                         || (openTradeDirection == -1 && btPrice < trailPrice)
                         || (openTradeDirection ==  1 && btPrice > trailPrice))
@@ -1470,32 +1482,30 @@ namespace NinjaTrader.NinjaScript.Strategies
                         if (enableDiagLog && first)
                             WriteDiagRow("BRICK_TRAIL_ARMED",
                                 "dir=" + openTradeDirection + " streak=" + nrBrickStreakCount
-                                + " lookback=" + brickTrailLookback
-                                + " anchorHi=" + anchorHigh.ToString("F2")
-                                + " anchorLo=" + anchorLow.ToString("F2")
-                                + " lastHi=" + lastNrBrickHigh.ToString("F2")
-                                + " lastLo=" + lastNrBrickLow.ToString("F2")
-                                + " trail=" + trailPrice.ToString("F2"));
+                                + " bodyHi=" + streakMinBodyHigh.ToString("F2")
+                                + " bodyLo=" + streakMaxBodyLow.ToString("F2")
+                                + " trail=" + trailPrice.ToString("F2")
+                                + " (info-only; exit on brick-flip or giveback>=" + brickTrailMaxGivebackPct + "%)");
                     }
                     brickTrailEngaged = true;
-                    // Hit detection (same logic as bottom of method but local for clarity).
-                    bool hit = (openTradeDirection == -1 && price >= trailPrice)
-                            || (openTradeDirection ==  1 && price <= trailPrice);
-                    if (hit)
+                    // Trigger 2: giveback safety (only after we've banked >5pt of peak).
+                    if (brickTrailMaxGivebackPct > 0 && trailMaxProfitPts > 5.0
+                        && profitPts < trailMaxProfitPts * (1.0 - brickTrailMaxGivebackPct / 100.0))
                     {
-                        lastExitReason = "TRAIL_BrickTrail";
+                        lastExitReason = "TRAIL_BrickTrail_Giveback";
                         if (enableDiagLog)
                             WriteDiagRow("BRICK_TRAIL_HIT",
-                                "dir=" + openTradeDirection + " px=" + price.ToString("F2")
-                                + " trail=" + trailPrice.ToString("F2") + " profit=" + profitPts.ToString("F1") + "pt");
+                                "reason=giveback peak=" + trailMaxProfitPts.ToString("F1")
+                                + "pt cur=" + profitPts.ToString("F1") + "pt limit="
+                                + brickTrailMaxGivebackPct + "%");
                         if (openTradeDirection == 1) ExitLong(); else if (openTradeDirection == -1) ExitShort();
                         pendingExit = true;
                         return;
                     }
-                    return; // Brick-trail in charge \u2014 skip the legacy ATR/tier logic entirely.
+                    // No price-tick exit - wick-immune by design.
+                    return; // Brick-trail in charge - skip the legacy ATR/tier logic entirely.
                 }
             }
-
             double atrPts = indAtr[0] / tickPt;
             double dynamicActivation = aggressiveExitsEnabled
                 ? aggrTrailActivationPts
@@ -3007,6 +3017,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             aggressiveLimitSubmitTime = DateTime.MinValue;
             activeEntrySignals.Clear();
             trailPrice = 0; trailActive = false; trailMaxProfitPts = 0; trailTierName = "";
+            // v6 2.6 — clear brick-trail per-trade state on flat (anchor stays per-streak).
+            pendingBrickFlipExit = false;
             // Auto-clear Runner Mode when position goes flat — it's a per-trade opt-in.
             if (runnerModeActive_user)
             {
@@ -3776,12 +3788,23 @@ namespace NinjaTrader.NinjaScript.Strategies
             lastNrBrickHigh  = bHigh;
             lastNrBrickLow   = bLow;
             lastNrBrickClose = bClose;
-            // v6 2.5 — maintain rolling history of brick extremes WITHIN the current same-color streak
-            // (cleared whenever streak resets) so Brick-Trail can anchor to the Nth-previous brick.
-            if (nrBrickStreakCount == 1) { nrBrickHighHist.Clear(); nrBrickLowHist.Clear(); }
-            nrBrickHighHist.Add(bHigh);
-            nrBrickLowHist.Add(bLow);
-            if (nrBrickHighHist.Count > 64) { nrBrickHighHist.RemoveAt(0); nrBrickLowHist.RemoveAt(0); }
+            // v6 2.6 — Brick-Trail v2 streak-extreme tracking (body, not wick) + brick-flip exit signal.
+            if (nrBrickStreakCount == 1)
+            {
+                streakMinBodyHigh = double.MaxValue;
+                streakMaxBodyLow  = double.MinValue;
+                // First brick of a NEW streak is OPPOSITE color of the prior streak.
+                // If we're in a position and the new brick closed against us, fire the brick-flip exit.
+                if (openTradeDirection != 0 && enableBrickTrail
+                    && ((openTradeDirection == -1 && color == "G") || (openTradeDirection == 1 && color == "R")))
+                {
+                    pendingBrickFlipExit = true;
+                }
+            }
+            double bodyHighPx = Math.Max(bOpen, bClose);
+            double bodyLowPx  = Math.Min(bOpen, bClose);
+            if (bodyHighPx < streakMinBodyHigh) streakMinBodyHigh = bodyHighPx;
+            if (bodyLowPx  > streakMaxBodyLow)  streakMaxBodyLow  = bodyLowPx;
             ninzaSeriesAdded = true;  // mark NR active so dashboard shows color, not "off"
             if (enableDiagLog)
                 WriteDiagRow("BRICK_CLOSE",
@@ -5698,10 +5721,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             Description = "When ON (default), Brick-Trail Mode only engages when currentRegime is TREND_DN (SHORT) or TREND_UP (LONG). Turn OFF to let brick-trail engage in UNKNOWN regimes too — riskier but catches runs the classifier doesn't label.")]
         public bool BrickTrailRequireTrendRegime { get { return brickTrailRequireTrendRegime; } set { brickTrailRequireTrendRegime = value; } }
 
-        [NinjaScriptProperty, Range(0, 10)]
-        [Display(Name = "  Brick-Trail Lookback", Order = 34, GroupName = "10 - Regime",
-            Description = "PHASE 2.5 — N-back anchor. Default 2. Anchors the trail to the brick that closed N steps BEFORE the most recent one (within the current same-color streak). Lookback=0 = legacy (anchor on just-closed brick, very tight). Lookback=2 = lets a high-streak run absorb up to 2 bricks of pullback as noise before triggering. Higher = looser trail = bigger winners but more give-back on real reversals. RATIONALE: Playback5 WIN#2 peaked at +36pt (brick #17) but exited +17pt at brick #18 because lookback=0 anchor tightened on every brick; same R-run continued unblocked to brick #30 (132pt). Lookback=2 would have anchored to brick #15 high ⇒ ~8pt of breathing room ⇒ ride to ~brick #25–30. History is automatically reset on color change.")]
-        public int BrickTrailLookback { get { return brickTrailLookback; } set { brickTrailLookback = value; } }
+        [NinjaScriptProperty, Range(0, 100)]
+        [Display(Name = "  Brick-Trail Max Giveback %", Order = 34, GroupName = "10 - Regime",
+            Description = "PHASE 2.6 — Brick-Trail v2 giveback safety. Default 50. Once brick-trail is engaged, if profit pulls back from peak by more than this percent, exit immediately. Catches stalls/wicks where bricks haven't flipped yet but the move is clearly dying. 0 = disabled (only brick-flip exit). Lower = lock more profit (more whipsaw on noisy runs). Higher = let runs breathe further (risk of giving back too much). NOTE: brick-trail v2 IGNORES price-tick wicks for exit — only opposite-color brick CLOSE or this giveback can exit a brick-trail position.")]
+        public int BrickTrailMaxGivebackPct { get { return brickTrailMaxGivebackPct; } set { brickTrailMaxGivebackPct = value; } }
 
         // ===== v6 2.4 — UNKNOWN-Regime Auto-Block (prevents low-conviction losses, ACTIVE LOGIC) =====
         [NinjaScriptProperty]
