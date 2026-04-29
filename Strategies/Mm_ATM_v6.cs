@@ -3848,9 +3848,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 && brickTrailProfitLockGivebackPct > 0
                 && trailMaxProfitPts >= brickTrailProfitLockMinPeakPts)
             {
+                double tickPtPL = TickSize * NQ_TICKS_PER_POINT;
                 double profitAtBrickClose = openTradeDirection == 1
-                    ? (bClose - averageEntryPrice) / tickPt
-                    : (averageEntryPrice - bClose) / tickPt;
+                    ? (bClose - averageEntryPrice) / tickPtPL
+                    : (averageEntryPrice - bClose) / tickPtPL;
                 double floorPts = trailMaxProfitPts * (1.0 - brickTrailProfitLockGivebackPct / 100.0);
                 if (profitAtBrickClose < floorPts)
                 {
