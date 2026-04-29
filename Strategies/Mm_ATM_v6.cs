@@ -145,6 +145,12 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int    brickTrailMinStreak = 4;     // require >= N same-color bricks before brick-trail engages
         private double brickTrailBufferTicks = 4;   // ticks above prev-brick-high (SHORT) / below low (LONG)
         private bool   brickTrailRequireTrendRegime = true; // require regime=TREND_DN (SHORT) / TREND_UP (LONG)
+        // v6 2.5 — N-back anchor: instead of anchoring to the just-closed brick, anchor to the brick N steps
+        // behind it within the current same-color streak. Lets high-streak runs absorb 1–2 bricks of pullback
+        // as noise instead of triggering an exit. Lookback=0 reproduces the original “prev brick” behavior.
+        private int    brickTrailLookback = 2;
+        private System.Collections.Generic.List<double> nrBrickHighHist = new System.Collections.Generic.List<double>();
+        private System.Collections.Generic.List<double> nrBrickLowHist  = new System.Collections.Generic.List<double>();
         // Cache prior brick high/low so trail can ratchet one brick behind the just-closed brick.
         private double prevNrBrickHigh;
         private double prevNrBrickLow;
@@ -759,6 +765,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     brickTrailMinStreak           = 4;
                     brickTrailBufferTicks         = 4;
                     brickTrailRequireTrendRegime  = true;
+                    brickTrailLookback            = 2;
                     prevNrBrickHigh               = 0;
                     prevNrBrickLow                = 0;
                     // v6 2.4 — UNKNOWN regime block defaults (ACTIVE LOGIC, OFF by default).
@@ -1441,9 +1448,16 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (brickAgrees && regimeOk)
                 {
                     double bufPt = brickTrailBufferTicks * TickSize;
+                    // v6 2.5 — N-back anchor. Index 0 = oldest brick in current streak, Count-1 = just-closed.
+                    // Lookback=0 ⇒ just-closed (legacy behavior). Lookback=2 ⇒ brick that closed 2 steps ago.
+                    // Falls back to the oldest available brick if streak is shorter than lookback+1.
+                    int hCount = nrBrickHighHist.Count;
+                    int idxN   = (hCount > 0) ? Math.Max(0, hCount - 1 - brickTrailLookback) : -1;
+                    double anchorHigh = (idxN >= 0) ? nrBrickHighHist[idxN] : lastNrBrickHigh;
+                    double anchorLow  = (idxN >= 0) ? nrBrickLowHist[idxN]  : lastNrBrickLow;
                     double btPrice = openTradeDirection == -1
-                        ? Math.Round((lastNrBrickHigh + bufPt) / TickSize) * TickSize
-                        : Math.Round((lastNrBrickLow  - bufPt) / TickSize) * TickSize;
+                        ? Math.Round((anchorHigh + bufPt) / TickSize) * TickSize
+                        : Math.Round((anchorLow  - bufPt) / TickSize) * TickSize;
                     // Only ratchet INWARD (never loosen) and only if currently active OR newly arming.
                     bool first = !trailActive;
                     if (first
@@ -1456,8 +1470,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                         if (enableDiagLog && first)
                             WriteDiagRow("BRICK_TRAIL_ARMED",
                                 "dir=" + openTradeDirection + " streak=" + nrBrickStreakCount
-                                + " brickHi=" + lastNrBrickHigh.ToString("F2")
-                                + " brickLo=" + lastNrBrickLow.ToString("F2")
+                                + " lookback=" + brickTrailLookback
+                                + " anchorHi=" + anchorHigh.ToString("F2")
+                                + " anchorLo=" + anchorLow.ToString("F2")
+                                + " lastHi=" + lastNrBrickHigh.ToString("F2")
+                                + " lastLo=" + lastNrBrickLow.ToString("F2")
                                 + " trail=" + trailPrice.ToString("F2"));
                     }
                     brickTrailEngaged = true;
@@ -3759,6 +3776,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             lastNrBrickHigh  = bHigh;
             lastNrBrickLow   = bLow;
             lastNrBrickClose = bClose;
+            // v6 2.5 — maintain rolling history of brick extremes WITHIN the current same-color streak
+            // (cleared whenever streak resets) so Brick-Trail can anchor to the Nth-previous brick.
+            if (nrBrickStreakCount == 1) { nrBrickHighHist.Clear(); nrBrickLowHist.Clear(); }
+            nrBrickHighHist.Add(bHigh);
+            nrBrickLowHist.Add(bLow);
+            if (nrBrickHighHist.Count > 64) { nrBrickHighHist.RemoveAt(0); nrBrickLowHist.RemoveAt(0); }
             ninzaSeriesAdded = true;  // mark NR active so dashboard shows color, not "off"
             if (enableDiagLog)
                 WriteDiagRow("BRICK_CLOSE",
@@ -5674,6 +5697,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "  Brick-Trail Require TREND Regime", Order = 33, GroupName = "10 - Regime",
             Description = "When ON (default), Brick-Trail Mode only engages when currentRegime is TREND_DN (SHORT) or TREND_UP (LONG). Turn OFF to let brick-trail engage in UNKNOWN regimes too — riskier but catches runs the classifier doesn't label.")]
         public bool BrickTrailRequireTrendRegime { get { return brickTrailRequireTrendRegime; } set { brickTrailRequireTrendRegime = value; } }
+
+        [NinjaScriptProperty, Range(0, 10)]
+        [Display(Name = "  Brick-Trail Lookback", Order = 34, GroupName = "10 - Regime",
+            Description = "PHASE 2.5 — N-back anchor. Default 2. Anchors the trail to the brick that closed N steps BEFORE the most recent one (within the current same-color streak). Lookback=0 = legacy (anchor on just-closed brick, very tight). Lookback=2 = lets a high-streak run absorb up to 2 bricks of pullback as noise before triggering. Higher = looser trail = bigger winners but more give-back on real reversals. RATIONALE: Playback5 WIN#2 peaked at +36pt (brick #17) but exited +17pt at brick #18 because lookback=0 anchor tightened on every brick; same R-run continued unblocked to brick #30 (132pt). Lookback=2 would have anchored to brick #15 high ⇒ ~8pt of breathing room ⇒ ride to ~brick #25–30. History is automatically reset on color change.")]
+        public int BrickTrailLookback { get { return brickTrailLookback; } set { brickTrailLookback = value; } }
 
         // ===== v6 2.4 — UNKNOWN-Regime Auto-Block (prevents low-conviction losses, ACTIVE LOGIC) =====
         [NinjaScriptProperty]
