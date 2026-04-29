@@ -2332,3 +2332,174 @@ Adding 2.1 Smart Cooldown on top would re-enter the 19â†’30 brick continuat
 ---
 
 **Phase 2.5 queued:** Wick-Reject entry gate (block entries against fresh `WICK_TAG` patterns), MM-Trap Re-Entry (auto re-enter original direction after a 1-streak trap-flip stops us out).
+
+
+
+
+---
+
+## 25. Phase 2.5 / 2.6 / 2.7 SHIPPED â€” Brick-Trail v2 + In-Bar Trail + Early-Entry-On-Flip (2026-04-29)
+
+This iteration captures the v6 2.5.0 â†’ 2.7 evolution, including the full forensic trail across Playback 5 â†’ 11 on the 2026-04-28 dataset (Day C). All eight commits live on the `ninja` branch; PB11 (the test that validates this section) is queued at the time of writing.
+
+### 25.1 Problem statement (rolling, from PB5 onward)
+
+| PB | Version | Result | Forensic root cause |
+|----|---------|--------|---------------------|
+| 5  | v6 2.4.0      | +$745 | Baseline brick-trail (anchor = "Nth brick back") |
+| 6  | v6 2.5.0      | +$385 | **Lookback â‰¥ 2 made trail TIGHTER not looser** (older brick high is HIGHER for SHORT in down-streak). REVERTED. |
+| 7  | v6 2.6.0      | +$445 | Symmetric giveback at 50% fired during normal consolidations |
+| 8  | v6 2.6.1      | **+$1145** | Best ever. Trade #2 rode brick 8â†’30 = +$1180. Trade #1 âˆ’$35 from violent V-reversal brick (structural ~20pt cost of NinzaRenko 80-tick reversal bricks). |
+| 9  | v6 2.6.2      | +$430 | Profit-lock used tick-based peak vs body-based close â†’ killed trade #2 on a continuation brick |
+| 10 | v6 2.6.3      | +$645 | In-bar trail too aggressive (16pt fired mid-streak); both trades exited inside healthy R streaks |
+| 11 | v6 2.6.4 + 2.7 | TBD   | Stall-gate the in-bar trail + Early-Entry override against UNKNOWN/CHOP/HTF |
+
+### 25.2 v6 2.6 â€” Brick-Trail v2 (wick-immune, brick-close-based)
+
+Replaces the v6 2.3/2.5 price-tick trail. Three exit triggers in priority order:
+
+1. **Brick-flip exit** â€” first opposite-color brick closes while engaged â†’ market exit. Set in `ProcessPrimaryAsNinzaRenkoBar` via `pendingBrickFlipExit` flag.
+2. **Giveback safety** â€” peak profit eroded past `BrickTrailMaxGivebackPct` (default 0 = disabled) with min-peak (`BrickTrailGivebackMinPeakPts` = 20pt) and stall-gate (`BrickTrailGivebackStallSec` = 45s) guards.
+3. **Trail price** â€” INFORMATIONAL only (displayed/logged, no exit). Anchor uses brick BODY extremes (running min/max of `Math.Max/Min(open, close)` across the streak) â€” wick-immune.
+
+Critical fields: `streakMinBodyHigh`, `streakMaxBodyLow`, `pendingBrickFlipExit`, `lastSameColorBrickTime`. Reset on `nrBrickStreakCount == 1` (color flip).
+
+**Removed in 2.6.0:** `BrickTrailLookback` (older bricks made the trail tighter not looser â€” fundamental misunderstanding fixed).
+
+### 25.3 v6 2.6.2 â€” Brick-CLOSE Profit Lock (DEFAULT DISABLED in 2.6.3)
+
+Added 3 fields and 3 properties (Order 37/38) for a wick-immune profit lock at brick close. **Default disabled** (`BrickTrailProfitLockGivebackPct = 0`) after PB9 forensic showed it killed trade #2 on a continuation brick. Why: peak is tick-based (intra-bar wick) but profit-at-close is body-based â€” apples-vs-oranges. v6 2.6.3 added a SAME-COLOR GUARD: even if you re-enable, it now skips continuation bricks. Kept for future tinkering.
+
+### 25.4 v6 2.6.3 â€” In-Bar Tick Trail (the user-requested aggressive intra-bar exit)
+
+User feedback after PB8: *"if you make the trail a little bit more agressive within the bar you can keep the profits. If needed you can always re-enter the trade again for the same downtrend."*
+
+**Logic** (in `MonitorAdaptiveTrail`, after brick-flip check, before brick-trail engagement):
+- Once peak profit â‰¥ `InBarTrailMinPeakPts` (default 25), exit immediately if current tick price retreats from peak by `InBarTrailGivebackPts` (default 16 = one brick height).
+- Wick-vulnerable by design â€” accepts occasional false stops because we can re-enter on resumed trend.
+- Default ON (`InBarTrailEnabled`).
+
+**PB10 result:** killed both winners during continuation pullbacks (16pt giveback hit during normal mid-streak retracements). +$645 day. Required the 2.6.4 stall-gate fix.
+
+### 25.5 v6 2.6.4 â€” In-Bar Trail STALL-GATE (the fix)
+
+New property `InBarTrailStallSec` (Order 42, default **25**). The in-bar trail is now disarmed while same-color bricks keep printing â€” only fires after **25s of no same-direction brick close**. While the trend is alive, only brick-flip exit is active.
+
+**PB10 counterfactual with stall-gate:**
+- Trade #1 brick 21 R: bricks 14-21 came in <25s apart â†’ in-bar disarmed â†’ trade rides to brick-flip â†’ ~+$1100 vs +$275
+- Trade #2 brick 17 R: same dynamic â†’ ~+$1200 vs +$370
+
+### 25.6 v6 2.7 â€” Early-Entry-On-Flip (the late-entry fix)
+
+User feedback after every PB: *"Still few trades and no trades to upside. Still enter too late trades."* Forensic showed every entry firing at brick 8-13 of 22-30 brick runs because UNKNOWN-regime block requires `adxSlope â‰¥ 0` and ADX lags 5-8 bricks behind the actual flip.
+
+**Helper:** `IsEarlyFlipEntry(int direction)` returns true when ALL of:
+- `EnableEarlyEntryOnFlip` ON (default)
+- Brick color matches trade direction
+- Brick streak âˆˆ [`EarlyEntryMinStreak`, `EarlyEntryMaxStreak`] = [3, 6] default
+- `|(Close - VWAP) / ATR| â‰¥ EarlyEntryMinDistVwapAtr` (default 0.8) in trade direction
+
+**Bypass injection points** in `CanEnterTrade`:
+- CHOP filter â€” skipped if `earlyFlip` is true
+- UNKNOWN-regime block â€” skipped if `earlyFlip` is true
+- HTF block (computed inside `TryAutoEntry`) â€” skipped if `EarlyEntryAlsoBypassHtf=ON` (default) and per-direction `IsEarlyFlipEntry(Â±1)` is true. **This is the LONG override** for the missed afternoon 26-brick G run.
+
+**PB10 counterfactual on Trade #1:**
+- 09:54:43 brick 4 R, distVwapAtr â‰ˆ âˆ’1.0 â†’ would enter at ~27210 instead of brick 13 @ 27174.75
+- That's **+35pt earlier entry** = ~+$700 extra on top of the 2.6.4 trail fix
+
+### 25.7 New NinjaScriptProperty entries (Group "10 - Regime")
+
+| Order | Name | Default | Phase |
+|-------|------|---------|-------|
+| 37 | Brick-Trail Profit-Lock Min Peak (pts)        | 20.0 | 2.6.2 |
+| 38 | Brick-Trail Profit-Lock Giveback %            | **0** (disabled) | 2.6.2/3 |
+| 39 | In-Bar Tick Trail Enabled                     | **ON** | 2.6.3 |
+| 40 | In-Bar Tick Trail Min Peak (pts)              | 25.0 | 2.6.3 |
+| 41 | In-Bar Tick Trail Giveback (pts)              | 16.0 | 2.6.3 |
+| 42 | In-Bar Tick Trail Stall Sec                   | **25** | 2.6.4 |
+| 50 | Enable Early-Entry On Flip                    | **ON** | 2.7 |
+| 51 | Early-Entry Min Streak                        | 3    | 2.7 |
+| 52 | Early-Entry Max Streak                        | 6    | 2.7 |
+| 53 | Early-Entry Min \|Dist VWAP / ATR\|           | 0.8  | 2.7 |
+| 54 | Early-Entry Also Bypass HTF Bias              | **ON** | 2.7 |
+
+### 25.8 Defaults stack (current as of HEAD `47e0255`)
+
+For the test user / Day C playback, these are the recommended defaults already set in `SetDefaults`:
+
+```
+EnableRegimeClassifier         = OFF (ON for Day C)
+EnableBrickAnalytics           = OFF (ON for Day C)
+EnableSmartCooldown            = OFF
+EnableExtensionTrendBypass     = OFF
+EnableBrickTrail               = OFF (ON for Day C)
+BrickTrailMinStreak            = 4
+BrickTrailBufferTicks          = 4
+BrickTrailRequireTrendRegime   = ON
+BrickTrailMaxGivebackPct       = 0
+BrickTrailGivebackMinPeakPts   = 20.0
+BrickTrailGivebackStallSec     = 45
+BrickTrailProfitLockMinPeakPts = 20.0
+BrickTrailProfitLockGivebackPct = 0   â† disabled (use in-bar trail instead)
+InBarTrailEnabled              = ON
+InBarTrailMinPeakPts           = 25.0
+InBarTrailGivebackPts          = 16.0
+InBarTrailStallSec             = 25
+EnableEarlyEntryOnFlip         = ON
+EarlyEntryMinStreak            = 3
+EarlyEntryMaxStreak            = 6
+EarlyEntryMinDistVwapAtr       = 0.8
+EarlyEntryAlsoBypassHtf        = ON
+EnableUnknownRegimeBlock       = OFF (ON for Day C)
+UnknownBlockMinStreak          = 6
+UnknownBlockMinAdxSlope        = 0
+```
+
+### 25.9 Test plan â€” PB11_DAYC
+
+**Dataset:** 2026-04-28 (Day C playback). Save log as `MmATM_v6_DiagLog_20260428_Playback11_DAYC.csv` in `~/Documents/NinjaTrader 8/`.
+
+**Pass criteria:**
+1. â‰¥ 3 trades (vs 2 in PB10)
+2. At least one entry at brick streak 3-6 (vs 8-13 in PB8-10)
+3. â‰¥ 1 LONG entry in afternoon G run window (vs 0 historically)
+4. `BRICK_TRAIL_HIT reason=in_bar` rows include `stallSecâ‰¥25` (no premature kills)
+5. Day total **> $1000**, target **$2000-3000+**
+
+**Watch in diag log:**
+- New entries with NO `BLOCK_UNKNOWN_REGIME` immediately preceding â†’ Phase 2.7 worked
+- `BRICK_TRAIL_HIT reason=in_bar stallSec=NN` â†’ 2.6.4 stall-gate active
+- `EXIT_..._BrickTrail_Flip` more common than `_InBar` on big runs â†’ monster runs preserved
+- Trade #1 at ~brick 4 R (not brick 13) â†’ early-entry working
+
+### 25.10 Tuning levers if PB11 still off
+
+| Symptom | Lever | Direction |
+|---------|-------|-----------|
+| Few/late trades | `EarlyEntryMinDistVwapAtr` | drop to 0.5 |
+| Whipsaw early entries | `EarlyEntryMinStreak` | raise to 4 |
+| Trail kills monster runs again | `InBarTrailStallSec` | raise to 35 |
+| Trail too loose on V-reversals | `InBarTrailGivebackPts` | drop to 12 |
+| Late re-arm after V-reversal | `InBarTrailMinPeakPts` | drop to 20 |
+
+### 25.11 Commits
+
+| Hash | Tag | Description |
+|------|-----|-------------|
+| `382b026` | v6 2.6.0 | Brick-Trail v2 (wick-immune body-extreme anchor) |
+| `e53d15d` | v6 2.6.1 | Giveback default OFF + min-peak + stall-gate |
+| `858fcf7` | v6 2.6.2 | Brick-CLOSE Profit-Lock (initial) |
+| `0fd6acd` | v6 2.6.2 fix | Scope tickPt locally |
+| `587c0a0` | v6 2.6.3 | In-Bar Tick Trail + profit-lock disabled by default |
+| `47e0255` | v6 2.6.4 + 2.7 | Stall-gate + Early-Entry-On-Flip + HTF bypass |
+
+### 25.12 Deferred / queued
+
+- **Phase 2.8 â€” Re-Entry on Same Trend.** After in-bar exit, allow re-entry within 60s if same-color streak resumes. Pairs perfectly with aggressive in-bar trail.
+- **Day D** â€” SmartCooldown validation
+- **Day E** â€” ExtensionTrendBypass validation
+- **Multi-day robustness** â€” current stack is optimized for trend-from-open Day C. Need pure-chop and reversal-Tuesday days.
+- **Phase 2.9 (proposed) â€” Daily-Adapt.** Auto-tune brick-trail aggressiveness based on opening-hour realized vol.
+
+---
