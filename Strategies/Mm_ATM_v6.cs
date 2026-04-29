@@ -155,8 +155,14 @@ namespace NinjaTrader.NinjaScript.Strategies
         // and brick-trail is enabled. MonitorAdaptiveTrail consumes the flag and exits at market.
         private bool   pendingBrickFlipExit;
         // Max % of peak profit we'll allow to bleed before we exit anyway (catches stalls/wicks where
-        // bricks haven't flipped yet but the move is clearly dying). 0 = disabled. Default 50.
-        private int    brickTrailMaxGivebackPct = 50;
+        // bricks haven't flipped yet but the move is clearly dying). 0 = disabled (recommended). Default 0.
+        // ONLY fires once peak profit >= BrickTrailGivebackMinPeakPts (default 20pt) so small winners aren't
+        // whip-sawed by ordinary consolidations. STALL-GATE: only fires after no new same-color brick has
+        // closed for BrickTrailGivebackStallSec seconds (default 45) — so an active run is never interrupted.
+        private int      brickTrailMaxGivebackPct       = 0;
+        private double   brickTrailGivebackMinPeakPts   = 20.0;
+        private int      brickTrailGivebackStallSec     = 45;
+        private DateTime lastSameColorBrickTime         = DateTime.MinValue;
         // (v6 2.5 N-back lookback was REMOVED in 2.6 — the body-extreme anchor is monotonic by construction
         //  and exit is brick-close based, so an Nth-back anchor is no longer needed.)
         // Cache prior brick high/low so trail can ratchet one brick behind the just-closed brick.
@@ -773,7 +779,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                     brickTrailMinStreak           = 4;
                     brickTrailBufferTicks         = 4;
                     brickTrailRequireTrendRegime  = true;
-                    brickTrailMaxGivebackPct      = 50;
+                    brickTrailMaxGivebackPct      = 0;
+                    brickTrailGivebackMinPeakPts  = 20.0;
+                    brickTrailGivebackStallSec    = 45;
                     prevNrBrickHigh               = 0;
                     prevNrBrickLow                = 0;
                     // v6 2.4 — UNKNOWN regime block defaults (ACTIVE LOGIC, OFF by default).
@@ -1488,8 +1496,17 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 + " (info-only; exit on brick-flip or giveback>=" + brickTrailMaxGivebackPct + "%)");
                     }
                     brickTrailEngaged = true;
-                    // Trigger 2: giveback safety (only after we've banked >5pt of peak).
-                    if (brickTrailMaxGivebackPct > 0 && trailMaxProfitPts > 5.0
+                    // Trigger 2: giveback safety with TWO guards:
+                    //   (a) peak must already be >= BrickTrailGivebackMinPeakPts (default 20pt) so small
+                    //       winners are not whip-sawed by ordinary consolidations
+                    //   (b) STALL-GATE: must have gone >= BrickTrailGivebackStallSec since the last
+                    //       same-color brick closed (default 45s). If new same-color bricks are still
+                    //       printing, the run is alive - never interrupt it.
+                    bool stalled = lastSameColorBrickTime != DateTime.MinValue
+                        && (Time[0] - lastSameColorBrickTime).TotalSeconds >= brickTrailGivebackStallSec;
+                    if (brickTrailMaxGivebackPct > 0
+                        && trailMaxProfitPts >= brickTrailGivebackMinPeakPts
+                        && stalled
                         && profitPts < trailMaxProfitPts * (1.0 - brickTrailMaxGivebackPct / 100.0))
                     {
                         lastExitReason = "TRAIL_BrickTrail_Giveback";
@@ -1497,7 +1514,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                             WriteDiagRow("BRICK_TRAIL_HIT",
                                 "reason=giveback peak=" + trailMaxProfitPts.ToString("F1")
                                 + "pt cur=" + profitPts.ToString("F1") + "pt limit="
-                                + brickTrailMaxGivebackPct + "%");
+                                + brickTrailMaxGivebackPct + "% stallSec="
+                                + ((int)(Time[0] - lastSameColorBrickTime).TotalSeconds));
                         if (openTradeDirection == 1) ExitLong(); else if (openTradeDirection == -1) ExitShort();
                         pendingExit = true;
                         return;
@@ -3019,6 +3037,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             trailPrice = 0; trailActive = false; trailMaxProfitPts = 0; trailTierName = "";
             // v6 2.6 — clear brick-trail per-trade state on flat (anchor stays per-streak).
             pendingBrickFlipExit = false;
+            lastSameColorBrickTime = DateTime.MinValue;
             // Auto-clear Runner Mode when position goes flat — it's a per-trade opt-in.
             if (runnerModeActive_user)
             {
@@ -3805,6 +3824,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             double bodyLowPx  = Math.Min(bOpen, bClose);
             if (bodyHighPx < streakMinBodyHigh) streakMinBodyHigh = bodyHighPx;
             if (bodyLowPx  > streakMaxBodyLow)  streakMaxBodyLow  = bodyLowPx;
+            // v6 2.6.1 - timestamp every same-color brick close for the giveback STALL-GATE.
+            // While we hold a position, only "trade-direction-agreeing" closes refresh this stamp -
+            // so a long pause without same-direction bricks indicates a real stall.
+            if (openTradeDirection != 0
+                && ((openTradeDirection == -1 && color == "R") || (openTradeDirection == 1 && color == "G")))
+            {
+                lastSameColorBrickTime = Time[0];
+            }
             ninzaSeriesAdded = true;  // mark NR active so dashboard shows color, not "off"
             if (enableDiagLog)
                 WriteDiagRow("BRICK_CLOSE",
@@ -5723,8 +5750,18 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         [NinjaScriptProperty, Range(0, 100)]
         [Display(Name = "  Brick-Trail Max Giveback %", Order = 34, GroupName = "10 - Regime",
-            Description = "PHASE 2.6 — Brick-Trail v2 giveback safety. Default 50. Once brick-trail is engaged, if profit pulls back from peak by more than this percent, exit immediately. Catches stalls/wicks where bricks haven't flipped yet but the move is clearly dying. 0 = disabled (only brick-flip exit). Lower = lock more profit (more whipsaw on noisy runs). Higher = let runs breathe further (risk of giving back too much). NOTE: brick-trail v2 IGNORES price-tick wicks for exit — only opposite-color brick CLOSE or this giveback can exit a brick-trail position.")]
+            Description = "PHASE 2.6.1 — Brick-Trail v2 giveback safety. DEFAULT 0 (DISABLED — recommended for monster runs). When > 0, exits if profit pulls back from peak by this percent — but ONLY if BOTH guards pass: (a) peak >= BrickTrailGivebackMinPeakPts, (b) no new same-direction brick in last BrickTrailGivebackStallSec seconds. Set to 0 to rely purely on brick-flip exit (max ride = full color-streak). Try 60-70 if you see big runs that stall and reverse without flipping (rare). NOTE: brick-trail v2 IGNORES price-tick wicks for exit — only opposite-color brick CLOSE or this giveback can exit a brick-trail position.")]
         public int BrickTrailMaxGivebackPct { get { return brickTrailMaxGivebackPct; } set { brickTrailMaxGivebackPct = value; } }
+
+        [NinjaScriptProperty, Range(5, 100)]
+        [Display(Name = "  Brick-Trail Giveback Min Peak (pts)", Order = 35, GroupName = "10 - Regime",
+            Description = "Giveback safety only fires after peak profit reaches this many points. Default 20. Prevents whip-sawing small winners on ordinary 5-10pt consolidations. Only used when BrickTrailMaxGivebackPct > 0.")]
+        public double BrickTrailGivebackMinPeakPts { get { return brickTrailGivebackMinPeakPts; } set { brickTrailGivebackMinPeakPts = value; } }
+
+        [NinjaScriptProperty, Range(10, 600)]
+        [Display(Name = "  Brick-Trail Giveback Stall Sec", Order = 36, GroupName = "10 - Regime",
+            Description = "Giveback safety STALL-GATE — only fires after this many seconds since the last same-direction brick closed. Default 45. While new same-color bricks are still printing, the run is alive and giveback is suppressed. Only used when BrickTrailMaxGivebackPct > 0.")]
+        public int BrickTrailGivebackStallSec { get { return brickTrailGivebackStallSec; } set { brickTrailGivebackStallSec = value; } }
 
         // ===== v6 2.4 — UNKNOWN-Regime Auto-Block (prevents low-conviction losses, ACTIVE LOGIC) =====
         [NinjaScriptProperty]
