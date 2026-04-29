@@ -150,6 +150,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         // the rest of the trade so the aggressive ATR trail can lock profit. Set OFF to keep
         // BrickMode's wide trail even after user presses TRL NOW (rarely useful).
         private bool   trlNowOverridesBrick = true;
+        // v6 2.7.5 - Tightness % of brick size used for BrickMode in-brick trail and in-bar giveback.
+        // Default 50 = half-brick. With renkoBrickSize=64 (16pt) -> trail rides 8pt behind close,
+        // in-bar giveback fires at 8pt retrace from peak. Lower (30) = tighter (more scratches on
+        // wicks). Higher (75) = wider (more giveback before exit). 100 = full-brick (legacy 16pt).
+        private double brickTrailTightnessPct = 50.0;
         private int    brickTrailMinStreak = 4;     // require >= N same-color bricks before brick-trail engages
         private double brickTrailBufferTicks = 4;   // ticks above prev-brick-high (SHORT) / below low (LONG)
         private bool   brickTrailRequireTrendRegime = true; // require regime=TREND_DN (SHORT) / TREND_UP (LONG)
@@ -834,6 +839,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     enableBrickTrail              = false;
                     brickModeAutoOnly             = true;
                     trlNowOverridesBrick          = true;
+                    brickTrailTightnessPct        = 50.0;
                     brickTrailMinStreak           = 4;
                     brickTrailBufferTicks         = 4;
                     brickTrailRequireTrendRegime  = true;
@@ -1559,19 +1565,26 @@ namespace NinjaTrader.NinjaScript.Strategies
             // v6 2.6.4 - STALL-GATE: only arm when no same-color brick in last InBarTrailStallSec.
             // While the trend is still printing same-color bricks the run is alive - never interrupt.
             // v6 2.7.1 - fires in BRICK-MODE (not just BrickTrail tier) so early entries are protected.
+            // v6 2.7.5 - giveback now derived from brick size & tightness % (default 50% = half-brick).
+            //   With 64-tk bricks: 16pt brick * 50% = 8pt giveback (was fixed 16pt).
+            //   Falls back to inBarTrailGivebackPts if brick size unknown / tightness <= 0.
+            double brickPts = renkoBrickSize > 0 ? renkoBrickSize / (double)NQ_TICKS_PER_POINT : 0;
+            double effGiveback = (brickPts > 0 && brickTrailTightnessPct > 0)
+                ? brickPts * brickTrailTightnessPct / 100.0
+                : inBarTrailGivebackPts;
             bool inBarStalled = lastSameColorBrickTime != DateTime.MinValue
                 && (Time[0] - lastSameColorBrickTime).TotalSeconds >= inBarTrailStallSec;
             if (inBarTrailEnabled && brickModeActive
                 && inBarStalled
                 && trailMaxProfitPts >= inBarTrailMinPeakPts
-                && profitPts < trailMaxProfitPts - inBarTrailGivebackPts)
+                && profitPts < trailMaxProfitPts - effGiveback)
             {
                 lastExitReason = "TRAIL_BrickTrail_InBar";
                 if (enableDiagLog)
                     WriteDiagRow("BRICK_TRAIL_HIT",
                         "reason=in_bar peak=" + trailMaxProfitPts.ToString("F1")
                         + "pt cur=" + profitPts.ToString("F1")
-                        + "pt giveback=" + inBarTrailGivebackPts.ToString("F1")
+                        + "pt giveback=" + effGiveback.ToString("F1")
                         + "pt stallSec=" + ((int)(Time[0] - lastSameColorBrickTime).TotalSeconds)
                         + " px=" + price.ToString("F2"));
                 if (openTradeDirection == 1) ExitLong(); else if (openTradeDirection == -1) ExitShort();
@@ -1584,14 +1597,34 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 // v6 2.7.3 - VISIBILITY FIX: compute and ratchet a trailPrice from the streak body
                 // anchors so the dashboard / diag log show a meaningful trail (was 0.00 before).
-                // This is INFORMATIONAL ONLY - actual exits are still brick-flip + in-bar trail.
+                // v6 2.7.5 - HALF-BRICK TIGHT TRAIL: take the TIGHTER of (legacy body-anchor, half-
+                // brick from current close). Brick body anchor protects against wick stop-runs;
+                // half-brick anchor locks profit when price runs many bricks ahead of last body.
+                // Result: trail rides ~8pt behind price (with 64-tk bricks) instead of 30+pt.
                 if (streakMinBodyHigh < double.MaxValue && streakMaxBodyLow > double.MinValue)
                 {
                     double bufPt = brickTrailBufferTicks * TickSize;
                     double anchorPx = openTradeDirection == -1 ? streakMinBodyHigh : streakMaxBodyLow;
-                    double btPrice = openTradeDirection == -1
+                    double bodyTrail = openTradeDirection == -1
                         ? Math.Round((anchorPx + bufPt) / TickSize) * TickSize
                         : Math.Round((anchorPx - bufPt) / TickSize) * TickSize;
+                    // Half-brick (or tightnessPct of brick) candidate from CURRENT close.
+                    double brickPts2 = renkoBrickSize > 0 ? renkoBrickSize / (double)NQ_TICKS_PER_POINT : 0;
+                    double tightOff = (brickPts2 > 0 && brickTrailTightnessPct > 0)
+                        ? brickPts2 * brickTrailTightnessPct / 100.0
+                        : 0;
+                    double tightTrail = bodyTrail; // fallback if disabled
+                    if (tightOff > 0)
+                    {
+                        double tickPt2 = TickSize * NQ_TICKS_PER_POINT;
+                        tightTrail = openTradeDirection == 1
+                            ? Math.Round((price - tightOff * tickPt2) / TickSize) * TickSize
+                            : Math.Round((price + tightOff * tickPt2) / TickSize) * TickSize;
+                    }
+                    // Pick the TIGHTER (closer to price) of body vs tight.
+                    double btPrice = openTradeDirection == 1
+                        ? Math.Max(bodyTrail, tightTrail)
+                        : Math.Min(bodyTrail, tightTrail);
                     bool first = !trailActive || trailPrice <= 0;
                     if (first
                         || (openTradeDirection == -1 && btPrice < trailPrice)
@@ -5972,6 +6005,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "  TRL NOW overrides BrickMode", Order = 30, GroupName = "10 - Regime",
             Description = "PHASE 2.7.4 — When ON (default), pressing TRL NOW (or nudging trail SL) on an AUTO trade BYPASSES BrickMode for the rest of that trade so the legacy aggressive ATR trail can lock profit at the user-chosen distance. Without this, BrickMode would keep overriding the manual lock with its wide brick-anchor trail. Cleared automatically when position goes flat.")]
         public bool TrlNowOverridesBrick { get { return trlNowOverridesBrick; } set { trlNowOverridesBrick = value; } }
+
+        [NinjaScriptProperty, Range(20.0, 100.0)]
+        [Display(Name = "  BrickTrail Tightness %", Order = 30, GroupName = "10 - Regime",
+            Description = "PHASE 2.7.5 — % of brick size used for BrickMode trail distance and in-bar giveback. Default 50 = HALF-BRICK. With 64-tick (16pt) bricks: trail rides 8pt behind close, in-bar exit fires at 8pt retrace from peak (was fixed 16pt = full brick). Lower (30) = tighter, more wick scratches. Higher (75) = wider, more giveback. 100 = full-brick (legacy). Trail picks the TIGHTER of body-anchor vs half-brick-from-close so wick immunity is preserved.")]
+        public double BrickTrailTightnessPct { get { return brickTrailTightnessPct; } set { brickTrailTightnessPct = value; } }
 
         [NinjaScriptProperty, Range(2, 20)]
         [Display(Name = "  Brick-Trail Min Streak", Order = 31, GroupName = "10 - Regime",
