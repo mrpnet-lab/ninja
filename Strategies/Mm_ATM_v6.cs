@@ -166,8 +166,21 @@ namespace NinjaTrader.NinjaScript.Strategies
         // v6 2.6.2 - PROFIT-LOCK at brick close (catches violent V-reversal bricks that finish past breakeven).
         // Independent of giveback (which is tick-based / time-gated). Profit-lock fires at the SAME bar a
         // big reversal brick closes, so a single 20pt+ reversal brick can't wipe a 30pt+ peak winner.
+        // v6 2.6.3 - DISABLED BY DEFAULT (giveback% = 0). Was killing monster runs on continuation bricks
+        // due to peak being tick-based and profit-at-close being body-based (apples-vs-oranges). The
+        // intended use case (V-reversal) is already covered by brick-flip exit. In-bar tick trail (below)
+        // is the better tool for catching V-reversals BEFORE the opposite brick closes.
         private double   brickTrailProfitLockMinPeakPts    = 20.0;
-        private int      brickTrailProfitLockGivebackPct   = 35;
+        private int      brickTrailProfitLockGivebackPct   = 0;
+        // v6 2.6.3 - IN-BAR TICK TRAIL (the user-requested aggressive mid-brick trail).
+        // Once peak profit reaches MinPeakPts, exit immediately if intra-bar tick price retreats from
+        // peak by GivebackPts. WICK-VULNERABLE by design - acceptable because we can re-enter on the
+        // same trend if it resumes. Default GivebackPts=16 (one brick height) is wide enough to ignore
+        // normal continuation-brick wicks but will catch any genuine V-reversal long before the opposite
+        // brick closes (which has a structural ~20pt cost from the NinzaRenko 16-tick offset).
+        private bool     inBarTrailEnabled                  = true;
+        private double   inBarTrailMinPeakPts               = 25.0;
+        private double   inBarTrailGivebackPts              = 16.0;
         // (v6 2.5 N-back lookback was REMOVED in 2.6 — the body-extreme anchor is monotonic by construction
         //  and exit is brick-close based, so an Nth-back anchor is no longer needed.)
         // Cache prior brick high/low so trail can ratchet one brick behind the just-closed brick.
@@ -788,7 +801,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                     brickTrailGivebackMinPeakPts  = 20.0;
                     brickTrailGivebackStallSec    = 45;
                     brickTrailProfitLockMinPeakPts  = 20.0;
-                    brickTrailProfitLockGivebackPct = 35;
+                    brickTrailProfitLockGivebackPct = 0;
+                    inBarTrailEnabled               = true;
+                    inBarTrailMinPeakPts            = 25.0;
+                    inBarTrailGivebackPts           = 16.0;
                     prevNrBrickHigh               = 0;
                     prevNrBrickLow                = 0;
                     // v6 2.4 — UNKNOWN regime block defaults (ACTIVE LOGIC, OFF by default).
@@ -1463,6 +1479,26 @@ namespace NinjaTrader.NinjaScript.Strategies
                         "reason=brick_flip color=" + lastNrBrickColor + " streak=" + nrBrickStreakCount
                         + " px=" + price.ToString("F2") + " profit=" + profitPts.ToString("F1") + "pt"
                         + " peak=" + trailMaxProfitPts.ToString("F1") + "pt");
+                if (openTradeDirection == 1) ExitLong(); else if (openTradeDirection == -1) ExitShort();
+                pendingExit = true;
+                return;
+            }
+            // v6 2.6.3 - IN-BAR TICK TRAIL (aggressive mid-brick exit on intra-bar retracement).
+            // Fires whenever brick-trail tier is engaged AND we already had a meaningful peak. Uses
+            // current tick price (not brick close) so it can catch V-reversals BEFORE the opposite
+            // brick closes - which is the structural ~20pt giveback weakness of brick-flip exit.
+            // Default giveback (16pt) is wide enough that normal continuation-brick wicks won't trip it.
+            if (inBarTrailEnabled && enableBrickTrail && trailTierName == "BrickTrail"
+                && trailMaxProfitPts >= inBarTrailMinPeakPts
+                && profitPts < trailMaxProfitPts - inBarTrailGivebackPts)
+            {
+                lastExitReason = "TRAIL_BrickTrail_InBar";
+                if (enableDiagLog)
+                    WriteDiagRow("BRICK_TRAIL_HIT",
+                        "reason=in_bar peak=" + trailMaxProfitPts.ToString("F1")
+                        + "pt cur=" + profitPts.ToString("F1")
+                        + "pt giveback=" + inBarTrailGivebackPts.ToString("F1")
+                        + "pt px=" + price.ToString("F2"));
                 if (openTradeDirection == 1) ExitLong(); else if (openTradeDirection == -1) ExitShort();
                 pendingExit = true;
                 return;
@@ -3844,8 +3880,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             // past the giveback threshold, mark for exit. Uses the brick CLOSE price (not wick) so
             // MM intra-brick spikes can't trigger it. Catches the case where a single big reversal
             // brick wipes out most of the run BEFORE brick-flip exit fires (e.g. PB8 trade #1).
+            // v6 2.6.3 - SAME-COLOR GUARD: never fire on a continuation brick (same color as our
+            // position) - peak is tick-based but profitAtClose is body-based, mismatch was killing
+            // monster runs (PB9 trade #2 exited at brick 11 R during a 22-brick down-run).
+            bool isOppositeBrick = (openTradeDirection == -1 && color == "G")
+                                || (openTradeDirection ==  1 && color == "R");
             if (openTradeDirection != 0 && enableBrickTrail && trailTierName == "BrickTrail"
                 && brickTrailProfitLockGivebackPct > 0
+                && isOppositeBrick
                 && trailMaxProfitPts >= brickTrailProfitLockMinPeakPts)
             {
                 double tickPtPL = TickSize * NQ_TICKS_PER_POINT;
@@ -5801,8 +5843,23 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         [NinjaScriptProperty, Range(0, 80)]
         [Display(Name = "  Brick-Trail Profit-Lock Giveback %", Order = 38, GroupName = "10 - Regime",
-            Description = "PHASE 2.6.2 — % of peak profit allowed to bleed at BRICK CLOSE before exiting. Default 35. Catches violent V-reversal bricks that wipe most of the run in a single 20pt+ reversal brick (e.g. PB8 trade #1: peak +31.75pt then G-flip brick erased it before brick-flip exit could fire). Lower (e.g. 25) = lock more profit, more whipsaw on noisy trends. Higher (e.g. 50) = let runs breathe more, risk giving back more on V-reversals. 0 = disabled (only brick-flip exit). Wick-immune (uses brick CLOSE price, not tick).")]
+            Description = "PHASE 2.6.2 — % of peak profit allowed to bleed at BRICK CLOSE before exiting. Default 0 = DISABLED (v6 2.6.3 disabled by default; was killing monster runs because peak is tick-based and brick-close profit is body-based — mismatch caused premature exits on continuation bricks). The intended V-reversal use case is now better handled by In-Bar Trail (Order 39+). Wick-immune (uses brick CLOSE price, not tick).")]
         public int BrickTrailProfitLockGivebackPct { get { return brickTrailProfitLockGivebackPct; } set { brickTrailProfitLockGivebackPct = value; } }
+
+        [NinjaScriptProperty]
+        [Display(Name = "  In-Bar Tick Trail Enabled", Order = 39, GroupName = "10 - Regime",
+            Description = "PHASE 2.6.3 — Aggressive intra-bar tick trail. Once peak profit reaches MinPeakPts, exit immediately if current tick price retreats from peak by GivebackPts. Wick-vulnerable by design — accepts occasional false stops (re-entry on resumed trend handles that). Catches V-reversals BEFORE the opposite brick closes — fixes the structural ~20pt giveback weakness of brick-flip exit. Default ON.")]
+        public bool InBarTrailEnabled { get { return inBarTrailEnabled; } set { inBarTrailEnabled = value; } }
+
+        [NinjaScriptProperty, Range(5, 100)]
+        [Display(Name = "  In-Bar Tick Trail Min Peak (pts)", Order = 40, GroupName = "10 - Regime",
+            Description = "PHASE 2.6.3 — Minimum peak profit (pts) before in-bar trail arms. Default 25. Below this, only brick-flip exit is active (run is still 'fresh', no profit to protect aggressively).")]
+        public double InBarTrailMinPeakPts { get { return inBarTrailMinPeakPts; } set { inBarTrailMinPeakPts = value; } }
+
+        [NinjaScriptProperty, Range(4, 40)]
+        [Display(Name = "  In-Bar Tick Trail Giveback (pts)", Order = 41, GroupName = "10 - Regime",
+            Description = "PHASE 2.6.3 — Max points price can retrace from peak before in-bar exit fires. Default 16 (one brick height) — wide enough to ignore normal continuation-brick wicks, tight enough to save 12+pt vs brick-flip on V-reversals. Lower (8-12) = more aggressive, more whipsaw. Higher (20-25) = looser, more like brick-flip.")]
+        public double InBarTrailGivebackPts { get { return inBarTrailGivebackPts; } set { inBarTrailGivebackPts = value; } }
 
         // ===== v6 2.4 — UNKNOWN-Regime Auto-Block (prevents low-conviction losses, ACTIVE LOGIC) =====
         [NinjaScriptProperty]
