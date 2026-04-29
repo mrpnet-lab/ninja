@@ -191,10 +191,16 @@ namespace NinjaTrader.NinjaScript.Strategies
         // catches the start of monster runs that current 'wait for ADX confirmation' logic misses.
         // PB8/9/10 forensic: every trade entered brick 8-13 of 22-30 brick runs, missing 30-50pt of
         // initial move. With this override, would have entered brick 3-4 instead.
+        // v6 2.7.2 - TRAP-AWARE: added MaxDistVwapAtr (extension cap) and MaxRunFavPts (run-already-
+        // moved cap) to block early-entry when MM-trap signature is present. ConfRelief lowers the
+        // signal threshold for fresh flips so brick-confirmed reversals can trade with lower bull/bear.
         private bool     enableEarlyEntryOnFlip             = true;
         private int      earlyEntryMinStreak                = 3;
         private int      earlyEntryMaxStreak                = 6;
         private double   earlyEntryMinDistVwapAtr           = 0.8;
+        private double   earlyEntryMaxDistVwapAtr           = 3.0;
+        private double   earlyEntryMaxRunFavPts             = 25.0;
+        private double   earlyEntryConfRelief               = 15.0;
         private bool     earlyEntryAlsoBypassHtf            = true;
         // (v6 2.5 N-back lookback was REMOVED in 2.6 — the body-extreme anchor is monotonic by construction
         //  and exit is brick-close based, so an Nth-back anchor is no longer needed.)
@@ -825,6 +831,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                     earlyEntryMinStreak             = 3;
                     earlyEntryMaxStreak             = 6;
                     earlyEntryMinDistVwapAtr        = 0.8;
+                    earlyEntryMaxDistVwapAtr        = 3.0;
+                    earlyEntryMaxRunFavPts          = 25.0;
+                    earlyEntryConfRelief            = 15.0;
                     earlyEntryAlsoBypassHtf         = true;
                     prevNrBrickHigh               = 0;
                     prevNrBrickLow                = 0;
@@ -2263,8 +2272,18 @@ namespace NinjaTrader.NinjaScript.Strategies
             double atr = indAtr != null && indAtr.IsValidDataPoint(0) ? indAtr[0] : 0;
             if (atr <= 0 || vwapValue <= 0) return false;
             double distVwapAtr = (Close[0] - vwapValue) / atr;
-            if (direction == 1  && distVwapAtr <  earlyEntryMinDistVwapAtr) return false;
-            if (direction == -1 && distVwapAtr > -earlyEntryMinDistVwapAtr) return false;
+            double absDist = Math.Abs(distVwapAtr);
+            // v6 2.7.2 - ABSOLUTE VWAP gate (replaces directional). Catches mean-revert reversals
+            // (e.g. 04-28 13:27 G run started below VWAP and ran +88pt). Min ensures the move is
+            // real (not noise near VWAP); Max blocks extension chases (PB12 trade #5 distVwap=-4.5
+            // ATR was -$400 trap).
+            if (absDist < earlyEntryMinDistVwapAtr) return false;
+            if (absDist > earlyEntryMaxDistVwapAtr) return false;
+            // v6 2.7.2 - RUN-ALREADY-MOVED cap. If the current brick streak has already run more
+            // than MaxRunFavPts from its starting price, we're not catching the start - we're
+            // chasing exhaustion. PB12 trade #3 LONG @ brick 3 G entered after the run had already
+            // moved +35pt = -$385 trap.
+            if (runMaxFavPts > earlyEntryMaxRunFavPts) return false;
             return true;
         }
 
@@ -2523,6 +2542,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             bool sweepBear = liquiditySweepBoostEnabled && IsLiquiditySweepBear();
             double effMinL = sweepBull ? Math.Max(35.0, effMin - liquiditySweepConfBoost) : effMin;
             double effMinS = sweepBear ? Math.Max(35.0, effMin - liquiditySweepConfBoost) : effMin;
+            // v6 2.7.2 - CONFIDENCE RELIEF for fresh brick flips. When IsEarlyFlipEntry passes,
+            // brick-chart has already confirmed direction so we don't need full bull/bear conviction.
+            // Catches valid runs that current effMin=55 misses (e.g. PB12 13:27 G run had bull=47.5).
+            bool earlyL = enableEarlyEntryOnFlip && IsEarlyFlipEntry(1);
+            bool earlyS = enableEarlyEntryOnFlip && IsEarlyFlipEntry(-1);
+            if (earlyL) effMinL = Math.Max(35.0, effMinL - earlyEntryConfRelief);
+            if (earlyS) effMinS = Math.Max(35.0, effMinS - earlyEntryConfRelief);
             if (sweepBull) overLong  = false;
             if (sweepBear) overShort = false;
             if ((sweepBull || sweepBear) && enableDiagLog)
@@ -5968,8 +5994,23 @@ namespace NinjaTrader.NinjaScript.Strategies
             Description = "PHASE 2.7 — Minimum |(Close-VWAP) / ATR| in trade direction for override. Default 0.8 — confirms a real impulsive move (not chop near VWAP).")]
         public double EarlyEntryMinDistVwapAtr { get { return earlyEntryMinDistVwapAtr; } set { earlyEntryMinDistVwapAtr = value; } }
 
+        [NinjaScriptProperty, Range(1.5, 6.0)]
+        [Display(Name = "  Early-Entry Max |Dist VWAP / ATR|", Order = 54, GroupName = "10 - Regime",
+            Description = "PHASE 2.7.2 — TRAP FILTER. Blocks early-entry when |(Close-VWAP) / ATR| exceeds this — the move is already extended and MM mean-reversion is likely. Default 3.0. PB12 trade #5 distVwap=-4.5 ATR was a -$400 trap; with this cap, blocked. Lower (2.0) = stricter, miss more chases. Higher (4.0) = looser, take more late entries.")]
+        public double EarlyEntryMaxDistVwapAtr { get { return earlyEntryMaxDistVwapAtr; } set { earlyEntryMaxDistVwapAtr = value; } }
+
+        [NinjaScriptProperty, Range(10.0, 60.0)]
+        [Display(Name = "  Early-Entry Max Run-Fav (pts)", Order = 55, GroupName = "10 - Regime",
+            Description = "PHASE 2.7.2 — TRAP FILTER. Blocks early-entry when current brick streak has already moved more than this many points from its start (runMaxFavPts). Catches 'late despite fresh streak count' traps where the move is already exhausted (PB12 trade #3 LONG @ brick 3 G entered after run had already moved +35pt = -$385 trap). Default 25. Lower (15) = only catch true brick-1-2 starts. Higher (40) = allow more pullback entries.")]
+        public double EarlyEntryMaxRunFavPts { get { return earlyEntryMaxRunFavPts; } set { earlyEntryMaxRunFavPts = value; } }
+
+        [NinjaScriptProperty, Range(0.0, 30.0)]
+        [Display(Name = "  Early-Entry Conf Relief (pts)", Order = 56, GroupName = "10 - Regime",
+            Description = "PHASE 2.7.2 — When IsEarlyFlipEntry passes, drop signal effMin by this many points. Default 15. Brick-chart has already confirmed direction so we don't need full bull/bear conviction (typical effMin=55 → effMin=40 for fresh flips). Catches valid runs current logic misses (PB12 13:27 G run had bull=47.5, blocked at 55). Floor 35.")]
+        public double EarlyEntryConfRelief { get { return earlyEntryConfRelief; } set { earlyEntryConfRelief = value; } }
+
         [NinjaScriptProperty]
-        [Display(Name = "  Early-Entry Also Bypass HTF Bias", Order = 54, GroupName = "10 - Regime",
+        [Display(Name = "  Early-Entry Also Bypass HTF Bias", Order = 57, GroupName = "10 - Regime",
             Description = "PHASE 2.7 — When ON, the Early-Entry override also bypasses the HTF (higher-timeframe) bias block. Catches afternoon trend-flip days (e.g. 04-28: 26-brick afternoon G run with 0 LONGs because htfBias was still -1). Default ON.")]
         public bool EarlyEntryAlsoBypassHtf { get { return earlyEntryAlsoBypassHtf; } set { earlyEntryAlsoBypassHtf = value; } }
 
