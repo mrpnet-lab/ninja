@@ -134,7 +134,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         // missed. Brick-trail solves it: trail price = previous closed brick's far extreme + buffer.
         // Each new same-direction brick ratchets the trail one brick at a time. First opposite-color
         // brick that prints will pierce the trail instantly = clean exit on actual reversal signal.
-        private bool   enableBrickTrail;            // master toggle, default OFF
+        private bool   enableBrickTrail = true;     // v6 2.10 - master ON (was OFF). Drives the entire intelligent brick exit suite.
         // v6 2.7.3 - When ON (default), BrickMode (and brick-flip exit + in-bar trail) only apply to
         // AUTO-opened trades. Manual trades keep the legacy ATR/tier trail visualization the user
         // expects. Set OFF to apply BrickMode universally (e.g. backtesting brick exits on manual fills).
@@ -168,6 +168,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         // the trail breathe.
         private double brickTrailPriceStopMinRetracePts = 5.0;
         private int    brickTrailMinStreak = 4;     // require >= N same-color bricks before brick-trail engages
+        // v6 2.10 - field-init also flipped ON (matches SetDefaults). Master switch for the
+        // entire intelligent brick exit suite (BrickTrail + InBar + PxStop + Flip-grace + Re-Entry).
         private double brickTrailBufferTicks = 4;   // ticks above prev-brick-high (SHORT) / below low (LONG)
         private bool   brickTrailRequireTrendRegime = true; // require regime=TREND_DN (SHORT) / TREND_UP (LONG)
         // v6 2.6 — Brick-Trail v2: brick-close-based exit (wick-immune) + body-extreme anchor.
@@ -841,7 +843,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     // Display
                     showVwap = true;
                     showEma  = true;
-                    enableDiagLog = false;
+                    enableDiagLog = true;   // v6 2.10 - default ON (essential for tuning + post-trade analysis)
                     // Renko 64/16 plumbing (Phase 0.2). Wired but not yet read by entry/exit logic.
                     enableRenkoSeries = true;
                     renkoBrickSize    = 64;
@@ -856,14 +858,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                     lastNrBrickColor  = "";
                     nrBrickStreakCount = 0;
                     lastProcessedNrBar = -1;
-                    // v6 1.1 — F1 Regime Classifier defaults (label-only, OFF by default).
-                    enableRegimeClassifier = false;
+                    // v6 1.1 — F1 Regime Classifier defaults (v6 2.10: ON by default — feeds BrickTrail + adaptive logic).
+                    enableRegimeClassifier = true;
                     currentRegime          = "UNKNOWN";
                     prevRegime             = "UNKNOWN";
                     regimeChangedBar       = 0;
                     regimeFlipsLast20      = 0;
                     // v6 1.2-1.4 — Brick analytics (run tracker, wick, MM pattern) defaults
-                    enableBrickAnalytics   = false;   // OFF by default — turn ON to collect data
+                    enableBrickAnalytics   = true;    // v6 2.10 - default ON (RUN_END/WICK_TAG/MM_PATTERN diag rows for analysis)
                     runCurrentLen          = 0;
                     runCurrentColor        = "";
                     runMaxFavPts           = 0;
@@ -871,8 +873,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                     lastBrickIntervalSec   = 0;
                     fastBricksLast10       = 0;
                     lastAdxSlope               = 0;
-                    // v6 2.3 — Brick-Trail Mode defaults (ACTIVE LOGIC, OFF by default).
-                    enableBrickTrail              = false;
+                    // v6 2.3 — Brick-Trail Mode defaults (ACTIVE LOGIC, ON by default).
+                    // v6 2.10: master ON — the entire v6 2.6/2.7/2.8/2.9 intelligent brick exit
+                    // suite (PxStop / Flip-grace / In-Bar / Brick Re-Entry / Adaptive Retrace)
+                    // depends on this single switch. Validated profitable across Days 28-29.
+                    enableBrickTrail              = true;
                     brickModeAutoOnly             = true;
                     trlNowOverridesBrick          = true;
                     brickTrailTightnessPct        = 50.0;
@@ -6103,7 +6108,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         // ===== v6 2.3 — Brick-Trail Mode (lets monster runs run, ACTIVE LOGIC) =====
         [NinjaScriptProperty]
         [Display(Name = "Enable Brick-Trail Mode", Order = 30, GroupName = "10 - Regime",
-            Description = "PHASE 2.3 — ACTIVE LOGIC. Default OFF. When ON and ALL of (1) brick color agrees with trade dir, (2) brick streak >= BrickTrailMinStreak, (3) regime is TREND matching dir (if BrickTrailRequireTrendRegime=ON), (4) trade is in profit beyond activation — the trail is anchored to the previous CLOSED brick's far extreme + buffer ticks. Each new same-direction brick ratchets the trail one brick. First opposite-color brick pierces the trail = clean exit on actual reversal (not a wick). VALIDATED on 2026-04-28 WIN#2: legacy trail exited at +$400 (brick #15) but run continued to brick #30 with maxFav=132pt = ~$2640 missed. Brick-trail would have ridden the full move. REQUIRES EnableRegimeClassifier=ON. Watch for BRICK_TRAIL_ARMED + BRICK_TRAIL_HIT diag rows. DO NOT enable in chop — it gives back more on reversals.")]
+            Description = "PHASE 2.10 - DEFAULT ON. MASTER SWITCH for the entire intelligent brick exit suite (BrickTrail body-anchor trail, BrickFlip exit, In-Bar trail, PxStop, Flip-Grace window, Brick Re-Entry, Adaptive Retrace). Lets monster runs run on real trends and exits cleanly on first confirmed reversal. Requires EnableRegimeClassifier=ON. If you turn this OFF you fall back to legacy ATR-tier trail and lose ALL v6 2.6/2.7/2.8/2.9 logic.")]
         public bool EnableBrickTrail { get { return enableBrickTrail; } set { enableBrickTrail = value; } }
 
         [NinjaScriptProperty]
