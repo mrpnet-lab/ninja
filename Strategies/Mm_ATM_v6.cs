@@ -248,6 +248,17 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool enableUnknownRegimeBlock;       // default OFF
         private int  unknownBlockMinStreak = 6;      // require streak >= N to enter in UNKNOWN
         private double unknownBlockMinAdxSlope = 0;  // require ADX slope >= this to enter in UNKNOWN
+        // v6 2.7.9 - FRESH-REVERSAL BYPASS for UNKNOWN block. Reason: when a real reversal
+        // starts, ADX is decaying from the prior trend (slope NEGATIVE) for the first 5-10 new
+        // bricks. The default adxSlope>=0 rule rejects exactly this pattern, forcing entries
+        // 25-40pt late (validated by 2026-04-28 R7/R8/R9 blocks before R10 finally fired).
+        // Bypass triggers when: brick agrees + new streak >= bypass-min + previously-ended
+        // OPPOSITE-color run was at least PriorRunMin bricks (proves a real reversal vs random flip).
+        private bool   freshReversalBypassEnabled    = true;
+        private int    freshReversalBypassStreakMin  = 4;
+        private int    freshReversalBypassPriorRunMin = 5;
+        private int    lastEndedRunLen               = 0;
+        private string lastEndedRunColor             = "";
         // Run tracker (live counters):
         private int    runCurrentLen;             // = nrBrickStreakCount but kept independent in case
         private string runCurrentColor = "";      // "G"/"R"
@@ -2473,13 +2484,32 @@ namespace NinjaTrader.NinjaScript.Strategies
                 bool adxOk       = lastAdxSlope >= unknownBlockMinAdxSlope;
                 if (!brickAgrees || !streakOk || !adxOk)
                 {
-                    UpdateDashboardStatus(label + " blocked: UNKNOWN regime", Brushes.Orange);
-                    if (enableDiagLog) WriteDiagRow("BLOCK_UNKNOWN_REGIME",
+                    // v6 2.7.9 - FRESH-REVERSAL BYPASS: real reversals start with ADX decaying
+                    // (negative slope) from the prior trend. Allow entry when (a) brick agrees,
+                    // (b) new streak >= bypass-min, (c) prior OPPOSITE-color run was substantial.
+                    string oppColor = (direction == 1) ? "R" : "G";
+                    bool freshBypass = freshReversalBypassEnabled
+                        && brickAgrees
+                        && nrBrickStreakCount >= freshReversalBypassStreakMin
+                        && lastEndedRunColor == oppColor
+                        && lastEndedRunLen   >= freshReversalBypassPriorRunMin;
+                    if (!freshBypass)
+                    {
+                        UpdateDashboardStatus(label + " blocked: UNKNOWN regime", Brushes.Orange);
+                        if (enableDiagLog) WriteDiagRow("BLOCK_UNKNOWN_REGIME",
+                            "dir=" + direction + " brick=" + lastNrBrickColor + "x" + nrBrickStreakCount
+                            + " adxSlope=" + lastAdxSlope.ToString("F2")
+                            + " priorOppRun=" + lastEndedRunColor + "x" + lastEndedRunLen
+                            + " need brick=" + (direction == 1 ? "G" : "R") + " streak>=" + unknownBlockMinStreak
+                            + " adxSlope>=" + unknownBlockMinAdxSlope
+                            + " OR bypass(streak>=" + freshReversalBypassStreakMin
+                            + " priorOpp" + oppColor + ">=" + freshReversalBypassPriorRunMin + ")");
+                        return false;
+                    }
+                    if (enableDiagLog) WriteDiagRow("BYPASS_UNKNOWN_FRESH_REVERSAL",
                         "dir=" + direction + " brick=" + lastNrBrickColor + "x" + nrBrickStreakCount
-                        + " adxSlope=" + lastAdxSlope.ToString("F2")
-                        + " need brick=" + (direction == 1 ? "G" : "R") + " streak>=" + unknownBlockMinStreak
-                        + " adxSlope>=" + unknownBlockMinAdxSlope);
-                    return false;
+                        + " priorOppRun=" + lastEndedRunColor + "x" + lastEndedRunLen
+                        + " adxSlope=" + lastAdxSlope.ToString("F2"));
                 }
             }
             // SL-cluster cooldown (AUTO ONLY — manual entries bypass): if we just hit N stop-losses
@@ -4355,6 +4385,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                         + " startPx=" + runStartPrice.ToString("F2")
                         + " endPx=" + bClose.ToString("F2"));
                 }
+                // v6 2.7.9 - capture the just-ended run for FRESH-REVERSAL BYPASS lookup.
+                if (runCurrentLen > 0)
+                {
+                    lastEndedRunLen   = runCurrentLen;
+                    lastEndedRunColor = runCurrentColor;
+                }
                 // Update last-10 max (regime context: "are we in a high-streak environment?")
                 if (runCurrentLen > 0)
                 {
@@ -6225,6 +6261,22 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "  UNKNOWN Block Min AdxSlope", Order = 42, GroupName = "10 - Regime",
             Description = "Minimum ADX slope (positive=rising trend strength) to enter when regime=UNKNOWN. Default 0 (just non-negative). Increase to 1-2 for stricter trend confirmation.")]
         public double UnknownBlockMinAdxSlope { get { return unknownBlockMinAdxSlope; } set { unknownBlockMinAdxSlope = value; } }
+
+        // ===== v6 2.7.9 — FRESH-REVERSAL BYPASS (catches reversals earlier when ADX still decaying) =====
+        [NinjaScriptProperty]
+        [Display(Name = "  Fresh-Reversal Bypass Enabled", Order = 43, GroupName = "10 - Regime",
+            Description = "PHASE 2.7.9 \u2014 When the UNKNOWN-Regime Block would normally reject (e.g. adxSlope still negative from prior trend), allow the trade IF the just-ended OPPOSITE-color run was substantial. Real reversals begin while ADX is still decaying \u2014 the default rule misses them by 5-10 bricks. VALIDATED on 2026-04-28: BLOCK_UNKNOWN_REGIME at R7/R8/R9 because adxSlope was -6/-3/-1 from the prior up-trend; finally entered late at R10. With this ON, would have entered at R4 (~25pt better). Watch for BYPASS_UNKNOWN_FRESH_REVERSAL diag rows.")]
+        public bool FreshReversalBypassEnabled { get { return freshReversalBypassEnabled; } set { freshReversalBypassEnabled = value; } }
+
+        [NinjaScriptProperty, Range(2, 10)]
+        [Display(Name = "  Fresh-Reversal Bypass Min Streak", Order = 44, GroupName = "10 - Regime",
+            Description = "PHASE 2.7.9 \u2014 Minimum NEW-direction brick streak required to bypass the UNKNOWN block on a fresh reversal. Default 4 (catches early bricks of the reversing leg). Lower = earlier entries (more risk of false flips). Higher = waits for more confirmation (less edge).")]
+        public int FreshReversalBypassStreakMin { get { return freshReversalBypassStreakMin; } set { freshReversalBypassStreakMin = value; } }
+
+        [NinjaScriptProperty, Range(3, 20)]
+        [Display(Name = "  Fresh-Reversal Bypass Prior Run", Order = 45, GroupName = "10 - Regime",
+            Description = "PHASE 2.7.9 \u2014 Minimum length of the just-ended OPPOSITE-color run for the bypass to fire. Proves a real exhaustion/reversal vs random brick flips. Default 5. Higher (8-10) = only major reversals qualify.")]
+        public int FreshReversalBypassPriorRunMin { get { return freshReversalBypassPriorRunMin; } set { freshReversalBypassPriorRunMin = value; } }
         #endregion
     }
 }
