@@ -154,7 +154,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool   brickTrailPriceStopEnabled = true;
         // v6 2.7.6 - Min peak profit (pts) before BrickMode price-stop is allowed to fire. Acts as
         // a TRAP filter: small peaks are likely noise / not real moves. Default 8pt (half-brick).
-        private double brickTrailPriceStopMinPeakPts = 8.0;
+        private double brickTrailPriceStopMinPeakPts = 12.0;  // v6 2.11 raised 8->12
         // v6 2.7.6 - When price reaches within ExtremeNearPct of brick high (LONG) / low (SHORT),
         // tighten the trail to ExtremeTightnessPct of brick (vs normal Tightness%). Default: when
         // price within 25% of brick top, trail tightens to 25% of brick (4pt vs 8pt). Encourages
@@ -166,7 +166,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         // a 1-2pt cross of the body anchor (which can sit only ~4pt below peak during fast runs)
         // exits prematurely on noise. Set lower (3) for very tight scalp mode, higher (8) to let
         // the trail breathe.
-        private double brickTrailPriceStopMinRetracePts = 5.0;
+        private double brickTrailPriceStopMinRetracePts = 7.0;  // v6 2.11 raised 5->7
         private int    brickTrailMinStreak = 4;     // require >= N same-color bricks before brick-trail engages
         // v6 2.10 - field-init also flipped ON (matches SetDefaults). Master switch for the
         // entire intelligent brick exit suite (BrickTrail + InBar + PxStop + Flip-grace + Re-Entry).
@@ -272,11 +272,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         // is the textbook MM stop-hunt headfake; required a grace window. Separately the 5
         // BrickTrail PxStop wins were great but used a fixed 5pt min-retrace - on strong trends
         // (ADX rising + long streak) the trail should breathe wider; on dying trends, tighter.
-        private int    flipExitGraceSec        = 45;   // suppress brick-flip exit for first N sec after entry
-        private int    flipExitMinOppositeCnt  = 1;    // require N consecutive opposite-color bricks (1 = legacy)
+        private int    flipExitGraceSec        = 60;   // v6 2.11 raised 45->60
+        private int    flipExitMinOppositeCnt  = 2;    // v6 2.11 raised 1->2 (require confirmation)
         private bool   pxStopAdaptiveEnabled   = true; // scale PxStop min-retrace by ADX slope + streak
-        private double pxStopAdxRisingMult     = 1.5;  // strong trend (ADX rising + streak >= N) -> wider retrace
-        private double pxStopAdxFallingMult    = 0.7;  // dying trend (ADX falling) -> tighter retrace, lock fast
+        private double pxStopAdxRisingMult     = 2.0;  // v6 2.11 raised 1.5->2.0
+        private double pxStopAdxFallingMult    = 0.6;  // v6 2.11 tightened 0.7->0.6
         private int    pxStopStrongStreakMin   = 5;    // streak needed to qualify as "strong"
         // Run tracker (live counters):
         private int    runCurrentLen;             // = nrBrickStreakCount but kept independent in case
@@ -473,7 +473,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         // is already over-extended from VWAP relative to current ATR, allowing the strategy to wait
         // for either a pullback or fresh consolidation — not chase the move.
         private bool          extensionFilterEnabled        = true;
-        private double        extensionMaxAtrFromVwap       = 5.0;   // block entry if |close-vwap| > N × ATR
+        private double        extensionMaxAtrFromVwap       = 2.5;   // v6 2.11 tightened 5.0->2.5
         private double        extensionMinAtrPoints         = 8.0;   // only enforce when ATR >= this (avoids over-blocking quiet sessions)
         // ----- Chop filter (default ON, applies to manual + auto) -----
         private bool          chopFilterEnabled           = true;
@@ -731,7 +731,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     // Mode
                     autoMode              = false;
                     autoStrategy          = 2;       // Auto-Select
-                    minSignalConfidence   = 55.0;
+                    minSignalConfidence   = 60.0;   // v6 2.11 - raised 55->60. Day-28 Playback17 trade #4 (-$385) had bull=57.5; would have been blocked. Higher conviction = fewer marginal trades.
                     entryDelaySeconds     = 1;
 
                     // Indicators
@@ -787,7 +787,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     longLockoutUntil  = DateTime.MinValue;
                     shortLockoutUntil = DateTime.MinValue;
                     extensionFilterEnabled        = true;
-                    extensionMaxAtrFromVwap       = 5.0;
+                    extensionMaxAtrFromVwap       = 2.5;   // v6 2.11 - tightened 5.0->2.5. Day-28 Playback17 trade #4 (-$385) entered at 1.47x ATR above VWAP. 5.0x was effectively never blocking.
                     extensionMinAtrPoints         = 8.0;
                     chopFilterEnabled           = true;
                     chopAdxMin                  = 18.0;
@@ -826,7 +826,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     breakevenAtPoints     = 8;
                     beSafeAtrFactor       = 0.20;   // was 0.35 — less restrictive so BE actually fires on small profitable trades
                     beSafeMinTicks        = 4;      // was 6 (1pt floor instead of 1.5pt)
-                    breakevenEnabled      = true;
+                    breakevenEnabled      = false;  // v6 2.11 - DISABLED. Day-28 Playback17 trade #3: BE slammed in 9 sec for -$90 on a fresh entry. BrickTrail PxStop + hidden SL handle protection without the MM stop-hunt vulnerability of BE-tagged levels.
                     allowMultiEntryPerBar = true;     // default ALLOW
                     jumpSlPercent         = 50;
                     slTpAdjustStep        = 5;
@@ -882,10 +882,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                     trlNowOverridesBrick          = true;
                     brickTrailTightnessPct        = 50.0;
                     brickTrailPriceStopEnabled    = true;
-                    brickTrailPriceStopMinPeakPts = 8.0;
+                    brickTrailPriceStopMinPeakPts = 12.0;  // v6 2.11 - raised 8->12. Day-28 Playback17 trade #1 exited at peak=9.3pt with full retrace = -$5. 12pt floor = no PxStop until real win exists.
                     brickTrailExtremeNearPct      = 25.0;
                     brickTrailExtremeTightnessPct = 25.0;
-                    brickTrailPriceStopMinRetracePts = 5.0;
+                    brickTrailPriceStopMinRetracePts = 7.0;  // v6 2.11 - raised 5->7. More breathing room before PxStop fires; pairs with 2.9 adaptive widening on strong trends.
                     brickTrailMinStreak           = 4;
                     brickTrailBufferTicks         = 4;
                     brickTrailRequireTrendRegime  = true;
@@ -893,11 +893,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                     brickTrailGivebackMinPeakPts  = 20.0;
                     brickTrailGivebackStallSec    = 45;
                     // v6 2.9 - Smart Trail defaults
-                    flipExitGraceSec              = 45;
-                    flipExitMinOppositeCnt        = 1;
+                    flipExitGraceSec              = 60;    // v6 2.11 - raised 45->60. MM stop-hunt headfakes typically reverse within 60-90s.
+                    flipExitMinOppositeCnt        = 2;     // v6 2.11 - require 2 consecutive opposite bricks (was 1). Single-brick MM headfake was the most common loss pattern.
                     pxStopAdaptiveEnabled         = true;
-                    pxStopAdxRisingMult           = 1.5;
-                    pxStopAdxFallingMult          = 0.7;
+                    pxStopAdxRisingMult           = 2.0;   // v6 2.11 - raised 1.5->2.0. Let runners run on strong trends; combined with PxStop min-retrace 7pt that's effective 14pt retrace tolerance on big moves.
+                    pxStopAdxFallingMult          = 0.6;   // v6 2.11 - tightened 0.7->0.6. Lock profit faster on dying trends.
                     pxStopStrongStreakMin         = 5;
                     inBarTrailEnabled               = true;
                     inBarTrailMinPeakPts            = 25.0;
