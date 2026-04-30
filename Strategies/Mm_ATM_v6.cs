@@ -122,16 +122,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool   enableBrickAnalytics;     // master toggle for Phase 1.2-1.4 observation
 
         // ---- v6 2.1/2.2 — Beat-the-MM Block Bypasses (ACTIVE LOGIC, default OFF) ----
-        // Phase 2.1 Smart Cooldown: shrinks the 7-min post-win cooldown to 60s when conditions prove
-        // we're in a real trend continuation (not the MM stop-run + fade pattern the cooldown protects against).
-        // Phase 2.2 Extension TREND-Bypass: lets us follow strong trends past the VWAP-extension guard.
-        // BOTH default OFF for safety. They are RISK-INCREASING tools — they create more entries by relaxing guards.
-        // Only enable AFTER you've validated EnableRegimeClassifier and EnableBrickAnalytics on the same session.
-        private bool   enableSmartCooldown;        // Phase 2.1
-        private int    smartCooldownMinSec     = 60;   // shortened cooldown when bypass triggers
-        private int    smartCooldownStreakMin  = 4;    // require this brick-streak in trend dir to bypass
-        private bool   enableExtensionTrendBypass; // Phase 2.2
-        private int    extensionBypassStreakMax = 8;   // only bypass extension if streak <= this (still avoid late chases)
+        // v6 2.7.12 - REMOVED Phase 2.1 SmartCooldown + Phase 2.2 ExtensionTrendBypass.
+        // Both required EnableRegimeClassifier=ON (default OFF), never validated as profitable,
+        // and added 5 properties + ~50 lines of logic without any measurable PnL contribution.
         // adxSlope cached from regime classifier so entry guards can read it without recomputing.
         private double lastAdxSlope;
 
@@ -244,21 +237,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double unknownBlockMinAdxSlope = 0;  // require ADX slope >= this to enter in UNKNOWN
         // v6 2.7.9 - FRESH-REVERSAL BYPASS for UNKNOWN block. Reason: when a real reversal
         // starts, ADX is decaying from the prior trend (slope NEGATIVE) for the first 5-10 new
-        // bricks. The default adxSlope>=0 rule rejects exactly this pattern, forcing entries
-        // 25-40pt late (validated by 2026-04-28 R7/R8/R9 blocks before R10 finally fired).
-        // Bypass triggers when: brick agrees + new streak >= bypass-min + previously-ended
-        // OPPOSITE-color run was at least PriorRunMin bricks (proves a real reversal vs random flip).
-        // v6 2.7.11 - Both bypass features default OFF after Day-28 Playback15 validation:
-        // every bypass-triggered entry LOST (-$1,545 swing vs prior). Logic kept opt-in for future
-        // refinement; tighter quality gates added (regime must be UNKNOWN strict, ADX >= 18, fresh
-        // EMA cross within 20 bars).
-        private bool   freshReversalBypassEnabled    = false;
-        private int    freshReversalBypassStreakMin  = 4;
-        private int    freshReversalBypassPriorRunMin = 5;
-        private int    lastEndedRunLen               = 0;
-        private string lastEndedRunColor             = "";
-        // v6 2.7.10 - CHOP fresh-reversal bypass (default OFF since 2.7.11 — see above).
-        private bool   chopFreshReversalBypassEnabled = false;
+        // v6 2.7.12 - REMOVED Fresh-Reversal bypasses entirely.
+        // Day-28 Playback15 validation: every bypass-triggered entry LOST (-$1,545 swing).
+        // The bypass logic catches stale snap-backs, not real reversals. Use the standard
+        // unknownBlockMinStreak / minAdxSlope tuning if early-trend entry is desired.
         // v6 2.7.10 - Post-win price-distance release: KEEP DEFAULT ON. This one is safe — only
         // releases AFTER price has already moved N pts in our direction (the stop-run scenario
         // didn't materialize). Day-28 Playback15: did not cause any losing entry.
@@ -417,11 +399,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double        aggrAdverseAtrFactor        = 0.5;
         private double        aggrAdverseMinPts           = 5.0;   // Floor raised from 3 — if you DO opt in, set higher to avoid same-bar noise
         private double        aggrAdverseDisarmPeak       = 3.0;
-        // ----- AGGR static-SL cap — OFF by default; raise only if you want a hard cap. -----
-        // NOTE: 12pt cap was tested and WORSENED results because NQ first-bar wicks routinely
-        // hit 10-15pt on volatile mornings, killing trades that would have run to peak +22pt.
-        // Leave at 0 (disabled). The AGGR adverse + pullback exits already protect capital correctly.
-        private double        aggrSlCapPoints             = 0.0;   // 0=disabled. When >0 and AGGR ON, SL distance capped at this many points.
+        // v6 2.7.12 - REMOVED aggrSlCapPoints (was default 0=disabled, AGGR adverse+pullback already protects).
         // ----- SL-cluster cooldown — pauses entries after consecutive SL exits in a short window -----
         private bool          slClusterCooldownEnabled    = true;
         private int           slClusterCount              = 2;     // After this many SL exits within window -> cooldown
@@ -762,7 +740,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                     aggrAdverseAtrFactor        = 0.5;
                     aggrAdverseMinPts           = 5.0;
                     aggrAdverseDisarmPeak       = 3.0;
-                    aggrSlCapPoints             = 0.0;
                     slClusterCooldownEnabled    = true;
                     slClusterCount              = 2;
                     slClusterWindowMin          = 90;
@@ -863,13 +840,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                     runMaxLast10           = 0;
                     lastBrickIntervalSec   = 0;
                     fastBricksLast10       = 0;
-                    // v6 2.1 — Smart Cooldown defaults (ACTIVE LOGIC, OFF by default).
-                    enableSmartCooldown        = false;
-                    smartCooldownMinSec        = 60;
-                    smartCooldownStreakMin     = 4;
-                    // v6 2.2 — Extension TREND-Bypass defaults (ACTIVE LOGIC, OFF by default).
-                    enableExtensionTrendBypass = false;
-                    extensionBypassStreakMax   = 8;
                     lastAdxSlope               = 0;
                     // v6 2.3 — Brick-Trail Mode defaults (ACTIVE LOGIC, OFF by default).
                     enableBrickTrail              = false;
@@ -2168,11 +2138,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 else if (IsTimeInWindow(ct, sodMiddayStart, sodMiddayEnd)) mult = sodMiddaySlMult;
                 baseSl = (int)Math.Round(slPoints * mult);
             }
-            // AGGR static-SL cap — when aggressive exits are armed, the AGGR pullback / adverse
-            // logic catches normal losses, so the static SL is only there as a catastrophe brake.
-            // Cap it tighter than the manual default to limit worst-case dollar loss per trade.
-            if (aggressiveExitsEnabled && aggrSlCapPoints > 0 && baseSl > aggrSlCapPoints)
-                baseSl = (int)Math.Round(aggrSlCapPoints);
             return Math.Max(2, baseSl); // never below 2pt
         }
 
@@ -2469,38 +2434,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 string chopReason;
                 if (IsChoppy(direction, out chopReason))
                 {
-                    // v6 2.7.10 - FRESH-REVERSAL BYPASS for CHOP. Same predicate as 2.7.9 UNKNOWN bypass:
-                    // brick agrees + new streak >= N + prior opposite run >= M. Tape-against rule still
-                    // overrides (we never override OFB tape). The range/EMA/ADX rules are the false-
-                    // positives during the first 5-10 bricks of a real reversal.
-                    // v6 2.7.11 - STRICTER GATES: only bypass when regime classifier says UNKNOWN
-                    // (NOT explicit CHOP), require fresh EMA cross (<=20 bars) and ADX >= 18.
-                    // Day-28 Playback15: bypass fired at 10:16 with Reg=CHOP (-$365) — exactly the
-                    // setup we should NEVER trade.
-                    string oppColor2 = (direction == 1) ? "R" : "G";
-                    bool brickAgreesC = (direction == 1 && lastNrBrickColor == "G")
-                                     || (direction == -1 && lastNrBrickColor == "R");
-                    bool emaFreshC  = emaCrossBarsAgo <= 20 && (direction == emaCrossDir);
-                    bool adxStrongC = indAdx != null && indAdx[0] >= 18;
-                    bool chopBypass = chopFreshReversalBypassEnabled
-                        && currentRegime != "CHOP"          // never bypass when classifier confirms CHOP
-                        && brickAgreesC
-                        && nrBrickStreakCount >= freshReversalBypassStreakMin
-                        && lastEndedRunColor == oppColor2
-                        && lastEndedRunLen   >= freshReversalBypassPriorRunMin
-                        && emaFreshC
-                        && adxStrongC
-                        && !chopReason.StartsWith("tape against"); // tape rule never bypassed
-                    if (!chopBypass)
-                    {
-                        UpdateDashboardStatus(label + " blocked: CHOP " + chopReason, Brushes.Orange);
-                        if (enableDiagLog) WriteDiagRow("BLOCK_CHOP", chopReason);
-                        return false;
-                    }
-                    if (enableDiagLog) WriteDiagRow("BYPASS_CHOP_FRESH_REVERSAL",
-                        "dir=" + direction + " brick=" + lastNrBrickColor + "x" + nrBrickStreakCount
-                        + " priorOppRun=" + lastEndedRunColor + "x" + lastEndedRunLen
-                        + " chopReason=" + chopReason);
+                    UpdateDashboardStatus(label + " blocked: CHOP " + chopReason, Brushes.Orange);
+                    if (enableDiagLog) WriteDiagRow("BLOCK_CHOP", chopReason);
+                    return false;
                 }
             }
             // v6 2.4 — UNKNOWN-Regime Auto-Block (AUTO ONLY — manual entries bypass).
@@ -2517,39 +2453,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                 bool adxOk       = lastAdxSlope >= unknownBlockMinAdxSlope;
                 if (!brickAgrees || !streakOk || !adxOk)
                 {
-                    // v6 2.7.9 - FRESH-REVERSAL BYPASS: real reversals start with ADX decaying
-                    // (negative slope) from the prior trend. Allow entry when (a) brick agrees,
-                    // (b) new streak >= bypass-min, (c) prior OPPOSITE-color run was substantial.
-                    // v6 2.7.11 - STRICTER GATES added after Day-28 Playback15: require fresh EMA
-                    // cross (<=20 bars) AND ADX >= 18. Without these, the bypass fires on stale
-                    // setups (emaXAgo=48, ADX 13) and price snaps back -> -$365 each.
-                    string oppColor = (direction == 1) ? "R" : "G";
-                    bool emaFresh   = emaCrossBarsAgo <= 20 && (direction == emaCrossDir);
-                    bool adxStrong  = indAdx != null && indAdx[0] >= 18;
-                    bool freshBypass = freshReversalBypassEnabled
-                        && brickAgrees
-                        && nrBrickStreakCount >= freshReversalBypassStreakMin
-                        && lastEndedRunColor == oppColor
-                        && lastEndedRunLen   >= freshReversalBypassPriorRunMin
-                        && emaFresh
-                        && adxStrong;
-                    if (!freshBypass)
-                    {
-                        UpdateDashboardStatus(label + " blocked: UNKNOWN regime", Brushes.Orange);
-                        if (enableDiagLog) WriteDiagRow("BLOCK_UNKNOWN_REGIME",
-                            "dir=" + direction + " brick=" + lastNrBrickColor + "x" + nrBrickStreakCount
-                            + " adxSlope=" + lastAdxSlope.ToString("F2")
-                            + " priorOppRun=" + lastEndedRunColor + "x" + lastEndedRunLen
-                            + " need brick=" + (direction == 1 ? "G" : "R") + " streak>=" + unknownBlockMinStreak
-                            + " adxSlope>=" + unknownBlockMinAdxSlope
-                            + " OR bypass(streak>=" + freshReversalBypassStreakMin
-                            + " priorOpp" + oppColor + ">=" + freshReversalBypassPriorRunMin + ")");
-                        return false;
-                    }
-                    if (enableDiagLog) WriteDiagRow("BYPASS_UNKNOWN_FRESH_REVERSAL",
+                    UpdateDashboardStatus(label + " blocked: UNKNOWN regime", Brushes.Orange);
+                    if (enableDiagLog) WriteDiagRow("BLOCK_UNKNOWN_REGIME",
                         "dir=" + direction + " brick=" + lastNrBrickColor + "x" + nrBrickStreakCount
-                        + " priorOppRun=" + lastEndedRunColor + "x" + lastEndedRunLen
-                        + " adxSlope=" + lastAdxSlope.ToString("F2"));
+                        + " adxSlope=" + lastAdxSlope.ToString("F2")
+                        + " need brick=" + (direction == 1 ? "G" : "R") + " streak>=" + unknownBlockMinStreak
+                        + " adxSlope>=" + unknownBlockMinAdxSlope);
+                    return false;
                 }
             }
             // SL-cluster cooldown (AUTO ONLY — manual entries bypass): if we just hit N stop-losses
@@ -2570,35 +2480,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 double minsSinceWin = (Time[0] - lastWinExitTime).TotalMinutes;
                 if (minsSinceWin < postWinSameDirCooldownMin)
                 {
-                    // v6 2.1 SMART COOLDOWN BYPASS:
-                    //   The 7-min post-win cooldown exists because MM often runs our stop right after
-                    //   we exit on trail — then continues the trend. That hurts when chop, but on real
-                    //   confirmed trends we leave 50pt+ runners on the table (validated 2026-04-28: 21
-                    //   BLOCK_POST_WIN events in TREND_DN, including 5 consecutive at 09:55 covering
-                    //   a ~50pt continuation). Bypass only when ALL of these prove a true trend:
-                    //     (1) Regime classifier says TREND_UP/DN AND agrees with our trade direction
-                    //     (2) NinzaRenko brick streak ≥ smartCooldownStreakMin (default 4) in trend color
-                    //     (3) ADX slope is RISING (>0)
-                    //     (4) At least smartCooldownMinSec (default 60s) has passed since the win
-                    //   When all true, we shrink the effective cooldown to 60s instead of 7min.
-                    bool smartBypass = false;
-                    if (enableSmartCooldown)
-                    {
-                        bool regimeAgrees = (direction == 1 && currentRegime == "TREND_UP")
-                                         || (direction == -1 && currentRegime == "TREND_DN");
-                        bool brickAgrees  = (direction == 1 && lastNrBrickColor == "G" && nrBrickStreakCount >= smartCooldownStreakMin)
-                                         || (direction == -1 && lastNrBrickColor == "R" && nrBrickStreakCount >= smartCooldownStreakMin);
-                        bool adxRising    = lastAdxSlope > 0;
-                        bool minTimeOk    = (Time[0] - lastWinExitTime).TotalSeconds >= smartCooldownMinSec;
-                        smartBypass = regimeAgrees && brickAgrees && adxRising && minTimeOk;
-                        if (smartBypass && enableDiagLog)
-                            WriteDiagRow("SMART_COOLDOWN_BYPASS",
-                                "dir=" + direction + " regime=" + currentRegime
-                                + " brick=" + lastNrBrickColor + "x" + nrBrickStreakCount
-                                + " adxSlope=" + lastAdxSlope.ToString("F2")
-                                + " sec_since_win=" + (int)(Time[0] - lastWinExitTime).TotalSeconds);
-                    }
-                    if (!smartBypass)
+                    // v6 2.7.12 - SmartCooldown bypass removed. Only PRICE-DISTANCE RELEASE remains
+                    // (v6 2.7.10): if price has already moved N pts IN trade direction since the win,
+                    // the MM stop-run scenario didn't materialize and the trend continued - release.
                     {
                         // v6 2.7.10 - PRICE-DISTANCE RELEASE: the cooldown protects against MM
                         // stop-runs that ramp price back to our exit, then continue. If price has
@@ -2656,40 +2540,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                     double ratio = dist / atrNow;
                     if (ratio > extensionMaxAtrFromVwap)
                     {
-                        // v6 2.2 EXTENSION TREND-BYPASS:
-                        //   Extension guard exists because chasing late entries far from VWAP
-                        //   gives MM room to ramp price and stop us out before trend resumes.
-                        //   But strong trends extend by definition — in TREND_DN we observed
-                        //   13 BLOCK_EXTENSION events on 2026-04-28, missing real follow-through.
-                        //   Bypass when ALL of these prove the move is healthy, not late:
-                        //     (1) Regime classifier says TREND_UP/DN AND agrees with trade dir
-                        //     (2) NinzaRenko brick streak <= extensionBypassStreakMax (default 8)
-                        //         (still skip if streak is already monstrous = mean reversion risk)
-                        //     (3) ADX slope is RISING (>0)
-                        //     (4) Brick color agrees with trade direction
-                        bool trendBypass = false;
-                        if (enableExtensionTrendBypass)
-                        {
-                            bool regimeAgrees = (direction == 1 && currentRegime == "TREND_UP")
-                                             || (direction == -1 && currentRegime == "TREND_DN");
-                            bool brickAgrees  = (direction == 1 && lastNrBrickColor == "G")
-                                             || (direction == -1 && lastNrBrickColor == "R");
-                            bool streakOk     = nrBrickStreakCount > 0 && nrBrickStreakCount <= extensionBypassStreakMax;
-                            bool adxRising    = lastAdxSlope > 0;
-                            trendBypass = regimeAgrees && brickAgrees && streakOk && adxRising;
-                            if (trendBypass && enableDiagLog)
-                                WriteDiagRow("EXTENSION_BYPASS",
-                                    "dir=" + direction + " regime=" + currentRegime
-                                    + " brick=" + lastNrBrickColor + "x" + nrBrickStreakCount
-                                    + " adxSlope=" + lastAdxSlope.ToString("F2")
-                                    + " ratio=" + ratio.ToString("F2"));
-                        }
-                        if (!trendBypass)
-                        {
-                            UpdateDashboardStatus(label + " blocked: EXTENSION " + ratio.ToString("F1") + "xATR", Brushes.Orange);
-                            if (enableDiagLog) WriteDiagRow("BLOCK_EXTENSION", "dir=" + direction + " dist=" + dist.ToString("F1") + " atr=" + atrNow.ToString("F1") + " ratio=" + ratio.ToString("F2") + " max=" + extensionMaxAtrFromVwap.ToString("F2"));
-                            return false;
-                        }
+                        // v6 2.7.12 - ExtensionTrendBypass removed (was default OFF, never validated).
+                        UpdateDashboardStatus(label + " blocked: EXTENSION " + ratio.ToString("F1") + "xATR", Brushes.Orange);
+                        if (enableDiagLog) WriteDiagRow("BLOCK_EXTENSION", "dir=" + direction + " dist=" + dist.ToString("F1") + " atr=" + atrNow.ToString("F1") + " ratio=" + ratio.ToString("F2") + " max=" + extensionMaxAtrFromVwap.ToString("F2"));
+                        return false;
                     }
                 }
             }
@@ -2746,7 +2600,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (adaptiveWindowEnabled && adaptiveTightenActive)
             {
                 effMin += adaptiveConfBoost;
-                if (enableDiagLog && IsFirstTickOfBar) WriteDiagRow("ADAPT_TIGHTEN_ACTIVE", "effMin=" + effMin.ToString("F1"));
+                // v6 2.7.12 - removed per-bar ADAPT_TIGHTEN_ACTIVE diag spam (was 184-221 rows/day, never actionable).
             }
 
             // Volatility spike block
@@ -4421,12 +4275,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                         + " startPx=" + runStartPrice.ToString("F2")
                         + " endPx=" + bClose.ToString("F2"));
                 }
-                // v6 2.7.9 - capture the just-ended run for FRESH-REVERSAL BYPASS lookup.
-                if (runCurrentLen > 0)
-                {
-                    lastEndedRunLen   = runCurrentLen;
-                    lastEndedRunColor = runCurrentColor;
-                }
+                // v6 2.7.12 - lastEndedRun tracking removed (was used only by removed bypasses).
                 // Update last-10 max (regime context: "are we in a high-streak environment?")
                 if (runCurrentLen > 0)
                 {
@@ -4453,34 +4302,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (favPts > runMaxFavPts) runMaxFavPts = favPts;
             }
 
-            // ---- 1.4 MM pattern recorder ----
+            // ---- 1.4 MM pattern recorder (ring still maintained for analytics state; diag emit removed in 2.7.12) ----
             brickColorRing.Enqueue(color);
             while (brickColorRing.Count > 20) brickColorRing.Dequeue();
-            // Emit MM_PATTERN snapshot every 5 minutes
-            if (enableDiagLog && (now - lastMmPatternEmit).TotalMinutes >= 5 && brickColorRing.Count >= 10)
-            {
-                lastMmPatternEmit = now;
-                System.Text.StringBuilder sb = new System.Text.StringBuilder();
-                int flips = 0; string prev = ""; int maxRunInRing = 0; int curRun = 0;
-                foreach (var c in brickColorRing)
-                {
-                    sb.Append(c);
-                    if (prev != "" && c != prev) flips++;
-                    if (c == prev) curRun++; else curRun = 1;
-                    if (curRun > maxRunInRing) maxRunInRing = curRun;
-                    prev = c;
-                }
-                double avgInterval = 0; int n = 0;
-                foreach (var d in brickIntervalsLast10) { avgInterval += d; n++; }
-                if (n > 0) avgInterval /= n;
-                WriteDiagRow("MM_PATTERN",
-                    "ring=" + sb.ToString()
-                    + " flips=" + flips
-                    + " maxRun=" + maxRunInRing
-                    + " avgIntvSec=" + avgInterval.ToString("F1")
-                    + " fast10=" + fastBricksLast10
-                    + " runMaxLast10=" + runMaxLast10);
-            }
+            // v6 2.7.12 - REMOVED MM_PATTERN diag emit (~100 rows/day, observation-only, never used).
         }
         #endregion
 
@@ -5832,10 +5657,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             Description = "Once trade peak profit reaches this many points, the adverse-exit is disarmed for this trade and AGGR_PULLBACK / trail take over. Default 3.0 (lets short blips disarm noise-only entries while still protecting fast-collapsing trades).")]
         public double AggrAdverseDisarmPeak { get { return aggrAdverseDisarmPeak; } set { aggrAdverseDisarmPeak = value; } }
 
-        [NinjaScriptProperty][Range(0.0, 50.0)]
-        [Display(Name = "Aggr SL Cap (pts, 0=off)", Order = 12, GroupName = "12 - Aggressive Exits",
-            Description = "When AGGR ON, the static stop-loss distance is capped at this many points. Default 0 (DISABLED). Testing showed that capping below 18pt on NQ kills trend trades on first-bar wicks. The AGGR adverse + pullback exits already handle capital protection. Only enable (>=18) if you want a hard catastrophe brake.")]
-        public double AggrSlCapPoints { get { return aggrSlCapPoints; } set { aggrSlCapPoints = value; } }
+        // v6 2.7.12 - REMOVED AggrSlCapPoints property (was default 0=disabled).
 
         // ===== Group 13 — Chop Filter (manual + auto) =====
         [NinjaScriptProperty]
@@ -6108,32 +5930,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             Description = "When ON, tracks NinzaRenko run length / favorable excursion / wick-rejection / brick-speed and emits RUN_END, WICK_TAG, MM_PATTERN diag rows. Adds 'Run:' row to dashboard. NO entry/exit logic uses these yet — pure observation feeding Phase 2.0 'Brick Mode' design. Default OFF.")]
         public bool EnableBrickAnalytics { get { return enableBrickAnalytics; } set { enableBrickAnalytics = value; } }
 
-        // ===== v6 2.1 — Smart Cooldown (Beat-the-MM block bypass, ACTIVE LOGIC) =====
-        [NinjaScriptProperty]
-        [Display(Name = "Enable Smart Cooldown (TREND bypass)", Order = 10, GroupName = "10 - Regime",
-            Description = "PHASE 2.1 — ACTIVE LOGIC. Default OFF. When ON, the 7-min post-win cooldown is bypassed (down to 60s) ONLY when all of: (1) Regime Classifier says TREND_UP/DN matching trade dir, (2) NinzaRenko brick streak >= 4 in trend color, (3) ADX slope rising, (4) at least 60s since the win. Lets you re-board confirmed trends after a winning scalp instead of sitting in cooldown while a 50pt runner takes off (validated 2026-04-28: 5 consecutive BLOCK_POST_WIN at 09:55 covered ~50pt missed). REQUIRES EnableRegimeClassifier=ON and EnableBrickAnalytics=ON. Watch for SMART_COOLDOWN_BYPASS rows in the diag CSV. Disable if you see consecutive losses after bypass (means regime label is wrong). DO NOT enable on choppy/low-ADX days.")]
-        public bool EnableSmartCooldown { get { return enableSmartCooldown; } set { enableSmartCooldown = value; } }
-
-        [NinjaScriptProperty, Range(15, 600)]
-        [Display(Name = "  Smart Cooldown Min Seconds", Order = 11, GroupName = "10 - Regime",
-            Description = "Minimum seconds since last win before Smart Cooldown bypass can fire. Default 60. Lower = more aggressive re-entry. Only used when EnableSmartCooldown=ON.")]
-        public int SmartCooldownMinSec { get { return smartCooldownMinSec; } set { smartCooldownMinSec = value; } }
-
-        [NinjaScriptProperty, Range(2, 20)]
-        [Display(Name = "  Smart Cooldown Streak Min", Order = 12, GroupName = "10 - Regime",
-            Description = "Minimum NinzaRenko brick streak (in trend direction) required for Smart Cooldown bypass. Default 4. Higher = more selective (fewer but stronger re-entries). Only used when EnableSmartCooldown=ON.")]
-        public int SmartCooldownStreakMin { get { return smartCooldownStreakMin; } set { smartCooldownStreakMin = value; } }
-
-        // ===== v6 2.2 — Extension TREND-Bypass (Beat-the-MM block bypass, ACTIVE LOGIC) =====
-        [NinjaScriptProperty]
-        [Display(Name = "Enable Extension TREND Bypass", Order = 20, GroupName = "10 - Regime",
-            Description = "PHASE 2.2 — ACTIVE LOGIC. Default OFF. When ON, the 'price too far from VWAP' extension block is bypassed ONLY when all of: (1) Regime Classifier says TREND_UP/DN matching trade dir, (2) NinzaRenko brick color matches dir, (3) brick streak <= 8 (skip if already monstrous — mean reversion risk), (4) ADX slope rising. Lets you follow strong trends instead of sitting out (validated 2026-04-28: 13 BLOCK_EXTENSION events in TREND_DN). REQUIRES EnableRegimeClassifier=ON. Watch for EXTENSION_BYPASS rows in the diag CSV. Disable if late-entries get stopped repeatedly (means trend was already exhausted).")]
-        public bool EnableExtensionTrendBypass { get { return enableExtensionTrendBypass; } set { enableExtensionTrendBypass = value; } }
-
-        [NinjaScriptProperty, Range(3, 30)]
-        [Display(Name = "  Extension Bypass Max Streak", Order = 21, GroupName = "10 - Regime",
-            Description = "Maximum NinzaRenko brick streak that still allows extension bypass. Default 8. Above this, the trend is likely exhausted and reversal risk dominates. Only used when EnableExtensionTrendBypass=ON.")]
-        public int ExtensionBypassStreakMax { get { return extensionBypassStreakMax; } set { extensionBypassStreakMax = value; } }
+        // ===== v6 2.7.12 - REMOVED Phase 2.1 SmartCooldown + Phase 2.2 ExtensionTrendBypass properties =====
 
         // ===== v6 2.3 — Brick-Trail Mode (lets monster runs run, ACTIVE LOGIC) =====
         [NinjaScriptProperty]
@@ -6291,31 +6088,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             Description = "Minimum ADX slope (positive=rising trend strength) to enter when regime=UNKNOWN. Default 0 (just non-negative). Increase to 1-2 for stricter trend confirmation.")]
         public double UnknownBlockMinAdxSlope { get { return unknownBlockMinAdxSlope; } set { unknownBlockMinAdxSlope = value; } }
 
-        // ===== v6 2.7.9 / 2.7.11 — FRESH-REVERSAL BYPASS (default OFF; opt-in only) =====
-        [NinjaScriptProperty]
-        [Display(Name = "  Fresh-Reversal Bypass Enabled", Order = 43, GroupName = "10 - Regime",
-            Description = "PHASE 2.7.9 / 2.7.11 \u2014 EXPERIMENTAL. DEFAULT OFF after Day-28 Playback15 showed every bypass-triggered entry LOST (-$1,545 swing). When ON, allows entry vs UNKNOWN-Regime block IF: brick agrees, new-dir streak >= MinStreak, prior OPPOSITE run >= PriorRunMin, EMA cross within 20 bars, ADX >= 18. Watch BYPASS_UNKNOWN_FRESH_REVERSAL diag rows.")]
-        public bool FreshReversalBypassEnabled { get { return freshReversalBypassEnabled; } set { freshReversalBypassEnabled = value; } }
+        // ===== v6 2.7.12 - REMOVED FreshReversalBypass + ChopFreshReversalBypass properties =====
+        // (Day-28 Playback15: every bypass-triggered entry LOST, -$1,545 swing.)
 
-        [NinjaScriptProperty, Range(2, 10)]
-        [Display(Name = "  Fresh-Reversal Bypass Min Streak", Order = 44, GroupName = "10 - Regime",
-            Description = "Minimum NEW-direction brick streak required to bypass the UNKNOWN block. Default 4.")]
-        public int FreshReversalBypassStreakMin { get { return freshReversalBypassStreakMin; } set { freshReversalBypassStreakMin = value; } }
-
-        [NinjaScriptProperty, Range(3, 20)]
-        [Display(Name = "  Fresh-Reversal Bypass Prior Run", Order = 45, GroupName = "10 - Regime",
-            Description = "Minimum length of just-ended OPPOSITE-color run for bypass to fire. Default 5.")]
-        public int FreshReversalBypassPriorRunMin { get { return freshReversalBypassPriorRunMin; } set { freshReversalBypassPriorRunMin = value; } }
-
-        // ===== v6 2.7.10 / 2.7.11 — CHOP fresh-reversal bypass + Post-Win price-distance release =====
-        [NinjaScriptProperty]
-        [Display(Name = "  CHOP Fresh-Reversal Bypass", Order = 46, GroupName = "10 - Regime",
-            Description = "PHASE 2.7.10 / 2.7.11 \u2014 EXPERIMENTAL. DEFAULT OFF. When ON, bypasses BLOCK_CHOP IF brick agrees, streak/prior-run met, regime != CHOP (UNKNOWN only), EMA cross within 20 bars, ADX >= 18. Tape-against rule never bypassed.")]
-        public bool ChopFreshReversalBypassEnabled { get { return chopFreshReversalBypassEnabled; } set { chopFreshReversalBypassEnabled = value; } }
-
+        // ===== v6 2.7.10 - Post-Win price-distance release =====
         [NinjaScriptProperty]
         [Display(Name = "  Post-Win Distance Release Enabled", Order = 47, GroupName = "10 - Regime",
-            Description = "PHASE 2.7.10 \u2014 KEEP DEFAULT ON. Releases the post-win same-dir cooldown when price has already moved >= PostWinDistanceReleasePts in trade direction since the win (proves the MM stop-run scenario didn't materialize). Day-28 Playback15: zero losing entries from this release.")]
+            Description = "PHASE 2.7.10 - KEEP DEFAULT ON. Releases the post-win same-dir cooldown when price has already moved >= PostWinDistanceReleasePts in trade direction since the win (proves the MM stop-run scenario didn't materialize). Day-28 Playback15: zero losing entries from this release.")]
         public bool PostWinDistanceReleaseEnabled { get { return postWinDistanceReleaseEnabled; } set { postWinDistanceReleaseEnabled = value; } }
 
         [NinjaScriptProperty, Range(2.0, 30.0)]
