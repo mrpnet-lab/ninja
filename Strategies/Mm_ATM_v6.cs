@@ -195,15 +195,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double   brickTrailGivebackMinPeakPts   = 20.0;
         private int      brickTrailGivebackStallSec     = 45;
         private DateTime lastSameColorBrickTime         = DateTime.MinValue;
-        // v6 2.6.2 - PROFIT-LOCK at brick close (catches violent V-reversal bricks that finish past breakeven).
-        // Independent of giveback (which is tick-based / time-gated). Profit-lock fires at the SAME bar a
-        // big reversal brick closes, so a single 20pt+ reversal brick can't wipe a 30pt+ peak winner.
-        // v6 2.6.3 - DISABLED BY DEFAULT (giveback% = 0). Was killing monster runs on continuation bricks
-        // due to peak being tick-based and profit-at-close being body-based (apples-vs-oranges). The
-        // intended use case (V-reversal) is already covered by brick-flip exit. In-bar tick trail (below)
-        // is the better tool for catching V-reversals BEFORE the opposite brick closes.
-        private double   brickTrailProfitLockMinPeakPts    = 20.0;
-        private int      brickTrailProfitLockGivebackPct   = 0;
+        // v6 2.7.11 - REMOVED: brickTrailProfitLockMinPeakPts + brickTrailProfitLockGivebackPct
+        // Were default-disabled (giveback%=0), superseded by v6 2.7.6 BrickMode price-stop +
+        // 2.7.7 retrace gate. The V-reversal use case is now handled inline by BrickMode trail.
         // v6 2.6.3 - IN-BAR TICK TRAIL (the user-requested aggressive mid-brick trail).
         // Once peak profit reaches MinPeakPts, exit immediately if intra-bar tick price retreats from
         // peak by GivebackPts. WICK-VULNERABLE by design - acceptable because we can re-enter on the
@@ -254,20 +248,20 @@ namespace NinjaTrader.NinjaScript.Strategies
         // 25-40pt late (validated by 2026-04-28 R7/R8/R9 blocks before R10 finally fired).
         // Bypass triggers when: brick agrees + new streak >= bypass-min + previously-ended
         // OPPOSITE-color run was at least PriorRunMin bricks (proves a real reversal vs random flip).
-        private bool   freshReversalBypassEnabled    = true;
+        // v6 2.7.11 - Both bypass features default OFF after Day-28 Playback15 validation:
+        // every bypass-triggered entry LOST (-$1,545 swing vs prior). Logic kept opt-in for future
+        // refinement; tighter quality gates added (regime must be UNKNOWN strict, ADX >= 18, fresh
+        // EMA cross within 20 bars).
+        private bool   freshReversalBypassEnabled    = false;
         private int    freshReversalBypassStreakMin  = 4;
         private int    freshReversalBypassPriorRunMin = 5;
         private int    lastEndedRunLen               = 0;
         private string lastEndedRunColor             = "";
-        // v6 2.7.10 - CHOP fresh-reversal bypass: same idea as 2.7.9 but for the BLOCK_CHOP filter.
-        // Validated 2026-04-28: 41 BLOCK_CHOP rows including R10/R11/R12 of a clean down-extension
-        // (range 12.25 < 18.48 over 5b). When a real reversal starts, range over the prior 5 bars
-        // is small because we just reversed - exactly the false-positive the bypass kills.
-        private bool   chopFreshReversalBypassEnabled = true;
-        // v6 2.7.10 - Post-win price-distance release: the post-win cooldown protects against MM
-        // stop-runs back to our exit. If price has moved >= N points IN OUR DIRECTION since the win,
-        // the stop-run scenario clearly didn't happen - release the cooldown. Validated 2026-04-28:
-        // 13 consecutive BLOCK_POST_WIN R-bricks while down-trend extended 30+pt (R13->R13).
+        // v6 2.7.10 - CHOP fresh-reversal bypass (default OFF since 2.7.11 — see above).
+        private bool   chopFreshReversalBypassEnabled = false;
+        // v6 2.7.10 - Post-win price-distance release: KEEP DEFAULT ON. This one is safe — only
+        // releases AFTER price has already moved N pts in our direction (the stop-run scenario
+        // didn't materialize). Day-28 Playback15: did not cause any losing entry.
         private bool   postWinDistanceReleaseEnabled = true;
         private double postWinDistanceReleasePts    = 8.0;  // half-brick
         // Run tracker (live counters):
@@ -893,8 +887,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                     brickTrailMaxGivebackPct      = 0;
                     brickTrailGivebackMinPeakPts  = 20.0;
                     brickTrailGivebackStallSec    = 45;
-                    brickTrailProfitLockMinPeakPts  = 20.0;
-                    brickTrailProfitLockGivebackPct = 0;
                     inBarTrailEnabled               = true;
                     inBarTrailMinPeakPts            = 25.0;
                     inBarTrailGivebackPts           = 16.0;
@@ -2481,14 +2473,23 @@ namespace NinjaTrader.NinjaScript.Strategies
                     // brick agrees + new streak >= N + prior opposite run >= M. Tape-against rule still
                     // overrides (we never override OFB tape). The range/EMA/ADX rules are the false-
                     // positives during the first 5-10 bricks of a real reversal.
+                    // v6 2.7.11 - STRICTER GATES: only bypass when regime classifier says UNKNOWN
+                    // (NOT explicit CHOP), require fresh EMA cross (<=20 bars) and ADX >= 18.
+                    // Day-28 Playback15: bypass fired at 10:16 with Reg=CHOP (-$365) — exactly the
+                    // setup we should NEVER trade.
                     string oppColor2 = (direction == 1) ? "R" : "G";
                     bool brickAgreesC = (direction == 1 && lastNrBrickColor == "G")
                                      || (direction == -1 && lastNrBrickColor == "R");
+                    bool emaFreshC  = emaCrossBarsAgo <= 20 && (direction == emaCrossDir);
+                    bool adxStrongC = indAdx != null && indAdx[0] >= 18;
                     bool chopBypass = chopFreshReversalBypassEnabled
+                        && currentRegime != "CHOP"          // never bypass when classifier confirms CHOP
                         && brickAgreesC
                         && nrBrickStreakCount >= freshReversalBypassStreakMin
                         && lastEndedRunColor == oppColor2
                         && lastEndedRunLen   >= freshReversalBypassPriorRunMin
+                        && emaFreshC
+                        && adxStrongC
                         && !chopReason.StartsWith("tape against"); // tape rule never bypassed
                     if (!chopBypass)
                     {
@@ -2519,12 +2520,19 @@ namespace NinjaTrader.NinjaScript.Strategies
                     // v6 2.7.9 - FRESH-REVERSAL BYPASS: real reversals start with ADX decaying
                     // (negative slope) from the prior trend. Allow entry when (a) brick agrees,
                     // (b) new streak >= bypass-min, (c) prior OPPOSITE-color run was substantial.
+                    // v6 2.7.11 - STRICTER GATES added after Day-28 Playback15: require fresh EMA
+                    // cross (<=20 bars) AND ADX >= 18. Without these, the bypass fires on stale
+                    // setups (emaXAgo=48, ADX 13) and price snaps back -> -$365 each.
                     string oppColor = (direction == 1) ? "R" : "G";
+                    bool emaFresh   = emaCrossBarsAgo <= 20 && (direction == emaCrossDir);
+                    bool adxStrong  = indAdx != null && indAdx[0] >= 18;
                     bool freshBypass = freshReversalBypassEnabled
                         && brickAgrees
                         && nrBrickStreakCount >= freshReversalBypassStreakMin
                         && lastEndedRunColor == oppColor
-                        && lastEndedRunLen   >= freshReversalBypassPriorRunMin;
+                        && lastEndedRunLen   >= freshReversalBypassPriorRunMin
+                        && emaFresh
+                        && adxStrong;
                     if (!freshBypass)
                     {
                         UpdateDashboardStatus(label + " blocked: UNKNOWN regime", Brushes.Orange);
@@ -4224,36 +4232,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 lastSameColorBrickTime = Time[0];
             }
-            // v6 2.6.2 - PROFIT-LOCK at brick close (wick-immune, catches violent V-reversals).
-            // Once peak profit reached >= MinPeakPts AND profit-at-this-brick-close has retraced
-            // past the giveback threshold, mark for exit. Uses the brick CLOSE price (not wick) so
-            // MM intra-brick spikes can't trigger it. Catches the case where a single big reversal
-            // brick wipes out most of the run BEFORE brick-flip exit fires (e.g. PB8 trade #1).
-            // v6 2.6.3 - SAME-COLOR GUARD: never fire on a continuation brick (same color as our
-            // position) - peak is tick-based but profitAtClose is body-based, mismatch was killing
-            // monster runs (PB9 trade #2 exited at brick 11 R during a 22-brick down-run).
-            bool isOppositeBrick = (openTradeDirection == -1 && color == "G")
-                                || (openTradeDirection ==  1 && color == "R");
-            if (openTradeDirection != 0 && enableBrickTrail && trailTierName == "BrickTrail"
-                && brickTrailProfitLockGivebackPct > 0
-                && isOppositeBrick
-                && trailMaxProfitPts >= brickTrailProfitLockMinPeakPts)
-            {
-                double tickPtPL = TickSize * NQ_TICKS_PER_POINT;
-                double profitAtBrickClose = openTradeDirection == 1
-                    ? (bClose - averageEntryPrice) / tickPtPL
-                    : (averageEntryPrice - bClose) / tickPtPL;
-                double floorPts = trailMaxProfitPts * (1.0 - brickTrailProfitLockGivebackPct / 100.0);
-                if (profitAtBrickClose < floorPts)
-                {
-                    pendingBrickFlipExit = true; // reuse the existing exit pipeline
-                    if (enableDiagLog)
-                        WriteDiagRow("BRICK_PROFIT_LOCK",
-                            "peak=" + trailMaxProfitPts.ToString("F1") + "pt floor=" + floorPts.ToString("F1")
-                            + "pt brickClose=" + bClose.ToString("F2")
-                            + " profitAtClose=" + profitAtBrickClose.ToString("F1") + "pt");
-                }
-            }
+            // v6 2.7.11 - REMOVED dead profit-lock block (was default OFF, superseded by v6 2.7.6
+            // BrickMode price-stop + retrace gate which now handles V-reversal exits correctly).
             ninzaSeriesAdded = true;  // mark NR active so dashboard shows color, not "off"
             if (enableDiagLog)
                 WriteDiagRow("BRICK_CLOSE",
@@ -6231,15 +6211,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             Description = "Giveback safety STALL-GATE — only fires after this many seconds since the last same-direction brick closed. Default 45. While new same-color bricks are still printing, the run is alive and giveback is suppressed. Only used when BrickTrailMaxGivebackPct > 0.")]
         public int BrickTrailGivebackStallSec { get { return brickTrailGivebackStallSec; } set { brickTrailGivebackStallSec = value; } }
 
-        [NinjaScriptProperty, Range(5, 100)]
-        [Display(Name = "  Brick-Trail Profit-Lock Min Peak (pts)", Order = 37, GroupName = "10 - Regime",
-            Description = "PHASE 2.6.2 — Wick-immune profit-lock at BRICK CLOSE. Once peak profit reaches this many points, every new brick close checks the profit-lock floor. Default 20. Below this peak, only brick-flip exit is active.")]
-        public double BrickTrailProfitLockMinPeakPts { get { return brickTrailProfitLockMinPeakPts; } set { brickTrailProfitLockMinPeakPts = value; } }
-
-        [NinjaScriptProperty, Range(0, 80)]
-        [Display(Name = "  Brick-Trail Profit-Lock Giveback %", Order = 38, GroupName = "10 - Regime",
-            Description = "PHASE 2.6.2 — % of peak profit allowed to bleed at BRICK CLOSE before exiting. Default 0 = DISABLED (v6 2.6.3 disabled by default; was killing monster runs because peak is tick-based and brick-close profit is body-based — mismatch caused premature exits on continuation bricks). The intended V-reversal use case is now better handled by In-Bar Trail (Order 39+). Wick-immune (uses brick CLOSE price, not tick).")]
-        public int BrickTrailProfitLockGivebackPct { get { return brickTrailProfitLockGivebackPct; } set { brickTrailProfitLockGivebackPct = value; } }
+        // v6 2.7.11 - REMOVED ProfitLockMinPeakPts + ProfitLockGivebackPct properties
+        // (Order 37/38). Logic was default-disabled and superseded by 2.7.6 BrickMode price-stop.
 
         [NinjaScriptProperty]
         [Display(Name = "  In-Bar Tick Trail Enabled", Order = 39, GroupName = "10 - Regime",
@@ -6318,21 +6291,37 @@ namespace NinjaTrader.NinjaScript.Strategies
             Description = "Minimum ADX slope (positive=rising trend strength) to enter when regime=UNKNOWN. Default 0 (just non-negative). Increase to 1-2 for stricter trend confirmation.")]
         public double UnknownBlockMinAdxSlope { get { return unknownBlockMinAdxSlope; } set { unknownBlockMinAdxSlope = value; } }
 
-        // ===== v6 2.7.9 — FRESH-REVERSAL BYPASS (catches reversals earlier when ADX still decaying) =====
+        // ===== v6 2.7.9 / 2.7.11 — FRESH-REVERSAL BYPASS (default OFF; opt-in only) =====
         [NinjaScriptProperty]
         [Display(Name = "  Fresh-Reversal Bypass Enabled", Order = 43, GroupName = "10 - Regime",
-            Description = "PHASE 2.7.9 \u2014 When the UNKNOWN-Regime Block would normally reject (e.g. adxSlope still negative from prior trend), allow the trade IF the just-ended OPPOSITE-color run was substantial. Real reversals begin while ADX is still decaying \u2014 the default rule misses them by 5-10 bricks. VALIDATED on 2026-04-28: BLOCK_UNKNOWN_REGIME at R7/R8/R9 because adxSlope was -6/-3/-1 from the prior up-trend; finally entered late at R10. With this ON, would have entered at R4 (~25pt better). Watch for BYPASS_UNKNOWN_FRESH_REVERSAL diag rows.")]
+            Description = "PHASE 2.7.9 / 2.7.11 \u2014 EXPERIMENTAL. DEFAULT OFF after Day-28 Playback15 showed every bypass-triggered entry LOST (-$1,545 swing). When ON, allows entry vs UNKNOWN-Regime block IF: brick agrees, new-dir streak >= MinStreak, prior OPPOSITE run >= PriorRunMin, EMA cross within 20 bars, ADX >= 18. Watch BYPASS_UNKNOWN_FRESH_REVERSAL diag rows.")]
         public bool FreshReversalBypassEnabled { get { return freshReversalBypassEnabled; } set { freshReversalBypassEnabled = value; } }
 
         [NinjaScriptProperty, Range(2, 10)]
         [Display(Name = "  Fresh-Reversal Bypass Min Streak", Order = 44, GroupName = "10 - Regime",
-            Description = "PHASE 2.7.9 \u2014 Minimum NEW-direction brick streak required to bypass the UNKNOWN block on a fresh reversal. Default 4 (catches early bricks of the reversing leg). Lower = earlier entries (more risk of false flips). Higher = waits for more confirmation (less edge).")]
+            Description = "Minimum NEW-direction brick streak required to bypass the UNKNOWN block. Default 4.")]
         public int FreshReversalBypassStreakMin { get { return freshReversalBypassStreakMin; } set { freshReversalBypassStreakMin = value; } }
 
         [NinjaScriptProperty, Range(3, 20)]
         [Display(Name = "  Fresh-Reversal Bypass Prior Run", Order = 45, GroupName = "10 - Regime",
-            Description = "PHASE 2.7.9 \u2014 Minimum length of the just-ended OPPOSITE-color run for the bypass to fire. Proves a real exhaustion/reversal vs random brick flips. Default 5. Higher (8-10) = only major reversals qualify.")]
+            Description = "Minimum length of just-ended OPPOSITE-color run for bypass to fire. Default 5.")]
         public int FreshReversalBypassPriorRunMin { get { return freshReversalBypassPriorRunMin; } set { freshReversalBypassPriorRunMin = value; } }
+
+        // ===== v6 2.7.10 / 2.7.11 — CHOP fresh-reversal bypass + Post-Win price-distance release =====
+        [NinjaScriptProperty]
+        [Display(Name = "  CHOP Fresh-Reversal Bypass", Order = 46, GroupName = "10 - Regime",
+            Description = "PHASE 2.7.10 / 2.7.11 \u2014 EXPERIMENTAL. DEFAULT OFF. When ON, bypasses BLOCK_CHOP IF brick agrees, streak/prior-run met, regime != CHOP (UNKNOWN only), EMA cross within 20 bars, ADX >= 18. Tape-against rule never bypassed.")]
+        public bool ChopFreshReversalBypassEnabled { get { return chopFreshReversalBypassEnabled; } set { chopFreshReversalBypassEnabled = value; } }
+
+        [NinjaScriptProperty]
+        [Display(Name = "  Post-Win Distance Release Enabled", Order = 47, GroupName = "10 - Regime",
+            Description = "PHASE 2.7.10 \u2014 KEEP DEFAULT ON. Releases the post-win same-dir cooldown when price has already moved >= PostWinDistanceReleasePts in trade direction since the win (proves the MM stop-run scenario didn't materialize). Day-28 Playback15: zero losing entries from this release.")]
+        public bool PostWinDistanceReleaseEnabled { get { return postWinDistanceReleaseEnabled; } set { postWinDistanceReleaseEnabled = value; } }
+
+        [NinjaScriptProperty, Range(2.0, 30.0)]
+        [Display(Name = "  Post-Win Distance Release (pts)", Order = 48, GroupName = "10 - Regime",
+            Description = "Points price must have moved IN trade direction since last win for cooldown to release. Default 8.")]
+        public double PostWinDistanceReleasePts { get { return postWinDistanceReleasePts; } set { postWinDistanceReleasePts = value; } }
         #endregion
     }
 }
