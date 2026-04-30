@@ -246,6 +246,23 @@ namespace NinjaTrader.NinjaScript.Strategies
         // didn't materialize). Day-28 Playback15: did not cause any losing entry.
         private bool   postWinDistanceReleaseEnabled = true;
         private double postWinDistanceReleasePts    = 8.0;  // half-brick
+        // v6 2.8 - BRICK RE-ENTRY. After a brick-trail WIN exit (PxStop / Flip / InBar / Giveback),
+        // arm a short window in which a fresh same-direction brick close (with streak >= MinStreak)
+        // re-fires the same-direction entry, BYPASSING the post-win cooldown. The cooldown was the
+        // single biggest source of "missed continuation" pain in Day-29 (validated: BrickTrail PxStop
+        // exited +$165/+$365 trades but the trend continued ~30pt further with no re-board).
+        // Conservatively gated by default: 1 re-entry per parent, 90s window, streak >= 3.
+        // CanEnterTrade still applies all OTHER guards (chop, dir lockout, SL cluster, extension,
+        // session/CME, max trades). Only post-win cooldown is bypassed.
+        private bool     brickReentryEnabled       = true;
+        private int      brickReentryWindowSec     = 90;
+        private int      brickReentryMinStreak     = 3;
+        private int      brickReentryMaxCount      = 1;
+        private DateTime brickReentryArmedAt       = DateTime.MinValue;
+        private int      brickReentryDir           = 0;
+        private double   brickReentryArmExitPx     = 0;
+        private int      brickReentryUsedCount     = 0;
+        private bool     brickReentryBypassActive  = false;
         // Run tracker (live counters):
         private int    runCurrentLen;             // = nrBrickStreakCount but kept independent in case
         private string runCurrentColor = "";      // "G"/"R"
@@ -2475,7 +2492,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             // Post-win same-direction cooldown (AUTO ONLY — manual entries bypass): block re-entry
             // in the SAME direction as the most recent winning exit for a short window. Catches MM
             // stop-runs that ramp price against us right after our trail kicked out, then continue trend.
-            if (!isManual && postWinSameDirCooldownEnabled && lastWinExitDirection != 0 && lastWinExitDirection == direction)
+            // v6 2.8 - BrickReentry bypass: when a brick-trail win armed re-entry and the brick-close
+            // handler is firing this entry, the cooldown is intentionally skipped (this IS the
+            // continuation we want to re-board).
+            if (!isManual && !brickReentryBypassActive && postWinSameDirCooldownEnabled && lastWinExitDirection != 0 && lastWinExitDirection == direction)
             {
                 double minsSinceWin = (Time[0] - lastWinExitTime).TotalMinutes;
                 if (minsSinceWin < postWinSameDirCooldownMin)
@@ -3475,6 +3495,19 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 lastWinExitTime = Time[0];
                                 lastWinExitDirection = last.Entry.MarketPosition == MarketPosition.Long ? 1 : -1;
                                 lastWinExitPrice = Close[0]; // v6 2.7.10 distance bypass anchor
+                                // v6 2.8 - arm BRICK RE-ENTRY on any brick-trail win exit.
+                                if (brickReentryEnabled && reason != null && reason.StartsWith("TRAIL_BrickTrail_"))
+                                {
+                                    brickReentryArmedAt   = Time[0];
+                                    brickReentryDir       = lastWinExitDirection;
+                                    brickReentryArmExitPx = Close[0];
+                                    brickReentryUsedCount = 0;
+                                    if (enableDiagLog) WriteDiagRow("BRICK_REENTRY_ARMED",
+                                        "dir=" + brickReentryDir + " reason=" + reason
+                                        + " exitPx=" + brickReentryArmExitPx.ToString("F2")
+                                        + " windowSec=" + brickReentryWindowSec
+                                        + " minStreak=" + brickReentryMinStreak);
+                                }
                                 if (enableDiagLog) WriteDiagRow("EXIT_WIN_" + reason, "pnl=" + last.ProfitCurrency.ToString("F2") + " consec=" + consecutiveWins);
                                 // Auto-widen on N consecutive wins
                                 if (autoWidenOnWinsEnabled && consecutiveWins >= autoWidenWinN && baseAggressiveTrailFactor > 0)
@@ -4094,6 +4127,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                     "src=primary color=" + color + " streak=" + nrBrickStreakCount
                     + " o=" + bOpen.ToString("F2") + " c=" + bClose.ToString("F2")
                     + " hi=" + bHigh.ToString("F2") + " lo=" + bLow.ToString("F2"));
+            // v6 2.8 - BRICK RE-ENTRY trigger evaluation at brick close.
+            TryBrickReentry(color, bClose);
             // v6 1.2-1.4 brick analytics hook (label-only)
             if (enableBrickAnalytics)
                 UpdateBrickAnalytics(color, prevColor, bOpen, bClose, bHigh, bLow);
@@ -4223,6 +4258,77 @@ namespace NinjaTrader.NinjaScript.Strategies
         //  + small body + big wick = absorption / stop-hunt zone).
         //  All metrics emitted as RUN_END / WICK_TAG / MM_PATTERN diag rows.
         // -----------------------------------------------------------
+
+        // -----------------------------------------------------------
+        //  v6 2.8 - Brick Re-Entry trigger evaluator (called once per primary brick close).
+        //  Fires same-direction entry if armed, within window, brick agrees, streak >= min,
+        //  position is flat, and re-entry quota not exceeded. Bypasses post-win cooldown only.
+        // -----------------------------------------------------------
+        private void TryBrickReentry(string color, double bClose)
+        {
+            if (!brickReentryEnabled) return;
+            if (brickReentryArmedAt == DateTime.MinValue || brickReentryDir == 0) return;
+            // Only re-board when flat (don't pile contracts on top of an open trade)
+            if (Position.MarketPosition != MarketPosition.Flat)
+            {
+                // Cancel arm if a new trade opened (the arm is stale)
+                ClearBrickReentryArm("position_open");
+                return;
+            }
+            // Window expiry
+            double secsArmed = (Time[0] - brickReentryArmedAt).TotalSeconds;
+            if (secsArmed > brickReentryWindowSec)
+            {
+                ClearBrickReentryArm("window_expired");
+                return;
+            }
+            // Quota
+            if (brickReentryUsedCount >= brickReentryMaxCount)
+            {
+                ClearBrickReentryArm("quota_used");
+                return;
+            }
+            // Cancel on opposite-color brick (continuation broke; trend likely flipped)
+            string needColor = (brickReentryDir == 1) ? "G" : "R";
+            if (color != needColor)
+            {
+                ClearBrickReentryArm("opp_brick");
+                return;
+            }
+            // Continuation streak gate
+            if (nrBrickStreakCount < brickReentryMinStreak) return;
+            // Fire — bypass only post-win cooldown
+            brickReentryBypassActive = true;
+            try
+            {
+                if (enableDiagLog) WriteDiagRow("BRICK_REENTRY_FIRE",
+                    "dir=" + brickReentryDir + " streak=" + nrBrickStreakCount
+                    + " secsArmed=" + ((int)secsArmed)
+                    + " exitPx=" + brickReentryArmExitPx.ToString("F2")
+                    + " curPx=" + bClose.ToString("F2")
+                    + " usedCount=" + (brickReentryUsedCount + 1) + "/" + brickReentryMaxCount);
+                if (brickReentryDir == 1) ExecuteLongEntry(false);
+                else                       ExecuteShortEntry(false);
+                brickReentryUsedCount++;
+                if (brickReentryUsedCount >= brickReentryMaxCount)
+                    ClearBrickReentryArm("quota_used_after_fire");
+            }
+            finally
+            {
+                brickReentryBypassActive = false;
+            }
+        }
+
+        private void ClearBrickReentryArm(string why)
+        {
+            if (brickReentryArmedAt == DateTime.MinValue) return;
+            if (enableDiagLog) WriteDiagRow("BRICK_REENTRY_DISARM", "why=" + why);
+            brickReentryArmedAt   = DateTime.MinValue;
+            brickReentryDir       = 0;
+            brickReentryArmExitPx = 0;
+            brickReentryUsedCount = 0;
+        }
+
         private void UpdateBrickAnalytics(string color, string prevColor, double bOpen, double bClose, double bHigh, double bLow)
         {
             // ---- 1.3 wick analyzer (per-brick) ----
@@ -6101,6 +6207,27 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "  Post-Win Distance Release (pts)", Order = 48, GroupName = "10 - Regime",
             Description = "Points price must have moved IN trade direction since last win for cooldown to release. Default 8.")]
         public double PostWinDistanceReleasePts { get { return postWinDistanceReleasePts; } set { postWinDistanceReleasePts = value; } }
+
+        // ===== v6 2.8 — BRICK RE-ENTRY (default ON, conservatively gated) =====
+        [NinjaScriptProperty]
+        [Display(Name = "  Brick Re-Entry Enabled", Order = 60, GroupName = "10 - Regime",
+            Description = "PHASE 2.8 — Default ON. After a brick-trail win exit (TRAIL_BrickTrail_*), arms a short window in which a fresh same-direction brick close re-fires the entry, bypassing only the post-win cooldown. Catches the continuation legs that the post-win cooldown forces us to miss. All other entry guards (CHOP, dir lockout, SL cluster, extension, session) still apply.")]
+        public bool BrickReentryEnabled { get { return brickReentryEnabled; } set { brickReentryEnabled = value; } }
+
+        [NinjaScriptProperty, Range(15, 600)]
+        [Display(Name = "  Brick Re-Entry Window (sec)", Order = 61, GroupName = "10 - Regime",
+            Description = "Seconds after the brick-trail win exit during which a re-entry can fire. Default 90.")]
+        public int BrickReentryWindowSec { get { return brickReentryWindowSec; } set { brickReentryWindowSec = value; } }
+
+        [NinjaScriptProperty, Range(2, 10)]
+        [Display(Name = "  Brick Re-Entry Min Streak", Order = 62, GroupName = "10 - Regime",
+            Description = "Minimum same-direction brick streak required at the re-entry trigger (the new continuation leg must already have N+ same-color bricks). Default 3.")]
+        public int BrickReentryMinStreak { get { return brickReentryMinStreak; } set { brickReentryMinStreak = value; } }
+
+        [NinjaScriptProperty, Range(1, 5)]
+        [Display(Name = "  Brick Re-Entry Max Per Parent", Order = 63, GroupName = "10 - Regime",
+            Description = "Maximum number of re-entries per parent win exit. Default 1 (single re-board, then standard logic resumes).")]
+        public int BrickReentryMaxCount { get { return brickReentryMaxCount; } set { brickReentryMaxCount = value; } }
         #endregion
     }
 }
