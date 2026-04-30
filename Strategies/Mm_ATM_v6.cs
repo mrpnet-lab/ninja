@@ -263,6 +263,19 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double   brickReentryArmExitPx     = 0;
         private int      brickReentryUsedCount     = 0;
         private bool     brickReentryBypassActive  = false;
+
+        // v6 2.9 - SMART TRAIL (anti-flip-trap + ADX-adaptive PxStop retrace).
+        // ROOT CAUSE FROM Day-28 Playback16: at 11:15-11:16 we entered SHORT 27221 and got
+        // flip-stopped 65sec later at 27253 (-$160). One opposite brick during a fresh entry
+        // is the textbook MM stop-hunt headfake; required a grace window. Separately the 5
+        // BrickTrail PxStop wins were great but used a fixed 5pt min-retrace - on strong trends
+        // (ADX rising + long streak) the trail should breathe wider; on dying trends, tighter.
+        private int    flipExitGraceSec        = 45;   // suppress brick-flip exit for first N sec after entry
+        private int    flipExitMinOppositeCnt  = 1;    // require N consecutive opposite-color bricks (1 = legacy)
+        private bool   pxStopAdaptiveEnabled   = true; // scale PxStop min-retrace by ADX slope + streak
+        private double pxStopAdxRisingMult     = 1.5;  // strong trend (ADX rising + streak >= N) -> wider retrace
+        private double pxStopAdxFallingMult    = 0.7;  // dying trend (ADX falling) -> tighter retrace, lock fast
+        private int    pxStopStrongStreakMin   = 5;    // streak needed to qualify as "strong"
         // Run tracker (live counters):
         private int    runCurrentLen;             // = nrBrickStreakCount but kept independent in case
         private string runCurrentColor = "";      // "G"/"R"
@@ -874,6 +887,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                     brickTrailMaxGivebackPct      = 0;
                     brickTrailGivebackMinPeakPts  = 20.0;
                     brickTrailGivebackStallSec    = 45;
+                    // v6 2.9 - Smart Trail defaults
+                    flipExitGraceSec              = 45;
+                    flipExitMinOppositeCnt        = 1;
+                    pxStopAdaptiveEnabled         = true;
+                    pxStopAdxRisingMult           = 1.5;
+                    pxStopAdxFallingMult          = 0.7;
+                    pxStopStrongStreakMin         = 5;
                     inBarTrailEnabled               = true;
                     inBarTrailMinPeakPts            = 25.0;
                     inBarTrailGivebackPts           = 16.0;
@@ -1573,6 +1593,24 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (pendingBrickFlipExit && enableBrickTrail && brickAutoGate)
             {
                 pendingBrickFlipExit = false;
+                // v6 2.9 - GRACE WINDOW: suppress flip exit for first N sec after entry.
+                // Reason: Day-28 Playback16 11:15-11:16 SHORT killed by single opposite brick 65s
+                // after entry (-$160). MM stop-hunt headfake. If trend really reversed, hard SL or
+                // a second opposite brick (configurable via FlipExitMinOppositeCnt) will catch us.
+                if (flipExitGraceSec > 0 && lastEntryWallTime != DateTime.MinValue)
+                {
+                    double secsHeld = (Time[0] - lastEntryWallTime).TotalSeconds;
+                    if (secsHeld < flipExitGraceSec)
+                    {
+                        if (enableDiagLog)
+                            WriteDiagRow("BRICK_FLIP_GRACE_SKIP",
+                                "secsHeld=" + secsHeld.ToString("F0")
+                                + " grace=" + flipExitGraceSec
+                                + " color=" + lastNrBrickColor
+                                + " px=" + price.ToString("F2"));
+                        return; // skip; let hard SL / next opposite brick handle real reversal
+                    }
+                }
                 lastExitReason = "TRAIL_BrickTrail_Flip";
                 if (enableDiagLog)
                     WriteDiagRow("BRICK_TRAIL_HIT",
@@ -1678,10 +1716,24 @@ namespace NinjaTrader.NinjaScript.Strategies
                     // body anchor (which often sits ~4pt below peak inside a fast run) exits on a 1-2pt
                     // mid-brick wiggle. Default 5pt = at least one-tick-of-noise + 4pt real retrace.
                     double retraceFromPeak = trailMaxProfitPts - profitPts;
+                    // v6 2.9 - ADAPTIVE PxStop min-retrace: scale by ADX slope & streak strength.
+                    // Strong trend (ADX rising + long same-dir streak) -> let trail breathe wider so
+                    // we don't get shaken out of $1000+ runners. Dying trend (ADX falling) -> tighten
+                    // to lock profit before the giveback gets ugly. Day-28 Playback16: would have
+                    // protected the 12:19 SHORT (peak 40pt -> retrace 28pt = 70% giveback before exit).
+                    double effRetracePts = brickTrailPriceStopMinRetracePts;
+                    if (pxStopAdaptiveEnabled)
+                    {
+                        bool sameDirBrick = (openTradeDirection ==  1 && lastNrBrickColor == "G")
+                                         || (openTradeDirection == -1 && lastNrBrickColor == "R");
+                        bool strongTrend  = sameDirBrick && nrBrickStreakCount >= pxStopStrongStreakMin;
+                        if (strongTrend && lastAdxSlope > 0)         effRetracePts *= pxStopAdxRisingMult;
+                        else if (lastAdxSlope < 0)                    effRetracePts *= pxStopAdxFallingMult;
+                    }
                     if (brickTrailPriceStopEnabled
                         && trailPrice > 0
                         && trailMaxProfitPts >= brickTrailPriceStopMinPeakPts
-                        && retraceFromPeak >= brickTrailPriceStopMinRetracePts
+                        && retraceFromPeak >= effRetracePts
                         && ((openTradeDirection ==  1 && price <= trailPrice)
                          || (openTradeDirection == -1 && price >= trailPrice)))
                     {
@@ -1692,8 +1744,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 + " peak=" + trailMaxProfitPts.ToString("F1")
                                 + "pt cur=" + profitPts.ToString("F1")
                                 + "pt retrace=" + retraceFromPeak.ToString("F1")
+                                + "pt effRetraceMin=" + effRetracePts.ToString("F1")
                                 + "pt trail=" + trailPrice.ToString("F2")
                                 + " px=" + price.ToString("F2")
+                                + " adxSlope=" + lastAdxSlope.ToString("F2")
+                                + " streak=" + nrBrickStreakCount
                                 + " effPct=" + effPct.ToString("F0"));
                         if (openTradeDirection == 1) ExitLong(); else if (openTradeDirection == -1) ExitShort();
                         pendingExit = true;
@@ -4099,10 +4154,17 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 streakMinBodyHigh = double.MaxValue;
                 streakMaxBodyLow  = double.MinValue;
-                // First brick of a NEW streak is OPPOSITE color of the prior streak.
-                // If we're in a position and the new brick closed against us, fire the brick-flip exit.
-                if (openTradeDirection != 0 && enableBrickTrail
-                    && ((openTradeDirection == -1 && color == "G") || (openTradeDirection == 1 && color == "R")))
+            }
+            // v6 2.9 - FLIP DETECTION with min-opposite-bricks gate. Default 1 = legacy behavior
+            // (fire on first opposite brick). Set to 2 for noisy regimes - requires 2 consecutive
+            // opposite-color bricks before arming flip exit. Combined with flipExitGraceSec this
+            // eliminates the 1-brick MM-headfake stop-out pattern. Evaluated EVERY brick close so
+            // it works for streak == 1 (legacy) and streak >= 2 (stricter modes).
+            if (openTradeDirection != 0 && enableBrickTrail && color != "")
+            {
+                bool brickAgainst = (openTradeDirection == -1 && color == "G")
+                                 || (openTradeDirection ==  1 && color == "R");
+                if (brickAgainst && nrBrickStreakCount >= flipExitMinOppositeCnt)
                 {
                     pendingBrickFlipExit = true;
                 }
@@ -6228,6 +6290,37 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "  Brick Re-Entry Max Per Parent", Order = 63, GroupName = "10 - Regime",
             Description = "Maximum number of re-entries per parent win exit. Default 1 (single re-board, then standard logic resumes).")]
         public int BrickReentryMaxCount { get { return brickReentryMaxCount; } set { brickReentryMaxCount = value; } }
+
+        // ===== v6 2.9 — SMART TRAIL (anti-flip-trap + ADX-adaptive PxStop retrace) =====
+        [NinjaScriptProperty, Range(0, 300)]
+        [Display(Name = "  Flip Exit Grace (sec)", Order = 64, GroupName = "10 - Regime",
+            Description = "PHASE 2.9 — Suppress brick-flip exit for first N seconds after entry. Eliminates the MM stop-hunt headfake (single opposite brick killing fresh entry). Hard SL still active. 0 = disable. Default 45.")]
+        public int FlipExitGraceSec { get { return flipExitGraceSec; } set { flipExitGraceSec = value; } }
+
+        [NinjaScriptProperty, Range(1, 5)]
+        [Display(Name = "  Flip Exit Min Opposite Bricks", Order = 65, GroupName = "10 - Regime",
+            Description = "Require N consecutive opposite-color bricks before arming the flip exit. 1 = legacy (fire on first opposite brick). 2 = require confirmation (recommended for chop-prone sessions). Default 1.")]
+        public int FlipExitMinOppositeCnt { get { return flipExitMinOppositeCnt; } set { flipExitMinOppositeCnt = value; } }
+
+        [NinjaScriptProperty]
+        [Display(Name = "  PxStop Adaptive Retrace Enabled", Order = 66, GroupName = "10 - Regime",
+            Description = "PHASE 2.9 — Scale BrickTrail PxStop min-retrace by ADX slope + streak. Strong trend (ADX rising + streak >= N) widens retrace so runners breathe; dying trend (ADX falling) tightens to lock profit. Default ON.")]
+        public bool PxStopAdaptiveEnabled { get { return pxStopAdaptiveEnabled; } set { pxStopAdaptiveEnabled = value; } }
+
+        [NinjaScriptProperty, Range(1.0, 3.0)]
+        [Display(Name = "  PxStop ADX-Rising Multiplier", Order = 67, GroupName = "10 - Regime",
+            Description = "Multiplier applied to PxStop min-retrace when ADX is rising AND brick streak >= strong-streak gate AND last brick agrees with our direction. Default 1.5.")]
+        public double PxStopAdxRisingMult { get { return pxStopAdxRisingMult; } set { pxStopAdxRisingMult = value; } }
+
+        [NinjaScriptProperty, Range(0.3, 1.0)]
+        [Display(Name = "  PxStop ADX-Falling Multiplier", Order = 68, GroupName = "10 - Regime",
+            Description = "Multiplier applied to PxStop min-retrace when ADX is falling. Locks profit faster on dying trends. Default 0.7.")]
+        public double PxStopAdxFallingMult { get { return pxStopAdxFallingMult; } set { pxStopAdxFallingMult = value; } }
+
+        [NinjaScriptProperty, Range(2, 15)]
+        [Display(Name = "  PxStop Strong Streak Min", Order = 69, GroupName = "10 - Regime",
+            Description = "Minimum same-direction brick streak (with current brick agreeing) to qualify as a 'strong trend' for the PxStop adaptive widening. Default 5.")]
+        public int PxStopStrongStreakMin { get { return pxStopStrongStreakMin; } set { pxStopStrongStreakMin = value; } }
         #endregion
     }
 }
