@@ -259,6 +259,17 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int    freshReversalBypassPriorRunMin = 5;
         private int    lastEndedRunLen               = 0;
         private string lastEndedRunColor             = "";
+        // v6 2.7.10 - CHOP fresh-reversal bypass: same idea as 2.7.9 but for the BLOCK_CHOP filter.
+        // Validated 2026-04-28: 41 BLOCK_CHOP rows including R10/R11/R12 of a clean down-extension
+        // (range 12.25 < 18.48 over 5b). When a real reversal starts, range over the prior 5 bars
+        // is small because we just reversed - exactly the false-positive the bypass kills.
+        private bool   chopFreshReversalBypassEnabled = true;
+        // v6 2.7.10 - Post-win price-distance release: the post-win cooldown protects against MM
+        // stop-runs back to our exit. If price has moved >= N points IN OUR DIRECTION since the win,
+        // the stop-run scenario clearly didn't happen - release the cooldown. Validated 2026-04-28:
+        // 13 consecutive BLOCK_POST_WIN R-bricks while down-trend extended 30+pt (R13->R13).
+        private bool   postWinDistanceReleaseEnabled = true;
+        private double postWinDistanceReleasePts    = 8.0;  // half-brick
         // Run tracker (live counters):
         private int    runCurrentLen;             // = nrBrickStreakCount but kept independent in case
         private string runCurrentColor = "";      // "G"/"R"
@@ -434,6 +445,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int           postWinSameDirCooldownMin     = 7;     // minutes to block same-direction re-entry after a win
         private DateTime      lastWinExitTime               = DateTime.MinValue;
         private int           lastWinExitDirection          = 0;     // +1=long win, -1=short win
+        private double        lastWinExitPrice              = 0;     // v6 2.7.10 - for price-distance bypass
         // ----- Directional lockout (per-direction loss-streak block) -----
         // After N losing SL/AGGR_ADVERSE exits in the SAME direction within a sliding window, lock
         // that direction for L minutes. Defends the pattern seen on 2026-03-20 PM where the strategy
@@ -2465,9 +2477,29 @@ namespace NinjaTrader.NinjaScript.Strategies
                 string chopReason;
                 if (IsChoppy(direction, out chopReason))
                 {
-                    UpdateDashboardStatus(label + " blocked: CHOP " + chopReason, Brushes.Orange);
-                    if (enableDiagLog) WriteDiagRow("BLOCK_CHOP", chopReason);
-                    return false;
+                    // v6 2.7.10 - FRESH-REVERSAL BYPASS for CHOP. Same predicate as 2.7.9 UNKNOWN bypass:
+                    // brick agrees + new streak >= N + prior opposite run >= M. Tape-against rule still
+                    // overrides (we never override OFB tape). The range/EMA/ADX rules are the false-
+                    // positives during the first 5-10 bricks of a real reversal.
+                    string oppColor2 = (direction == 1) ? "R" : "G";
+                    bool brickAgreesC = (direction == 1 && lastNrBrickColor == "G")
+                                     || (direction == -1 && lastNrBrickColor == "R");
+                    bool chopBypass = chopFreshReversalBypassEnabled
+                        && brickAgreesC
+                        && nrBrickStreakCount >= freshReversalBypassStreakMin
+                        && lastEndedRunColor == oppColor2
+                        && lastEndedRunLen   >= freshReversalBypassPriorRunMin
+                        && !chopReason.StartsWith("tape against"); // tape rule never bypassed
+                    if (!chopBypass)
+                    {
+                        UpdateDashboardStatus(label + " blocked: CHOP " + chopReason, Brushes.Orange);
+                        if (enableDiagLog) WriteDiagRow("BLOCK_CHOP", chopReason);
+                        return false;
+                    }
+                    if (enableDiagLog) WriteDiagRow("BYPASS_CHOP_FRESH_REVERSAL",
+                        "dir=" + direction + " brick=" + lastNrBrickColor + "x" + nrBrickStreakCount
+                        + " priorOppRun=" + lastEndedRunColor + "x" + lastEndedRunLen
+                        + " chopReason=" + chopReason);
                 }
             }
             // v6 2.4 — UNKNOWN-Regime Auto-Block (AUTO ONLY — manual entries bypass).
@@ -2560,10 +2592,33 @@ namespace NinjaTrader.NinjaScript.Strategies
                     }
                     if (!smartBypass)
                     {
-                        int remainSec = (int)((postWinSameDirCooldownMin - minsSinceWin) * 60);
-                        UpdateDashboardStatus(label + " blocked: POST-WIN cooldown " + remainSec + "s", Brushes.Orange);
-                        if (enableDiagLog) WriteDiagRow("BLOCK_POST_WIN", "dir=" + direction + " mins_since_win=" + minsSinceWin.ToString("F1") + " cooldown=" + postWinSameDirCooldownMin + "m");
-                        return false;
+                        // v6 2.7.10 - PRICE-DISTANCE RELEASE: the cooldown protects against MM
+                        // stop-runs that ramp price back to our exit, then continue. If price has
+                        // already moved N pts IN OUR DIRECTION since the win, that scenario didn't
+                        // happen - the move continued. Release cooldown so we can re-board.
+                        bool distRelease = false;
+                        if (postWinDistanceReleaseEnabled && lastWinExitPrice > 0 && postWinDistanceReleasePts > 0)
+                        {
+                            double moved = (direction == 1)
+                                ? (Close[0] - lastWinExitPrice)
+                                : (lastWinExitPrice - Close[0]);
+                            if (moved >= postWinDistanceReleasePts)
+                            {
+                                distRelease = true;
+                                if (enableDiagLog) WriteDiagRow("POST_WIN_DIST_RELEASE",
+                                    "dir=" + direction + " moved=" + moved.ToString("F1")
+                                    + "pt thr=" + postWinDistanceReleasePts.ToString("F1")
+                                    + " exit_px=" + lastWinExitPrice.ToString("F2")
+                                    + " cur_px=" + Close[0].ToString("F2"));
+                            }
+                        }
+                        if (!distRelease)
+                        {
+                            int remainSec = (int)((postWinSameDirCooldownMin - minsSinceWin) * 60);
+                            UpdateDashboardStatus(label + " blocked: POST-WIN cooldown " + remainSec + "s", Brushes.Orange);
+                            if (enableDiagLog) WriteDiagRow("BLOCK_POST_WIN", "dir=" + direction + " mins_since_win=" + minsSinceWin.ToString("F1") + " cooldown=" + postWinSameDirCooldownMin + "m");
+                            return false;
+                        }
                     }
                 }
             }
@@ -3557,6 +3612,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 // Track for post-win same-direction cooldown
                                 lastWinExitTime = Time[0];
                                 lastWinExitDirection = last.Entry.MarketPosition == MarketPosition.Long ? 1 : -1;
+                                lastWinExitPrice = Close[0]; // v6 2.7.10 distance bypass anchor
                                 if (enableDiagLog) WriteDiagRow("EXIT_WIN_" + reason, "pnl=" + last.ProfitCurrency.ToString("F2") + " consec=" + consecutiveWins);
                                 // Auto-widen on N consecutive wins
                                 if (autoWidenOnWinsEnabled && consecutiveWins >= autoWidenWinN && baseAggressiveTrailFactor > 0)
