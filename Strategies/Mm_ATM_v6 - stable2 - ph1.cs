@@ -7124,12 +7124,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             Description = "PHASE 3.3 - Minimum brick streak in direction for PreTrendChase. Default 5 (clear run, not 1-2 brick noise).")]
         public int PreTrendChaseMinStreak { get { return preTrendChaseMinStreak; } set { preTrendChaseMinStreak = value; } }
 
-        [NinjaScriptProperty, Range(30, 120)]
+        [NinjaScriptProperty, Range(60, 120)]
         [Display(Name = "  PreTrendChase Min Conf", Order = 67, GroupName = "10 - Regime",
-            Description = "PHASE 3.3 - Minimum Bull/Bear confidence for PreTrendChase to fire. v4.1 lowered to 55 (catches strong UNKNOWN runs at 77.5 conf then 35-57).")]
+            Description = "PHASE 3.3 - Minimum Bull/Bear confidence for PreTrendChase to fire. Default 70 (lowered from 80 in v3.4 to catch the 13:00 STRONG_BUY at 77.5).")]
         public double PreTrendChaseMinConf { get { return preTrendChaseMinConf; } set { preTrendChaseMinConf = value; } }
 
-        [NinjaScriptProperty, Range(5, 40)]
+        [NinjaScriptProperty, Range(5, 20)]
         [Display(Name = "  PreTrendChase Max Streak", Order = 68, GroupName = "10 - Regime",
             Description = "PHASE 3.4 - Exhaustion cap. Don't fire PreTrendChase when brick streak exceeds this (e.g. brick 13 of a 13-brick run = capitulation, not continuation). Default 9.")]
         public int PreTrendChaseMaxStreak { get { return preTrendChaseMaxStreak; } set { preTrendChaseMaxStreak = value; } }
@@ -7144,7 +7144,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             Description = "PHASE 3.4 - Bypass htfBias entry block when brick streak in trade direction >= this (htfBias is stale: brick chart already proved direction changed). Default 8.")]
         public int HtfStalenessOverrideStreak { get { return htfStalenessOverrideStreak; } set { htfStalenessOverrideStreak = value; } }
 
-        [NinjaScriptProperty, Range(10, 100)]
+        [NinjaScriptProperty, Range(10, 50)]
         [Display(Name = "  TrendChase Max Streak", Order = 71, GroupName = "10 - Regime",
             Description = "PHASE 3.6 - Exhaustion cap for TrendChase. Don't enter when brick streak in trend dir exceeds this. Today's 13:42 32-brick LONG trapped -$175. Default 25.")]
         public int TrendChaseMaxStreak { get { return trendChaseMaxStreak; } set { trendChaseMaxStreak = value; } }

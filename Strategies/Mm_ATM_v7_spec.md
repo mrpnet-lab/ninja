@@ -1,12 +1,16 @@
-﻿# Mm_ATM_v6 â€” Design Specification & Implementation Summary
+﻿# Mm_ATM_v7 — Design Specification & Implementation Summary
 
-**Version:** 6.0  
-**Date:** April 28, 2026  
-**Base reference:** `Mm_ATM_v5.cs` v5 14.20 (frozen â€” kept intact for live trading and A/B comparison)  
-**Target file:** `Mm_ATM_v6.cs`  
-**Platform:** NinjaTrader 8.1+ â€” NQ Futures (MNQ compatible)
+**Version:** 7.0.1
+**Date:** April 30, 2026
+**Base reference:** `Mm_ATM_v6.cs` v6 4.2 (frozen — kept intact for forensic comparison)
+**Target file:** `Mm_ATM_v7.cs`
+**Platform:** NinjaTrader 8.1+ — NQ Futures (MNQ compatible)
 
-> **Note on lineage:** Historical sections below (the v4 â†’ v5 rewrite, the original 12-filter design, etc.) are preserved as-is for context. They describe how the codebase reached its v5 14.20 baseline, which is the seed `Mm_ATM_v6.cs` was forked from. New v6 work is documented in Â§18 (v6 roadmap) and Â§19 (active workplan), and all *new* version tags use `v6 0.x` numbering.
+> **Note on lineage:** This spec was forked from `Mm_ATM_v6_spec.md`. All historical sections (v4→v5 rewrite, v5 14.x, v6 0.x–4.2 phases) are preserved verbatim; comments inside `Mm_ATM_v7.cs` likewise keep their original `v6 X.Y` tags as forensic anchors. **New v7 work is appended in §20 (v7 roadmap & changelog) and tagged `v7 0.x`.**
+
+> **Companion docs:**
+> - `Mm_ATM_v7_DOC.md` — user-facing parameter reference & dashboard guide.
+> - `Diags/Mm_ATM_v7_Changelog.md` — running PnL ledger and per-release validation results.
 
 ---
 
@@ -2593,3 +2597,249 @@ Run Playback session (PB20+) with v6 3.1 and verify:
 - v6 3.3 - Daily-Adapt: auto-tune brick-trail aggressiveness from opening-hour realized vol.
 
 ---
+
+
+---
+
+## 20. v7 Roadmap & Changelog
+
+> v7 was forked from v6 4.2 stable on 2026-04-30. The fork was made because v6 4.2 passed its phase-1–7 build goals and is now used as the apples-to-apples comparison baseline. All v7 work tracks deltas from that baseline.
+
+### 20.1 Design discipline for v7
+
+1. **Forensic-first.** No tactical change ships without a corresponding playback comparison vs the prior version on the same dataset.
+2. **Instrument first, relax second.** When a gate looks too restrictive, add a `WOULD_TRADE` audit row first; relax the live gate only after the audit confirms expected alpha.
+3. **Per-release ledger.** Every shipped version logs its changes in `Diags/Mm_ATM_v7_Changelog.md` with: code surfaces touched, expected impact, validation checklist.
+4. **Comment-tag rule.** New code is tagged `// v7 X.Y - <reason>`. Existing `// v6 X.Y` tags are preserved (forensic anchors). Do not retroactively renumber.
+5. **No removal of v6 history.** The version-history block in the file header keeps every v6 line; v7 lines are appended above the v6 history block.
+
+### 20.2 v7 0.1 (2026-04-30) — v4.3 ports + audit instrumentation
+
+**Trigger:** v4.0-vs-v4.2 forensic comparison on RTH 2026-04-30 playback (see `Diags/Mm_ATM_v7_Changelog.md`).
+- v4.0 baseline: 6 trades, +$530 (avg $88/trade)
+- v4.2: 3 trades + 8 silent blocks, +$445 (avg $148/trade — quality up but $ down)
+- Phase 7 win confirmed (Trade #3 SHORT in TREND_DN: v4.0 $125 → v4.2 $325, +$200/+160%)
+- Penalty: 8 `outsideHours` blocks pre-RTH cost ~$150–$300
+
+**Changes shipped (4):**
+
+| # | Change | Code surface | Behavior |
+|---|--------|--------------|----------|
+| 1 | Pre-RTH bypass | `TryAutoEntry` outsideHours gate | If `regime ∈ {TREND_UP, TREND_DN}` AND `nrBrickStreakCount ≥ preRthTrendMinStreak (12)` AND brick color matches direction, skip outsideHours block. Emits `PRE_RTH_BYPASS` diag. |
+| 2 | Streak-Hold loosen | brick-trail PxStop section (~L2113) | When `nrBrickStreakCount ≥ streakHoldMaxStreak (8)`, disable the v6 4.1 streak-hold guard (clean impulse — legacy retrace already catches reversal). |
+| 3 | Chop peak-lock mult lift | `peakLockChopMult` (field) | 0.80 → 0.85. UNKNOWN-regime trade T#5 had been SL'd at +$10 in v4.2 due to overtight giveback. |
+| 5 | WOULD_TRADE audit | `LogSilentBlock` | When any silent BLOCK_AUTO fires AND brick streak ≥ `wouldTradeMinStreak (8)` with matching color in TREND/UNKNOWN, also emit `WOULD_TRADE,blockedBy=<reason> dir=<L/S> regime=<r> streak=<n> bullConf=<c> bearConf=<c>`. Throttled per `(reason+dir, bar)`. Pure observation; no live trading effect. |
+
+**New private fields:**
+- `preRthTrendBypassEnabled = true`
+- `preRthTrendMinStreak = 12`
+- `streakHoldMaxStreak = 8`
+- `enableWouldTradeAudit = true`
+- `wouldTradeMinStreak = 8`
+- `lastWouldTradeBar`, `lastWouldTradeKey` (throttle state)
+
+**New diag tags:**
+- `PRE_RTH_BYPASS,regime=<r> streak=<n> color=<G|R>`
+- `WOULD_TRADE,blockedBy=<reason> dir=<LONG|SHORT> regime=<r> streak=<n> bullConf=<c> bearConf=<c>`
+
+**Validation checklist (run after next playback):**
+- [ ] PnL ≥ +$530 (matches or beats v4.0 baseline)
+- [ ] At least one `PRE_RTH_BYPASS` row on a session with overnight TREND
+- [ ] WOULD_TRADE row count by `blockedBy` (informs v7 0.2 priorities)
+- [ ] Phase 7: chop-mult lift increases UNKNOWN-regime trade capture
+- [ ] Streak-Hold loosen: any same-pattern re-entries that v4.2 had blocked
+
+**Deferred (candidates for v7 0.2+):**
+- Phase 5 cross-session persistence (write `captureRatioByRegime` to disk; today auto-tune doesn't fire until 30 trades in a single session)
+- Per-regime trail capture stats persisted (lift to multi-day rolling)
+- Tombstone-comment cleanup pass (~25 historical `// v6 2.7.x - REMOVED` lines + dead `BrickTrailProfitLockEnabled` no-op block, ~120 lines) — defer until v7 has 2 clean playback validations
+- Dashboard simplification pass (TBD with user)
+
+
+### 20.3 v7 0.2 (2026-04-30) — "Premium Re-Arm"
+
+**Trigger:** v7 0.1 first playback (RTH 2026-04-30, +$975) hit `maxTradesPerDay=20` cap at **11:55:36**. The WOULD_TRADE audit (shipped in 0.1) immediately proved the instrumentation thesis: from 13:00–13:59 the log emitted 43 `BLOCK_AUTO,reason=maxTrades` rows during a streak-43 TREND_UP run (price 27363 → 27547, ≈ +$3,440/contract raw move) with `bullConf` 65–108. That single missed trend was worth more than the entire day''s realized PnL.
+
+**Design lesson:** `maxTradesPerDay` is a blunt anti-revenge guardrail. In its v6 form it cannot distinguish "20 small wins on quiet morning chop → still locked out at 13:00" from "20 SL-hits in 30 min → please stop". v7 0.2 splits the cap''s semantics:
+
+1. **Quality-aware bypass** (Change A) — clean trends always get a finite quota of bypasses regardless of count.
+2. **Outcome-aware accounting** (Change B) — winners refund the budget; losers and scratches consume it.
+
+**Changes shipped (3):**
+
+| # | Change | Code surface | Behavior |
+|---|--------|--------------|----------|
+| A | Premium-trend cap bypass | `TryAutoEntry` maxTrades branch + `IsPremiumBypassEligible(direction)` helper + secondary check in `CanProceedToEntry` | When cap hit, allow entry IFF `regime ∈ {TREND_UP, TREND_DN}` AND brick color matches dir AND `streak ≥ premiumStreak (12)` AND matching `confidence ≥ premiumMinConf (85)` AND `dailyRealizedPnL ≥ premiumMinPnl ($0)`. Capped at `premiumExtraTrades (5)` per session. Emits `PREMIUM_BYPASS` diag. |
+| B | Cap refund on winners | `OnExecutionUpdate` win branch | Closed trade with `ProfitCurrency ≥ cdScratchThreshold ($25)` decrements `dailyTradeCount` (floor 0). Emits `CAP_REFUND` diag. |
+| C | Diag instrumentation | `WriteDiagRow` calls | New tags `PREMIUM_BYPASS` and `CAP_REFUND`; existing WOULD_TRADE audit kept active for forensic continuity. |
+
+**New private fields:**
+- `premiumBypassEnabled = true`
+- `premiumStreak = 12`
+- `premiumMinConf = 85`
+- `premiumMinPnl = 0.0`
+- `premiumExtraTrades = 5`
+- `premiumExtraUsed = 0` (reset in OnSessionRoll + ResetSessionFlags)
+- `cdScratchThreshold = 25.0`
+
+**New diag tags:**
+- `PREMIUM_BYPASS,dir=<L|S> regime=<r> streak=<n> conf=<c> dailyPnl=<p> extraUsed=<n>/<max> tradesToday=<n>/<cap>`
+- `CAP_REFUND,pnl=<p> thr=<t> tradesToday=<n>/<cap>`
+
+**Guardrails (all six must hold for bypass to fire):**
+- Regime ∈ {TREND_UP, TREND_DN} (no chop bypasses)
+- Brick color matches direction (no fade entries)
+- Streak ≥ 12 (no noise re-entries)
+- Confidence ≥ 85 (high-quality only)
+- `dailyPnL ≥ $0` (never double down on a losing day)
+- `premiumExtraUsed < 5` (hard sub-cap; worst case 25 total trades, not unbounded)
+
+**Validation checklist (run after next playback):**
+- [ ] PnL ≥ $1,200 lower bound; ≥ $2,000 stretch goal
+- [ ] At least one `PREMIUM_BYPASS` row in 13:xx hour
+- [ ] `CAP_REFUND` rows fire on each ≥ $25 winner — does it meaningfully extend the budget?
+- [ ] WOULD_TRADE rows still emitted for non-bypassed blocks (forensic continuity intact)
+- [ ] No premium-bypass entries that immediately SL — if so, tighten `premiumStreak`→15 or `premiumMinConf`→95 in v7 0.3
+
+**Deferred (still candidates for v7 0.3+):**
+- Phase 5 cross-session capture-ratio persistence (write to disk; today's auto-tune doesn't fire until 30 trades in a single session)
+- Per-regime trail capture stats persisted (lift to multi-day rolling)
+- Tombstone-comment cleanup pass (~25 historical `// v6 2.7.x - REMOVED` lines + dead `BrickTrailProfitLockEnabled` no-op block, ~120 lines) — defer until v7 has 2 clean playback validations
+- Dashboard simplification pass (TBD with user)
+- Time-of-day `+N` cap reset (e.g. add 5 to cap at 13:30 ET if `dailyPnL > +$200`) — only if v7 0.2 still gets locked out
+
+
+### 20.4 v7 0.3 (2026-04-30) — "Ride The Brick"
+
+**Trigger:** v7 0.2 second playback (RTH 2026-04-30, **+$1,275** / 9 trades) confirmed the cap-bypass + cap-refund work. But the user flagged severe **over-trading inside single trends** -- the same continuous move was being sliced into 4-6 mini-trades. Forensic on the 09:35 SHORT cluster:
+
+| Time | Action | Detail |
+|---|---|---|
+| 09:35:00 | ENTRY_SHORT | regime=TREND_DN, streak=13 (already 13 R bricks deep) |
+| 09:35:49 | PROFIT_SAFEGUARD T1 | peak=13.8pt, SL→27341.75 (-2pt offset) |
+| 09:35:49 | REGIME_CHANGE | TREND_DN→UNKNOWN (adxSlope dipped to -0.57; streak still ALIVE 17 R) |
+| 09:35:51 | BRICK_TRAIL_HIT | px_stop_extreme, retrace=4.0pt, **effRetraceMin=2.9pt** → exit +$190 (51s in market) |
+| 09:36:16 | RUN_END | color=R, len=17, **maxFav=80pt** ($1,600/contract not captured) |
+| 09:37:55→09:47:31 | 4 more SHORTs | small captures totalling +$330; one −$415 trap |
+
+**Net:** sliced one ~$1,600 winner into +$520 across 5 trades + 1 loss = **net ~$105 vs would-be ~$1,600**.
+
+**Root cause:** the `pxStopAdxFallingMult = 0.7` path *tightens* `effRetracePts` whenever `lastAdxSlope < 0`, even by a hair (-0.57). Inside an alive 17-brick same-direction streak, that's exactly the wrong reaction -- a slight ADX wobble is normal mid-trend MM noise, not a reversal signal.
+
+**Change shipped (single surgical patch):**
+
+| # | Change | Code surface | Behavior |
+|---|--------|--------------|----------|
+| A | **RIDE_LOCK in PxStop** | brick-trail PxStop adaptive block | When alive same-direction streak ≥ `rideStreakMin (5)` AND last same-color brick within `rideRecentBrickSec (30s)` AND `lastAdxSlope > rideMinSlope (-2.0)`, compute `rideMult = min(rideStreakMaxMult 1.5, 1 + (streak-min) × rideStreakPerBrickBonus 0.05)`. Final `effRetracePts = max(adaptive-output, baseline × rideMult)`. Effectively: never let fallingMult tighten during a live streak; widen progressively as streak grows. Emits `RIDE_LOCK_PXSTOP` (throttled per-bar). |
+
+**New private fields:**
+- `rideLockEnabled = true`
+- `rideStreakMin = 5`
+- `rideMinSlope = -2.0`
+- `rideStreakPerBrickBonus = 0.05`
+- `rideStreakMaxMult = 1.5`
+- `rideRecentBrickSec = 30`
+- `lastRideLockBar = -1` (throttle state)
+
+**New diag tag:**
+- `RIDE_LOCK_PXSTOP,streak=<n> slope=<s> base=<b> prevMult_eff=<m> rideMult=<r> newEff=<e> peak=<p> cur=<c>`
+
+**Expected impact on 09:35 SHORT case:**
+- Old: streak=17, slope=-0.57 → effRetracePts = 2.9 × 0.7 (fallingMult) = 2.03 → 4.0pt retrace fired exit at +$190.
+- New: streak=17, slope=-0.57 (> -2.0) → rideMult = min(1.5, 1 + 12×0.05) = min(1.5, 1.6) = 1.5 → newEff = 2.9 × 1.5 = 4.35pt → 4.0pt retrace does NOT fire → trade rides until either real flip brick or PEAKLOCK floor → est. +$700–$1,200 single trade vs old +$190 + 4 re-entries.
+
+**Validation checklist (run after playback):**
+- [ ] PnL ≥ +$1,500 (lower bound: trail holds the morning SHORT cluster)
+- [ ] Stretch PnL ≥ +$2,500
+- [ ] At least one `RIDE_LOCK_PXSTOP` row in 09:35–09:42 window (the canonical case)
+- [ ] Trade count drops materially (today's 9 → expect 5-7 with same or better PnL per trade)
+- [ ] No premium-bypass entries that fail (continued v7 0.2 health)
+- [ ] PROFIT_SAFEGUARD ladder still fires correctly on big peaks (RIDE_LOCK does not interfere)
+
+**Failure modes & next-step plan:**
+- **RIDE_LOCK holds too long, gives back winnings:** lower `rideStreakMaxMult` to 1.3 OR raise `rideStreakMin` to 7 in v7 0.4.
+- **Still over-trading after RIDE_LOCK:** add Brick-Reentry suppression (skip BRICK_REENTRY_FIRE if alive same-dir streak still in flight) in v7 0.4.
+- **Misses true trend collapse:** raise `rideMinSlope` to -1.0 (more strict on slope health).
+
+**Deferred (still candidates for v7 0.4+):**
+- Dormant-trail SL tightening: when `peakLockTierActive == 0` and peak ≥ 5pt, move hidden SL closer (entry ± atr*0.6) but never within `dormantSlGap (1.5pt)` of price -- "tight when dormant but not crowding the trail" per user spec.
+- 10:40–11:30 LONG miss fix: streak=51 / 188pt run blocked by post-loss cooldown + htfBlockL + extension filter. Needs a "premium override" similar to v7 0.2 PREMIUM_BYPASS but for cooldown/htfBlock/extension stack.
+- REGIME_CHANGE hysteresis: only downgrade TREND_X → UNKNOWN if condition holds N consecutive bars (today single-bar dip flips regime).
+- Phase 5 cross-session capture-ratio persistence (still pending from v7 0.1).
+- Tombstone-comment + dead-code cleanup pass (defer until v7 has 3 clean playback validations).
+
+
+---
+
+## 21. Failed Experiments — Lessons Learned (do NOT repeat)
+
+This section records v7 attempts that **regressed PnL vs the v7 0.3 baseline ($2,250 / 32 trades RTH 2026-04-30)**. They are preserved here so we don't reinvent the same broken designs. All code from these attempts has been DELETED from `Mm_ATM_v7.cs`. Forensic backups are in `Old/`.
+
+### 21.1 v7 0.4 (2026-05-01) — "Ride The Trend" — RESULT: +$1,770 / 12 trades (-21% vs v0.3)
+
+**What it did:** When `runnerModeActive_user == true` (manual RUN button OR auto-engaged on streak ≥ `rideAutoStreak (7)` in `TREND_*`), suppress PxStop AND InBar exits — exit ONLY on brick-flip / hard SL / PEAK-LOCK floor. Auto-disengage on flat.
+
+**Why it failed:**
+- Captured the +$2,000 single-best trade ever (14:25 LONG runner) — proof the suppression core works on a true trend.
+- BUT morning auto-RIDE engaged on apparent trends that were actually MM fakeouts → held into -$260 and -$415 SLs.
+- Net: one big win could not pay for two morning blow-ups. PnL went DOWN despite hitting the biggest single-trade ever.
+
+**Root-cause lesson:** Streak ≥ 7 in `TREND_*` is **not** sufficient confirmation of a real trend. MM frequently prints 7-9 same-color bricks as a stop-run/squeeze before reversing. Suppressing PxStop on an apparent-trend that is really a fakeout converts a -$80 retrace exit into a -$300+ SL hit. **Future fix would need:** (a) htfBias-must-agree gate (already had it but too soft), (b) momentum-decay early-out independent of brick-flip (e.g., 3-tick reversal velocity), (c) min-time-in-trend before suppression engages.
+
+**Backup:** `Old/Mm_ATM_v7_BKP_v0.4.cs` (if not present, code is in v0.3 backup git history)
+
+---
+
+### 21.2 v7 0.5 (2026-05-01) — "Tight Trail or Range Adapt + SL_CHASE" — RESULT: -$685 / 13 trades (-130% vs v0.3, CATASTROPHIC)
+
+**What it did:**
+- When RIDE active AND regime `TREND_*`: tight 1-brick-behind exit (`prevBrickHigh + 1tk` for SHORT, `prevBrickLow - 1tk` for LONG).
+- When regime left `TREND_*`: auto-disengage RIDE.
+- **`SL_CHASE`:** every brick close, ratchet hidden SL toward `trailPrice ± slChaseGapTicks (2)`.
+
+**Why it failed:**
+- `slChaseGapTicks = 2` placed the hard SL **2 ticks closer to price than the trail itself**. Result: SL fired before the trail logic could engage on EVERY trade.
+- All 13 of 13 exits were `EXIT_LOSS_SL`. Zero trail wins, zero brick-flip wins. `RIDE_TIGHT_TRAIL_HIT` fired 0 times — SL beat it every time.
+
+**Root-cause lesson:** **NEVER put the hard SL closer to price than the trail.** The trail IS the exit mechanism — the hard SL is the disaster floor. If they invert, the disaster floor becomes the primary exit and you eat full SL on every trade. **Future fix:** SL must always be ≥ trail distance + buffer, never less. Better yet: SL = trail (sync to trail value, never gap closer).
+
+**Backup:** `Old/Mm_ATM_v7_BKP_v0.5_FAILED_20260501.cs`
+
+---
+
+### 21.3 v7 1.0 (2026-05-01) — "Reversal Rider" — RESULT: NEGATIVE (rolled back same day)
+
+**What it did (3 patches under one master switch `reversalRiderEnabled`):**
+1. **RR Entry** — on first opposite-color brick close in `TREND_X`, ARM a reversal candidate (record body). Next bar, if color matches AND body ≥ 50% of armed body, fire entry at market. Bypassed streak/conf gates (intent: cure the 42-bar `emaXAgo` late entries).
+2. **RR Tight Trail** — in `TREND_X` with same-dir streak ≥ 2: trail = `prevBrickLow − 3tk` (LONG) / `prevBrickHigh + 3tk` (SHORT). Hidden SL **synced to trail value** (avoiding the v0.5 SL_CHASE bug). Touch-exit (no retrace gate).
+3. **RR Trap Re-entry** — after RR_TIGHT exit, if 1-2 bricks later same color resumes in matching `TREND_*`, re-enter at market (max 2 per trend).
+
+**Why it failed:** PnL was MOST NEGATIVE of any v7 release. The combination broke v0.3's working logic in multiple ways simultaneously, so no single patch can be blamed cleanly. Suspected contributors:
+- **RR Entry** fires on the FIRST opposite-color brick — but in `TREND_*` the first opposite brick is most often a 1-brick MM trap (16% of all runs are 1-brick traps per §20.2 brick stats). Entering on every trap = entering against the trend = systemic losses.
+- **RR Tight Trail** at `prev ± 3tk` with touch-exit (no retrace gate) gives back ALL room v0.3 PxStop earned via streak-aware retraces. Got chopped on noise.
+- **RR Trap Re-entry** compounded losses: every chop-out re-entered into the same chop, paying spread + slip 2x more per losing trend.
+
+**Root-cause lesson:**
+- **Reversal-on-first-opposite-brick is a trap-magnet, not an early-entry edge.** A real reversal needs at least 2-3 same-color confirms after the first opposite brick, not 1.
+- **Touch-exit on tight trail kills the v0.3 PxStop adaptive-retrace edge** — that retrace logic IS what protects winners from MM noise. Replacing it with a touch-exit at a tight buffer = you exit on every wick.
+- **Trap re-entry must be gated on regime QUALITY, not just regime label.** `TREND_*` with degrading trendQuality is exactly when MM fakeouts cluster.
+
+**What to try later (NOT now):**
+- Reversal entry that requires **2 confirming bricks** post-opposite (not 1) AND htfBias agreement AND adx rising.
+- Tight trail that activates ONLY after peak ≥ 8pt (let v0.3 PxStop handle early phase, swap in tight trail once we have a winner to protect).
+- Trap re-entry capped at 1 per trend AND only after a `RR_TIGHT_HIT` that occurred with peak ≥ 6pt (proves the original trade had real momentum, not a chop entry).
+
+**Backup:** `Old/Mm_ATM_v7_BKP_v1.0_FAILED_20260501.cs`
+
+---
+
+### 21.4 Cross-cutting lessons (apply to ALL future v7 work)
+
+1. **The v0.3 baseline is sacred.** Any new release MUST beat $2,250 on the 2026-04-30 RTH dataset OR be deleted same day. No "let it cook for a week."
+2. **No dead toggles.** Every new param defaults ON. If a feature only helps when off, it shouldn't exist.
+3. **Hidden SL must NEVER be closer to price than the trail.** SL = max(static_SL_floor, trailPrice). Never less.
+4. **First opposite-color brick in TREND is most likely a trap, NOT a reversal.** 16% of runs are 1-brick traps. Any "early reversal entry" must require 2+ confirming bricks.
+5. **Touch-exit on tight trail is brittle.** Adaptive-retrace (v0.3 PxStop) protects against MM wicks. Don't replace it with touch-exit unless proven on ≥ 3 sessions.
+6. **Trap re-entry compounds losses in chop.** Must require both regime quality AND prior-trade peak proof before re-entering.
+7. **Big single-trade wins are NOT proof of edge.** v0.4 hit +$2,000 on one trade and STILL lost vs v0.3 net. Edge = avg per trade, not max trade.
+

@@ -13,11 +13,6 @@
 //                       trendChaseMaxStreak 25->60 (4/30 13:17-14:25 missed 52-brick/220pt run blocked at G26+) +
 //                       preTrendChaseMaxStreak 9->25 + preTrendChaseMinConf 70->55 (4/30 10:40-10:54 missed 28-brick run with bull 47-77 in UNKNOWN regime).
 //                       Streak-Hold: when last brick is in trade direction and printed within last 25sec, require >=1 full brick of retrace before PxStop fires (instead of body-anchor).
-//  v6 4.2 (2026-04-30): Phases 3+4+5+7 -- Adaptive Daily Target + Silent-Block Diag + Trail Auto-Tune + Per-Regime Trail Profile.
-//                       Phase 3: dailyProfitHit no longer hard-blocks - allows TrendChase / PullbackReentry above target up to hardKill (2x target). Give-back protector hard-stops at 30% drop from peakPnL.
-//                       Phase 4: every silent-return path in TryAutoEntry now emits BLOCK_AUTO with reason (dailyProfit/dailyLoss/outsideHours/maxTrades/emergency) - throttled per state change.
-//                       Phase 5: rolling 5-day capture-ratio per regime persisted in-memory (resets on State.Configure). Auto-tunes peakLockTNGivebackPts +/-2pt nightly via TRAIL_TUNE_DAILY diag.
-//                       Phase 7: per-regime Peak-Lock multipliers (TREND=1.20 looser for runners, CHOP/UNKNOWN=0.80 tighter for chop scratches).
 
 //  v6 3.6 (2026-04-30): Profit Safeguard Ladder ($-based, fires in RUNNER mode) + TrendChase max-streak cap.
 //  v6 3.5 (2026-04-30): TrendChase ADX gate lowered to 22 + extension-filter bypass on TrendChase.
@@ -472,26 +467,6 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int      processedTradeCount;
         private bool     dailyLimitHit;
         private bool     dailyProfitHit;
-        // v6 4.2 Phase 3 - Adaptive Daily Target.
-        // Soft cap (dailyProfitHit) only restricts to TrendChase / PullbackReentry; hard kill at HardKillMult x target.
-        // Give-back protector flattens + hard-stops if dailyPnL drops by GivebackPct from intraday peak.
-        private bool     adaptiveDailyTargetEnabled = true;
-        private double   adaptiveDailyHardKillMult  = 2.0;     // hard stop at 2x maxDailyProfitDollars
-        private double   adaptiveDailyGivebackPct   = 30.0;    // hard-stop if pnl drops 30% from peak (after target hit)
-        private double   peakDailyPnL               = 0;       // intraday max realized PnL
-        private bool     softProfitCapActive        = false;   // true after dailyProfitHit but below hard kill
-        // v6 4.2 Phase 4 - Silent-Block Diag throttle (one row per (reason, bar) pair).
-        private string   lastSilentBlockReason      = "";
-        // v6 4.2 Phase 5 - Rolling 5-day capture-ratio tracker (per regime).
-        // captureSamples[regime] -> queue of (peakPts, capturedPts) tuples; max N kept.
-        private System.Collections.Generic.Dictionary<string, System.Collections.Generic.Queue<double>>
-            captureRatioByRegime = new System.Collections.Generic.Dictionary<string, System.Collections.Generic.Queue<double>>();
-        private int      captureRatioMaxSamples     = 60;       // ~5 days x ~12 trades
-        private DateTime lastTrailTuneDate          = DateTime.MinValue;
-        // v6 4.2 Phase 7 - Per-Regime Peak-Lock multipliers.
-        // Applied as: effGiveback = tierGiveback * regimeMult (TREND looser, CHOP tighter).
-        private double   peakLockTrendMult          = 1.20;     // let runners breathe in confirmed trend
-        private double   peakLockChopMult           = 0.80;     // tighten in chop / unknown to lock fast
         // True when ArmHiddenStops/ResizeHiddenStops had to pull the hidden TP in to a prevDay
         // level. Used to FORCE the TP check to honor the hidden target even in runner mode
         // (otherwise the visible green line is at e.g. entry+18pt while the runner-mode bypass
@@ -1253,8 +1228,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             processedTradeCount = 0;
             dailyLimitHit = false;
             dailyProfitHit = false;
-            peakDailyPnL = 0;            // v6 4.2 Phase 3
-            softProfitCapActive = false; // v6 4.2 Phase 3
             flattenFired = false;
             emergencyKillActive = false;
             consecutiveLosses = 0;
@@ -1544,14 +1517,13 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void LiveDailyPnLCheck()
         {
-            if (dailyLimitHit) return;
+            if (dailyLimitHit || dailyProfitHit) return;
             double unreal = 0;
             if (Position.MarketPosition == MarketPosition.Long)
                 unreal = (Close[0] - averageEntryPrice) * NQ_DOLLARS_PER_POINT * Math.Max(totalContracts, Position.Quantity);
             else if (Position.MarketPosition == MarketPosition.Short)
                 unreal = (averageEntryPrice - Close[0]) * NQ_DOLLARS_PER_POINT * Math.Max(totalContracts, Position.Quantity);
             double live = dailyRealizedPnL + unreal;
-            if (live > peakDailyPnL) peakDailyPnL = live;  // v6 4.2 Phase 3 track intraday peak
             if (live <= -maxDailyLossDollars)
             {
                 dailyLimitHit = true;
@@ -1559,52 +1531,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                 lastExitReason = "DAILY_LOSS";
                 ExecuteFlatten();
                 UpdateDashboardStatus("⛔ DAILY LOSS LIMIT " + live.ToString("C0") + " — position closed. Strategy STILL ENABLED. Press RESET to resume.", Brushes.Red);
-                return;
             }
-            // v6 4.2 Phase 3 - Adaptive Daily Target.
-            // Soft cap: still allow TrendChase / PullbackReentry above target (handled in TryAutoEntry).
-            // Hard kill at HardKillMult x target.
-            // Give-back protector: hard-stop if PnL falls GivebackPct below intraday peak (only after target hit).
-            double hardKill = adaptiveDailyTargetEnabled
-                ? maxDailyProfitDollars * adaptiveDailyHardKillMult
-                : maxDailyProfitDollars;
-            if (live >= hardKill)
-            {
-                dailyLimitHit = true; dailyProfitHit = true;
-                Print(TAG + "HARD PROFIT KILL " + live.ToString("C0") + " (" + adaptiveDailyHardKillMult.ToString("F1") + "x target) — closing position.");
-                lastExitReason = "DAILY_PROFIT_HARD";
-                ExecuteFlatten();
-                UpdateDashboardStatus("💰 HARD PROFIT KILL " + live.ToString("C0") + " — strategy halted. Press RESET.", Brushes.Gold);
-                return;
-            }
-            if (!dailyProfitHit && live >= maxDailyProfitDollars)
+            else if (live >= maxDailyProfitDollars)
             {
                 dailyProfitHit = true;
-                softProfitCapActive = adaptiveDailyTargetEnabled;
-                if (adaptiveDailyTargetEnabled)
-                {
-                    Print(TAG + "SOFT PROFIT CAP " + live.ToString("C0") + " — only TrendChase / PullbackReentry allowed above target.");
-                    UpdateDashboardStatus("💰 SOFT CAP " + live.ToString("C0") + " — chase-only mode (hard kill " + hardKill.ToString("C0") + ").", Brushes.Gold);
-                    if (enableDiagLog) WriteDiagRow("DAILY_SOFT_CAP", "live=" + live.ToString("F0") + " target=" + maxDailyProfitDollars + " hardKill=" + hardKill.ToString("F0"));
-                }
-                else
-                {
-                    Print(TAG + "LIVE PROFIT TARGET " + live.ToString("C0") + " — closing position.");
-                    lastExitReason = "DAILY_PROFIT";
-                    ExecuteFlatten();
-                    UpdateDashboardStatus("💰 DAILY PROFIT TARGET " + live.ToString("C0") + " — position closed.", Brushes.Gold);
-                }
-            }
-            // Give-back protector: only after we've banked the target
-            if (softProfitCapActive && peakDailyPnL >= maxDailyProfitDollars
-                && peakDailyPnL > 0 && live <= peakDailyPnL * (1.0 - adaptiveDailyGivebackPct / 100.0))
-            {
-                dailyLimitHit = true;
-                Print(TAG + "GIVEBACK PROTECTOR " + live.ToString("C0") + " (peak " + peakDailyPnL.ToString("C0") + ") — halting.");
-                lastExitReason = "DAILY_GIVEBACK";
+                Print(TAG + "LIVE PROFIT TARGET " + live.ToString("C0") + " — closing position. Strategy stays ENABLED. Press RESET or wait for 18:00 ET session rollover to resume.");
+                lastExitReason = "DAILY_PROFIT";
                 ExecuteFlatten();
-                UpdateDashboardStatus("⚠️ GIVEBACK PROTECTOR " + live.ToString("C0") + " (-" + adaptiveDailyGivebackPct.ToString("F0") + "% from peak " + peakDailyPnL.ToString("C0") + ").", Brushes.OrangeRed);
-                if (enableDiagLog) WriteDiagRow("DAILY_GIVEBACK", "live=" + live.ToString("F0") + " peak=" + peakDailyPnL.ToString("F0") + " pct=" + adaptiveDailyGivebackPct);
+                UpdateDashboardStatus("💰 DAILY PROFIT TARGET " + live.ToString("C0") + " — position closed. Strategy STILL ENABLED. Press RESET to resume.", Brushes.Gold);
             }
         }
         #endregion
@@ -2027,11 +1961,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                         else if (trailMaxProfitPts >= peakLockT1PeakPts) { desiredTierPl = Math.Max(desiredTierPl, 1); allowedGb = peakLockT1GivebackPts; }
                         if (desiredTierPl > 0 && allowedGb > 0)
                         {
-                            // v6 4.2 Phase 7 - per-regime multiplier (TREND looser, CHOP/UNKNOWN tighter).
-                            double regMult = 1.0;
-                            if (currentRegime == "TREND_UP" || currentRegime == "TREND_DN") regMult = peakLockTrendMult;
-                            else if (currentRegime == "CHOP" || currentRegime == "UNKNOWN") regMult = peakLockChopMult;
-                            allowedGb *= regMult;
                             double tickPtPl = TickSize * NQ_TICKS_PER_POINT;
                             double peakPx = openTradeDirection == 1
                                 ? averageEntryPrice + trailMaxProfitPts * tickPtPl
@@ -2559,8 +2488,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 consecutiveWins     = 0;
                 dailyLimitHit       = false;
                 dailyProfitHit      = false;
-                peakDailyPnL        = 0;     // v6 4.2 Phase 3
-                softProfitCapActive = false; // v6 4.2 Phase 3
                 emergencyKillActive = false;
                 flattenFired        = false;
                 rthStartedToday     = false;
@@ -3111,12 +3038,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             int ct = ToTime(Time[0]);
             bool insideHours = !tradingHoursEnabled || (ct >= tradingStartTime && ct < flattenTime);
-            // v6 4.2 Phase 4 - emit BLOCK_AUTO with reason on every silent return (throttled per state-change).
-            if (!insideHours)               { LogSilentBlock("outsideHours"); return; }
-            if (dailyLimitHit)              { LogSilentBlock("dailyLimitHit"); return; }
-            if (emergencyKillActive)        { LogSilentBlock("emergencyKill"); return; }
-            if (maxTradesPerDay > 0 && dailyTradeCount >= maxTradesPerDay) { LogSilentBlock("maxTrades"); return; }
-            // v6 4.2 Phase 3 - Soft profit cap: only TrendChase / PullbackReentry allowed (decided below).
+            if (!insideHours || dailyLimitHit || dailyProfitHit || emergencyKillActive) return;
+            if (maxTradesPerDay > 0 && dailyTradeCount >= maxTradesPerDay) return;
 
             // v6 3.2 - TrendChase override (computed FIRST so cooldowns can be bypassed in strong trends).
             // v6 3.3 - PreTrendChase widens the gate to UNKNOWN regime when brick + STRONG signal agree.
@@ -3306,12 +3229,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             // v6 3.2 - Try LONG path first; emit BLOCK_AUTO with reason on silent rejection.
             bool longCandidate  = lastBullConfidence >= effMinL;
             bool shortCandidate = lastBearConfidence >= effMinS;
-            // v6 4.2 Phase 3 - Soft profit cap: above target only TrendChase / PullbackReentry allowed.
-            if (softProfitCapActive && !trendChaseLong && !trendChaseShort)
-            {
-                LogSilentBlock("softProfitCap_chaseOnly");
-                return;
-            }
             if (longCandidate)
             {
                 if (rsiDown || overLong || nearH || volSpike || htfBlockL || tapeBlockL)
@@ -3363,64 +3280,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                     if (currentEntryPullbackReentry) { pullbackArmedDir = 0; currentEntryPullbackReentry = false; }
                 }
             }
-        }
-
-        // v6 4.2 Phase 4 - Silent-Block diag throttle: only emit when (reason, bar) changes.
-        private void LogSilentBlock(string reason)
-        {
-            if (!enableDiagLog) return;
-            if (lastSilentBlockBar == CurrentBar && lastSilentBlockReason == reason) return;
-            lastSilentBlockBar    = CurrentBar;
-            lastSilentBlockReason = reason;
-            WriteDiagRow("BLOCK_AUTO", "reason=" + reason);
-        }
-
-        // v6 4.2 Phase 5 - Record capture-ratio sample per regime; trigger nightly auto-tune.
-        // Capture ratio = ProfitPts / PeakPts. Stored per regime as packed [ratio*1000 + peak/100] doubles.
-        // Simpler: store ratio (0..1) only; peak is reflected in tier coverage.
-        private void RecordCaptureSample(double profitCurrency)
-        {
-            if (trailMaxProfitPts <= 0) return;
-            double profitPts = profitCurrency / NQ_DOLLARS_PER_POINT
-                / Math.Max(1, totalContracts > 0 ? totalContracts : 1);
-            double ratio = profitPts / trailMaxProfitPts;
-            if (ratio < -2.0) ratio = -2.0; if (ratio > 1.5) ratio = 1.5;
-            string reg = string.IsNullOrEmpty(lastEntryRegime) ? "UNKNOWN" : lastEntryRegime;
-            System.Collections.Generic.Queue<double> q;
-            if (!captureRatioByRegime.TryGetValue(reg, out q))
-            {
-                q = new System.Collections.Generic.Queue<double>();
-                captureRatioByRegime[reg] = q;
-            }
-            q.Enqueue(ratio);
-            while (q.Count > captureRatioMaxSamples) q.Dequeue();
-            MaybeAutoTuneTrail();
-        }
-
-        // Nightly (per-day) auto-tune of Peak-Lock giveback tiers.
-        // If avg capture < 50% across last 30+ samples -> WIDEN giveback (let runners run, +2pt).
-        // If avg capture > 80% AND avg peak small -> TIGHTEN giveback (lock faster, -2pt, floor 6pt).
-        private void MaybeAutoTuneTrail()
-        {
-            if (Time[0].Date == lastTrailTuneDate) return;
-            lastTrailTuneDate = Time[0].Date;
-            int totalN = 0; double sumRatio = 0;
-            foreach (var kv in captureRatioByRegime)
-                foreach (var r in kv.Value) { totalN++; sumRatio += r; }
-            if (totalN < 30) return;
-            double avg = sumRatio / totalN;
-            double[] tiers = { peakLockT1GivebackPts, peakLockT2GivebackPts, peakLockT3GivebackPts,
-                               peakLockT4GivebackPts, peakLockT5GivebackPts };
-            string action = "hold";
-            if (avg < 0.50)       { for (int i = 0; i < 5; i++) tiers[i] = Math.Min(tiers[i] + 2.0, 30.0); action = "widen"; }
-            else if (avg > 0.80)  { for (int i = 0; i < 5; i++) tiers[i] = Math.Max(tiers[i] - 2.0, 6.0);  action = "tighten"; }
-            peakLockT1GivebackPts = tiers[0]; peakLockT2GivebackPts = tiers[1];
-            peakLockT3GivebackPts = tiers[2]; peakLockT4GivebackPts = tiers[3];
-            peakLockT5GivebackPts = tiers[4];
-            if (enableDiagLog)
-                WriteDiagRow("TRAIL_TUNE_DAILY",
-                    "n=" + totalN + " avgRatio=" + avg.ToString("F2") + " action=" + action
-                    + " tiers=[" + string.Join(",", Array.ConvertAll(tiers, t => t.ToString("F0"))) + "]");
         }
 
         private void ExecuteLongEntry(bool isManual)
@@ -4069,8 +3928,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             lastLossDirection   = 0;
             dailyLimitHit       = false;
             dailyProfitHit      = false;
-            peakDailyPnL        = 0;       // v6 4.2 Phase 3
-            softProfitCapActive = false;   // v6 4.2 Phase 3
             emergencyKillActive = false;
             flattenFired        = false;
             // Restore aggressive trail factor to its base if streak-adapted
@@ -4297,7 +4154,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                                     }
                                 }
                                 if (enableDiagLog) WriteDiagRow("EXIT_LOSS_" + reason, "pnl=" + last.ProfitCurrency.ToString("F2") + " consec=" + consecutiveLosses);
-                                RecordCaptureSample(last.ProfitCurrency); // v6 4.2 Phase 5
                                 // v6 3.0 - REGIME_PNL: attribute exit pnl to entry regime; emit running per-regime totals.
                                 if (regimeQualityGateEnabled && !string.IsNullOrEmpty(lastEntryRegime))
                                 {
@@ -4346,7 +4202,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                                         + " minStreak=" + brickReentryMinStreak);
                                 }
                                 if (enableDiagLog) WriteDiagRow("EXIT_WIN_" + reason, "pnl=" + last.ProfitCurrency.ToString("F2") + " consec=" + consecutiveWins);
-                                RecordCaptureSample(last.ProfitCurrency); // v6 4.2 Phase 5
                                 // v6 3.0 - REGIME_PNL: attribute win pnl to entry regime; emit running per-regime totals.
                                 if (regimeQualityGateEnabled && !string.IsNullOrEmpty(lastEntryRegime))
                                 {
@@ -7124,12 +6979,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             Description = "PHASE 3.3 - Minimum brick streak in direction for PreTrendChase. Default 5 (clear run, not 1-2 brick noise).")]
         public int PreTrendChaseMinStreak { get { return preTrendChaseMinStreak; } set { preTrendChaseMinStreak = value; } }
 
-        [NinjaScriptProperty, Range(30, 120)]
+        [NinjaScriptProperty, Range(60, 120)]
         [Display(Name = "  PreTrendChase Min Conf", Order = 67, GroupName = "10 - Regime",
-            Description = "PHASE 3.3 - Minimum Bull/Bear confidence for PreTrendChase to fire. v4.1 lowered to 55 (catches strong UNKNOWN runs at 77.5 conf then 35-57).")]
+            Description = "PHASE 3.3 - Minimum Bull/Bear confidence for PreTrendChase to fire. Default 70 (lowered from 80 in v3.4 to catch the 13:00 STRONG_BUY at 77.5).")]
         public double PreTrendChaseMinConf { get { return preTrendChaseMinConf; } set { preTrendChaseMinConf = value; } }
 
-        [NinjaScriptProperty, Range(5, 40)]
+        [NinjaScriptProperty, Range(5, 20)]
         [Display(Name = "  PreTrendChase Max Streak", Order = 68, GroupName = "10 - Regime",
             Description = "PHASE 3.4 - Exhaustion cap. Don't fire PreTrendChase when brick streak exceeds this (e.g. brick 13 of a 13-brick run = capitulation, not continuation). Default 9.")]
         public int PreTrendChaseMaxStreak { get { return preTrendChaseMaxStreak; } set { preTrendChaseMaxStreak = value; } }
@@ -7144,7 +6999,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             Description = "PHASE 3.4 - Bypass htfBias entry block when brick streak in trade direction >= this (htfBias is stale: brick chart already proved direction changed). Default 8.")]
         public int HtfStalenessOverrideStreak { get { return htfStalenessOverrideStreak; } set { htfStalenessOverrideStreak = value; } }
 
-        [NinjaScriptProperty, Range(10, 100)]
+        [NinjaScriptProperty, Range(10, 50)]
         [Display(Name = "  TrendChase Max Streak", Order = 71, GroupName = "10 - Regime",
             Description = "PHASE 3.6 - Exhaustion cap for TrendChase. Don't enter when brick streak in trend dir exceeds this. Today's 13:42 32-brick LONG trapped -$175. Default 25.")]
         public int TrendChaseMaxStreak { get { return trendChaseMaxStreak; } set { trendChaseMaxStreak = value; } }

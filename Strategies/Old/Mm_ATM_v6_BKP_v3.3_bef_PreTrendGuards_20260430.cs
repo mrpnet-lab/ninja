@@ -3,25 +3,6 @@
 //  Complete rewrite: simplified architecture, 12 filters, unified exits,
 //  smart-trail backtrack vs MM stop-hunts, optional order-flow tape filter,
 //  redesigned dashboard with explicit BUY/SELL trade-signal indicator.
-//  v6 3.7 (2026-04-30): Pullback Re-Entry (post big-run continuation) + Extension Ratio Auto-Loosen on strong htf.
-//  v6 4.0 (2026-04-30): Peak-Lock Trail Floor (tiered max giveback) + Cooldown halved (8->4 bars) + HtfStaleness override at streak 5 (was 8).
-//                       Backtest 4/28-4/30: trail left $12,000 on table across 39 trades (avg capture 30%). Peak-Lock caps absolute giveback by peak magnitude:
-//                         peak >=15pt -> max -10pt giveback;  peak >=25pt -> -12pt;  peak >=40pt -> -15pt;  peak >=60pt -> -18pt;  peak >=80pt -> -22pt.
-//                       Postloss cooldown 8->4 bars unblocks fast brick continuations (4/30 10:40-11:36 missed a 188pt run).
-//                       HtfStaleness override threshold 8->5 lets streak G5-G7 trade through stale htfBias (4/30 same window).
-//  v6 4.1 (2026-04-30): Streak-Hold trail PxStop (suppress exit during alive same-color streak) +
-//                       trendChaseMaxStreak 25->60 (4/30 13:17-14:25 missed 52-brick/220pt run blocked at G26+) +
-//                       preTrendChaseMaxStreak 9->25 + preTrendChaseMinConf 70->55 (4/30 10:40-10:54 missed 28-brick run with bull 47-77 in UNKNOWN regime).
-//                       Streak-Hold: when last brick is in trade direction and printed within last 25sec, require >=1 full brick of retrace before PxStop fires (instead of body-anchor).
-//  v6 4.2 (2026-04-30): Phases 3+4+5+7 -- Adaptive Daily Target + Silent-Block Diag + Trail Auto-Tune + Per-Regime Trail Profile.
-//                       Phase 3: dailyProfitHit no longer hard-blocks - allows TrendChase / PullbackReentry above target up to hardKill (2x target). Give-back protector hard-stops at 30% drop from peakPnL.
-//                       Phase 4: every silent-return path in TryAutoEntry now emits BLOCK_AUTO with reason (dailyProfit/dailyLoss/outsideHours/maxTrades/emergency) - throttled per state change.
-//                       Phase 5: rolling 5-day capture-ratio per regime persisted in-memory (resets on State.Configure). Auto-tunes peakLockTNGivebackPts +/-2pt nightly via TRAIL_TUNE_DAILY diag.
-//                       Phase 7: per-regime Peak-Lock multipliers (TREND=1.20 looser for runners, CHOP/UNKNOWN=0.80 tighter for chop scratches).
-
-//  v6 3.6 (2026-04-30): Profit Safeguard Ladder ($-based, fires in RUNNER mode) + TrendChase max-streak cap.
-//  v6 3.5 (2026-04-30): TrendChase ADX gate lowered to 22 + extension-filter bypass on TrendChase.
-//  v6 3.4 (2026-04-30): PreTrendChase guards (max-streak, ADX slope rising-only) + htfBias staleness override.
 //  v6 3.3 (2026-04-30): Pre-Trend Chase (UNKNOWN regime + strong brick streak + STRONG conf bypasses CHOP/silent gates).
 //  v6 3.2 (2026-04-30): TrendChase override + counter-trend block + silent-block diag (trend-blind fix).
 //  v6 3.1 (2026-04-30): Manual-trader hardening + tick-precision STEP toggle + diag observability.
@@ -312,9 +293,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         // tapeBlock, tooSoon (bar cooldown), postLossCD, postWinSameDirCooldown, entryDelay.
         // Only the trade direction matching the trend is allowed to chase.
         private bool   trendChaseEnabled         = true;
-        private double trendChaseMinAdx          = 22.0;  // v6 3.5 - lowered from 35 (regime=TREND_* already implies trend)
+        private double trendChaseMinAdx          = 35.0;
         private int    trendChaseMinStreak       = 3;
-        private int    trendChaseMaxStreak       = 60;    // v6 4.1 - raised 25->60 (4/30 13:17-14:25 lost 52-brick/220pt run when blocked at G26+).
         // v6 3.2 - Counter-trend block: when regime=TREND_UP/DN AND ADX>=counterTrendMinAdx,
         // block the OPPOSITE direction (unless earlyFlip / sweep is armed).
         private bool   counterTrendBlockEnabled  = true;
@@ -325,21 +305,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         // and tooSoon/postLossCD/postWin (same as TrendChase). Today's 2026-04-30 12:45-12:51
         // forensic: 7-brick R streak with Bear=107 (STRONG_SELL) blocked by CHOP filter because
         // ADX falling 25->19 kept regime=UNKNOWN.
-        // v6 3.4 - GUARDS added after 12:57 brick-13 short caught exhaustion (-$395):
-        //   * MaxStreak: don't chase exhaustion (brick 13 of 13 is capitulation, not continuation).
-        //   * MinAdxSlope: require ADX rising or flat (lastAdxSlope >= threshold). Falling ADX in
-        //     a long brick streak = the move is dying.
-        //   * MinConf lowered to 70 (was 80) - the 13:00 STRONG_BUY at 77.5 conf would have caught
-        //     a +28pt up move; 80 missed it by 2.5.
         private bool   preTrendChaseEnabled      = true;
         private int    preTrendChaseMinStreak    = 5;
-        private int    preTrendChaseMaxStreak    = 25;    // v6 4.1 - raised 9->25 (4/30 10:40-10:54 lost 28-brick UNKNOWN-regime run that never crossed into TREND_UP).
-        private double preTrendChaseMinAdxSlope  = -0.25; // v6 3.4 - allow flat-ish, block clearly falling
-        private double preTrendChaseMinConf      = 55.0;  // v6 4.1 - lowered 70->55 (4/30 10:40-10:54 bull peaked at 77 once, then 35-57; with brick-aligned streak 55 is enough).
-        // v6 3.4 - htfBias staleness override: when brick streak in trade direction >= N, the
-        // htfBias from a prior leg is stale (brick chart proved direction changed). Today's
-        // 13:01 BUY at Gx8/Bull=70 was blocked by htf=-1 (left over from morning down move).
-        private int    htfStalenessOverrideStreak = 5;  // v6 4.0 - lowered 8->5 (4/30 10:52-11:36 missed 188pt run while blocked at G3-G7 with stale htfBias).
+        private double preTrendChaseMinConf      = 80.0;
         // v6 3.2 - Silent-block diag throttle: emit at most one BLOCK_AUTO row per bar.
         private int    lastSilentBlockBar        = -1;
         // v6 3.2 - Trend-chase context flag set by TryAutoEntry before Execute*Entry calls,
@@ -355,71 +323,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int    smartBeTierActive         = 0;   // 0=none, 1=loss-cap, 2=soft-be, 3=handoff
         private bool   smartBeManualHandoffLogged = false; // v6 3.1 - one-shot diag flag
 
-        // v6 3.6 - Profit Safeguard Ladder ($-based ratchet; fires in ALL modes including RUNNER).
-        // Today's 13:26 LONG hit peak +46pt = +$925 unrealized but SL stayed at entry-18 = -$360
-        // risk the entire time. Smart BE Ladder is suppressed in RUNNER mode by design (so the
-        // runner can run), but a $-based safeguard MUST run regardless. Never undoes manual moves
-        // (breakevenLocked respected) and is strict ratchet (only tightens, never loosens).
-        private bool   profitSafeguardEnabled  = true;
-        private double profitSafeguardT1Pts    = 10.0; // peak >= 10pt ($200) -> SL = entry - 2pt (loss-cap)
-        private double profitSafeguardT1SlPts  = -2.0;  // negative = below entry (loss-cap)
-        private double profitSafeguardT2Pts    = 20.0; // peak >= 20pt ($400) -> SL = entry + 1pt (BE+)
-        private double profitSafeguardT2SlPts  = 1.0;
-        private double profitSafeguardT3Pts    = 30.0; // peak >= 30pt ($600) -> SL = entry + 8pt
-        private double profitSafeguardT3SlPts  = 8.0;
-        private double profitSafeguardT4Pts    = 50.0; // peak >= 50pt ($1000) -> SL = entry + 15pt
-        private double profitSafeguardT4SlPts  = 15.0;
-        private int    profitSafeguardTierActive = 0;
-
-        // v6 3.7 - Pullback Re-Entry: after a big run (len>=20 AND maxFav>=40pt), arm a window where
-        // a continuation entry in the same direction is allowed AFTER a meaningful retrace, even
-        // through the extension filter. Today 14:25 a 52-brick +192pt run ended; at 15:06 a clean
-        // 5-brick continuation broke to new highs but ALL 5 BUY signals were BLOCK_EXTENSION'd.
-        private bool   pullbackReentryEnabled            = true;
-        private int    pullbackReentryMinRunLen          = 20;
-        private double pullbackReentryMinMaxFavPts       = 40.0;
-        private double pullbackReentryRetracePctNormal   = 0.30; // need 30% giveback in normal trends
-        private double pullbackReentryRetracePctStrongHtf= 0.20; // only 20% if htfBiasConsec strong (one-sided trend)
-        private int    pullbackReentryStrongHtfThresh    = 7;     // |htfBiasConsec| >= 7 => strong
-        private int    pullbackReentryMinContBricks      = 2;     // need 2 bricks in trend dir after retrace
-        private int    pullbackReentryWindowSec          = 900;   // 15 min arm window
-        // arm state
-        private int      pullbackArmedDir       = 0;     // +1 long, -1 short, 0 disarmed
-        private DateTime pullbackArmedTime     = DateTime.MinValue;
-        private double   pullbackArmedExtremePx = 0;     // run end price (= run extreme high/low)
-        private double   pullbackArmedRunPts    = 0;
-        private bool     currentEntryPullbackReentry = false;
-
-        // v6 3.7 - Extension Ratio Auto-Loosen: when htfBiasConsec is strong AND we've got a 3+ brick
-        // streak in trend direction, allow extension up to extLooseMax instead of the default cap.
-        // This helps when session VWAP lags 200+pt behind a runaway market.
-        private bool   extLooseEnabled       = true;
-        private int    extLooseMinHtfConsec  = 7;
-        private int    extLooseMinStreak     = 3;
-        private double extLooseMaxAtrFromVwap = 8.0;
-
         // v6 3.0 - Adaptive BrickTrail retrace (peak-scaled).
         private bool   brickTrailAdaptiveRetraceEnabled = true;
         private double brickTrailAdaptiveRetracePctOfPeak = 0.30;
         private double brickTrailAdaptiveRetraceMinPts    = 2.5;
         private double brickTrailAdaptiveRetraceMaxPts    = 7.5;
-
-        // v6 4.0 - Peak-Lock Trail Floor (tiered max-giveback by peak magnitude).
-        // Caps absolute giveback regardless of body-anchor distance. Once peak hits each tier,
-        // the trail floor moves to (peak - tierGivebackPts) and never retreats. Combines with
-        // body-anchor by taking the TIGHTER (more profit-locking) of the two. This is the primary
-        // fix for 4/28-4/29 trail give-back: peaks of 40-110pt previously gave back 28pt uniformly
-        // (body-anchor lagged peak by full streak length). Tier table chosen empirically:
-        //   peak >=15pt -> max -10pt   (33% lock)   |  peak >=25pt -> max -12pt  (52% lock)
-        //   peak >=40pt -> max -15pt   (63% lock)   |  peak >=60pt -> max -18pt  (70% lock)
-        //   peak >=80pt -> max -22pt   (73% lock)
-        private bool   peakLockTrailEnabled  = true;
-        private double peakLockT1PeakPts     = 15.0; private double peakLockT1GivebackPts = 10.0;
-        private double peakLockT2PeakPts     = 25.0; private double peakLockT2GivebackPts = 12.0;
-        private double peakLockT3PeakPts     = 40.0; private double peakLockT3GivebackPts = 15.0;
-        private double peakLockT4PeakPts     = 60.0; private double peakLockT4GivebackPts = 18.0;
-        private double peakLockT5PeakPts     = 80.0; private double peakLockT5GivebackPts = 22.0;
-        private int    peakLockTierActive    = 0;
 
         // v6 3.0 - Regime-Quality Gate (per-regime intraday PnL self-tightening).
         private bool   regimeQualityGateEnabled    = true;
@@ -472,26 +380,6 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int      processedTradeCount;
         private bool     dailyLimitHit;
         private bool     dailyProfitHit;
-        // v6 4.2 Phase 3 - Adaptive Daily Target.
-        // Soft cap (dailyProfitHit) only restricts to TrendChase / PullbackReentry; hard kill at HardKillMult x target.
-        // Give-back protector flattens + hard-stops if dailyPnL drops by GivebackPct from intraday peak.
-        private bool     adaptiveDailyTargetEnabled = true;
-        private double   adaptiveDailyHardKillMult  = 2.0;     // hard stop at 2x maxDailyProfitDollars
-        private double   adaptiveDailyGivebackPct   = 30.0;    // hard-stop if pnl drops 30% from peak (after target hit)
-        private double   peakDailyPnL               = 0;       // intraday max realized PnL
-        private bool     softProfitCapActive        = false;   // true after dailyProfitHit but below hard kill
-        // v6 4.2 Phase 4 - Silent-Block Diag throttle (one row per (reason, bar) pair).
-        private string   lastSilentBlockReason      = "";
-        // v6 4.2 Phase 5 - Rolling 5-day capture-ratio tracker (per regime).
-        // captureSamples[regime] -> queue of (peakPts, capturedPts) tuples; max N kept.
-        private System.Collections.Generic.Dictionary<string, System.Collections.Generic.Queue<double>>
-            captureRatioByRegime = new System.Collections.Generic.Dictionary<string, System.Collections.Generic.Queue<double>>();
-        private int      captureRatioMaxSamples     = 60;       // ~5 days x ~12 trades
-        private DateTime lastTrailTuneDate          = DateTime.MinValue;
-        // v6 4.2 Phase 7 - Per-Regime Peak-Lock multipliers.
-        // Applied as: effGiveback = tierGiveback * regimeMult (TREND looser, CHOP tighter).
-        private double   peakLockTrendMult          = 1.20;     // let runners breathe in confirmed trend
-        private double   peakLockChopMult           = 0.80;     // tighten in chop / unknown to lock fast
         // True when ArmHiddenStops/ResizeHiddenStops had to pull the hidden TP in to a prevDay
         // level. Used to FORCE the TP check to honor the hidden target even in runner mode
         // (otherwise the visible green line is at e.g. entry+18pt while the runner-mode bypass
@@ -1253,8 +1141,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             processedTradeCount = 0;
             dailyLimitHit = false;
             dailyProfitHit = false;
-            peakDailyPnL = 0;            // v6 4.2 Phase 3
-            softProfitCapActive = false; // v6 4.2 Phase 3
             flattenFired = false;
             emergencyKillActive = false;
             consecutiveLosses = 0;
@@ -1544,14 +1430,13 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void LiveDailyPnLCheck()
         {
-            if (dailyLimitHit) return;
+            if (dailyLimitHit || dailyProfitHit) return;
             double unreal = 0;
             if (Position.MarketPosition == MarketPosition.Long)
                 unreal = (Close[0] - averageEntryPrice) * NQ_DOLLARS_PER_POINT * Math.Max(totalContracts, Position.Quantity);
             else if (Position.MarketPosition == MarketPosition.Short)
                 unreal = (averageEntryPrice - Close[0]) * NQ_DOLLARS_PER_POINT * Math.Max(totalContracts, Position.Quantity);
             double live = dailyRealizedPnL + unreal;
-            if (live > peakDailyPnL) peakDailyPnL = live;  // v6 4.2 Phase 3 track intraday peak
             if (live <= -maxDailyLossDollars)
             {
                 dailyLimitHit = true;
@@ -1559,52 +1444,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                 lastExitReason = "DAILY_LOSS";
                 ExecuteFlatten();
                 UpdateDashboardStatus("⛔ DAILY LOSS LIMIT " + live.ToString("C0") + " — position closed. Strategy STILL ENABLED. Press RESET to resume.", Brushes.Red);
-                return;
             }
-            // v6 4.2 Phase 3 - Adaptive Daily Target.
-            // Soft cap: still allow TrendChase / PullbackReentry above target (handled in TryAutoEntry).
-            // Hard kill at HardKillMult x target.
-            // Give-back protector: hard-stop if PnL falls GivebackPct below intraday peak (only after target hit).
-            double hardKill = adaptiveDailyTargetEnabled
-                ? maxDailyProfitDollars * adaptiveDailyHardKillMult
-                : maxDailyProfitDollars;
-            if (live >= hardKill)
-            {
-                dailyLimitHit = true; dailyProfitHit = true;
-                Print(TAG + "HARD PROFIT KILL " + live.ToString("C0") + " (" + adaptiveDailyHardKillMult.ToString("F1") + "x target) — closing position.");
-                lastExitReason = "DAILY_PROFIT_HARD";
-                ExecuteFlatten();
-                UpdateDashboardStatus("💰 HARD PROFIT KILL " + live.ToString("C0") + " — strategy halted. Press RESET.", Brushes.Gold);
-                return;
-            }
-            if (!dailyProfitHit && live >= maxDailyProfitDollars)
+            else if (live >= maxDailyProfitDollars)
             {
                 dailyProfitHit = true;
-                softProfitCapActive = adaptiveDailyTargetEnabled;
-                if (adaptiveDailyTargetEnabled)
-                {
-                    Print(TAG + "SOFT PROFIT CAP " + live.ToString("C0") + " — only TrendChase / PullbackReentry allowed above target.");
-                    UpdateDashboardStatus("💰 SOFT CAP " + live.ToString("C0") + " — chase-only mode (hard kill " + hardKill.ToString("C0") + ").", Brushes.Gold);
-                    if (enableDiagLog) WriteDiagRow("DAILY_SOFT_CAP", "live=" + live.ToString("F0") + " target=" + maxDailyProfitDollars + " hardKill=" + hardKill.ToString("F0"));
-                }
-                else
-                {
-                    Print(TAG + "LIVE PROFIT TARGET " + live.ToString("C0") + " — closing position.");
-                    lastExitReason = "DAILY_PROFIT";
-                    ExecuteFlatten();
-                    UpdateDashboardStatus("💰 DAILY PROFIT TARGET " + live.ToString("C0") + " — position closed.", Brushes.Gold);
-                }
-            }
-            // Give-back protector: only after we've banked the target
-            if (softProfitCapActive && peakDailyPnL >= maxDailyProfitDollars
-                && peakDailyPnL > 0 && live <= peakDailyPnL * (1.0 - adaptiveDailyGivebackPct / 100.0))
-            {
-                dailyLimitHit = true;
-                Print(TAG + "GIVEBACK PROTECTOR " + live.ToString("C0") + " (peak " + peakDailyPnL.ToString("C0") + ") — halting.");
-                lastExitReason = "DAILY_GIVEBACK";
+                Print(TAG + "LIVE PROFIT TARGET " + live.ToString("C0") + " — closing position. Strategy stays ENABLED. Press RESET or wait for 18:00 ET session rollover to resume.");
+                lastExitReason = "DAILY_PROFIT";
                 ExecuteFlatten();
-                UpdateDashboardStatus("⚠️ GIVEBACK PROTECTOR " + live.ToString("C0") + " (-" + adaptiveDailyGivebackPct.ToString("F0") + "% from peak " + peakDailyPnL.ToString("C0") + ").", Brushes.OrangeRed);
-                if (enableDiagLog) WriteDiagRow("DAILY_GIVEBACK", "live=" + live.ToString("F0") + " peak=" + peakDailyPnL.ToString("F0") + " pct=" + adaptiveDailyGivebackPct);
+                UpdateDashboardStatus("💰 DAILY PROFIT TARGET " + live.ToString("C0") + " — position closed. Strategy STILL ENABLED. Press RESET to resume.", Brushes.Gold);
             }
         }
         #endregion
@@ -1743,67 +1590,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 Print(TAG + "SMART BE " + tierName + " @ " + hiddenStopPrice.ToString("F2")
                                     + " peak=" + peakLd.ToString("F1") + "pt");
                             }
-                        }
-                    }
-                }
-            }
-
-            // v6 3.6 - PROFIT SAFEGUARD LADDER ($-based ratchet, fires in ALL modes including
-            // RUNNER, where Smart BE Ladder is suppressed). Today's 13:26 LONG ran to peak +46pt
-            // ($925) but SL stayed at entry-18 the entire time = -$360 risk. Unacceptable.
-            // Ratchet-only: never weakens existing SL, never undoes manual locks (breakevenLocked
-            // is respected for tighter user-set SLs because we only RAISE SL, never lower).
-            if (profitSafeguardEnabled && stopsArmed && openTradeDirection != 0 && averageEntryPrice > 0)
-            {
-                double tickPtPs = TickSize * NQ_TICKS_PER_POINT;
-                double pxPs = openTradeDirection == 1 ? priceLong : priceShort;
-                double profPs = openTradeDirection == 1
-                    ? (pxPs - averageEntryPrice) / tickPtPs
-                    : (averageEntryPrice - pxPs) / tickPtPs;
-                if (profPs > trailMaxProfitPts) trailMaxProfitPts = profPs;
-                double peakPs = trailMaxProfitPts;
-
-                int desiredTierPs = profitSafeguardTierActive;
-                double slOffsetPts = 0;
-                if (peakPs >= profitSafeguardT4Pts) { desiredTierPs = 4; slOffsetPts = profitSafeguardT4SlPts; }
-                else if (peakPs >= profitSafeguardT3Pts) { desiredTierPs = Math.Max(desiredTierPs, 3); slOffsetPts = profitSafeguardT3SlPts; }
-                else if (peakPs >= profitSafeguardT2Pts) { desiredTierPs = Math.Max(desiredTierPs, 2); slOffsetPts = profitSafeguardT2SlPts; }
-                else if (peakPs >= profitSafeguardT1Pts) { desiredTierPs = Math.Max(desiredTierPs, 1); slOffsetPts = profitSafeguardT1SlPts; }
-
-                if (desiredTierPs > profitSafeguardTierActive)
-                {
-                    double targetSlPs = openTradeDirection == 1
-                        ? averageEntryPrice + slOffsetPts
-                        : averageEntryPrice - slOffsetPts;
-                    targetSlPs = Math.Round(targetSlPs / TickSize) * TickSize;
-
-                    // Safety: never park SL too close to current price (1 tick min).
-                    bool okPs;
-                    if (openTradeDirection == 1) okPs = targetSlPs <= pxPs - TickSize;
-                    else                          okPs = targetSlPs >= pxPs + TickSize;
-
-                    if (okPs)
-                    {
-                        // Strict ratchet: only TIGHTEN existing SL.
-                        bool movedPs = false;
-                        if (openTradeDirection == 1 && targetSlPs > hiddenStopPrice)
-                        { hiddenStopPrice = targetSlPs; movedPs = true; }
-                        else if (openTradeDirection == -1 && targetSlPs < hiddenStopPrice)
-                        { hiddenStopPrice = targetSlPs; movedPs = true; }
-
-                        if (movedPs)
-                        {
-                            profitSafeguardTierActive = desiredTierPs;
-                            string tagPs = "T" + desiredTierPs + "_PROFIT_SAFE";
-                            if (enableDiagLog) WriteDiagRow("PROFIT_SAFEGUARD",
-                                "tier=" + desiredTierPs + " " + tagPs
-                                + " peak=" + peakPs.ToString("F1")
-                                + "pt sl=" + hiddenStopPrice.ToString("F2")
-                                + " offset=" + slOffsetPts.ToString("F1") + "pt"
-                                + " entry=" + averageEntryPrice.ToString("F2")
-                                + " runner=" + runnerModeActive);
-                            Print(TAG + "PROFIT SAFEGUARD " + tagPs + " @ " + hiddenStopPrice.ToString("F2")
-                                + " peak=" + peakPs.ToString("F1") + "pt");
                         }
                     }
                 }
@@ -2016,46 +1802,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                     double btPrice = openTradeDirection == 1
                         ? Math.Max(bodyTrail, tightTrail)
                         : Math.Min(bodyTrail, tightTrail);
-                    // v6 4.0 - PEAK-LOCK FLOOR: cap absolute giveback by peak tier (ratchet only).
-                    if (peakLockTrailEnabled && trailMaxProfitPts > 0 && averageEntryPrice > 0)
-                    {
-                        double allowedGb = 0; int desiredTierPl = peakLockTierActive;
-                        if      (trailMaxProfitPts >= peakLockT5PeakPts) { desiredTierPl = 5; allowedGb = peakLockT5GivebackPts; }
-                        else if (trailMaxProfitPts >= peakLockT4PeakPts) { desiredTierPl = Math.Max(desiredTierPl, 4); allowedGb = peakLockT4GivebackPts; }
-                        else if (trailMaxProfitPts >= peakLockT3PeakPts) { desiredTierPl = Math.Max(desiredTierPl, 3); allowedGb = peakLockT3GivebackPts; }
-                        else if (trailMaxProfitPts >= peakLockT2PeakPts) { desiredTierPl = Math.Max(desiredTierPl, 2); allowedGb = peakLockT2GivebackPts; }
-                        else if (trailMaxProfitPts >= peakLockT1PeakPts) { desiredTierPl = Math.Max(desiredTierPl, 1); allowedGb = peakLockT1GivebackPts; }
-                        if (desiredTierPl > 0 && allowedGb > 0)
-                        {
-                            // v6 4.2 Phase 7 - per-regime multiplier (TREND looser, CHOP/UNKNOWN tighter).
-                            double regMult = 1.0;
-                            if (currentRegime == "TREND_UP" || currentRegime == "TREND_DN") regMult = peakLockTrendMult;
-                            else if (currentRegime == "CHOP" || currentRegime == "UNKNOWN") regMult = peakLockChopMult;
-                            allowedGb *= regMult;
-                            double tickPtPl = TickSize * NQ_TICKS_PER_POINT;
-                            double peakPx = openTradeDirection == 1
-                                ? averageEntryPrice + trailMaxProfitPts * tickPtPl
-                                : averageEntryPrice - trailMaxProfitPts * tickPtPl;
-                            double floorPx = openTradeDirection == 1
-                                ? peakPx - allowedGb * tickPtPl
-                                : peakPx + allowedGb * tickPtPl;
-                            floorPx = Math.Round(floorPx / TickSize) * TickSize;
-                            // Take the TIGHTER (more profit-locking) of body-anchor and peak-lock floor.
-                            btPrice = openTradeDirection == 1
-                                ? Math.Max(btPrice, floorPx)
-                                : Math.Min(btPrice, floorPx);
-                            if (desiredTierPl > peakLockTierActive)
-                            {
-                                if (enableDiagLog)
-                                    WriteDiagRow("PEAKLOCK_T" + desiredTierPl,
-                                        "peak=" + trailMaxProfitPts.ToString("F1")
-                                        + "pt giveback=" + allowedGb.ToString("F1")
-                                        + "pt floor=" + floorPx.ToString("F2")
-                                        + " entry=" + averageEntryPrice.ToString("F2"));
-                                peakLockTierActive = desiredTierPl;
-                            }
-                        }
-                    }
                     bool first = !trailActive || trailPrice <= 0;
                     if (first
                         || (openTradeDirection == -1 && btPrice < trailPrice)
@@ -2090,22 +1836,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                         bool strongTrend  = sameDirBrick && nrBrickStreakCount >= pxStopStrongStreakMin;
                         if (strongTrend && lastAdxSlope > 0)         effRetracePts *= pxStopAdxRisingMult;
                         else if (lastAdxSlope < 0)                    effRetracePts *= pxStopAdxFallingMult;
-                    }
-                    // v6 4.1 - STREAK-HOLD: when last brick is in trade direction AND was printed
-                    // recently (streak alive), require >= 1 full brick of retrace before PxStop fires.
-                    // Prevents the "trail exited next bar" scalp-out pattern (4/30 09:35-09:40 cluster
-                    // exited 4 trades each within 1 brick at peaks 9-13pt with 3-5pt body-anchor retrace).
-                    // Real continuations always retrace less than 1 brick body before resuming.
-                    bool streakAliveDir = (openTradeDirection ==  1 && lastNrBrickColor == "G"
-                                         && nrBrickStreakCount >= 3)
-                                       || (openTradeDirection == -1 && lastNrBrickColor == "R"
-                                         && nrBrickStreakCount >= 3);
-                    bool sameColorRecent = lastSameColorBrickTime != DateTime.MinValue
-                                         && (Time[0] - lastSameColorBrickTime).TotalSeconds <= 25;
-                    if (streakAliveDir && sameColorRecent && renkoBrickSize > 0)
-                    {
-                        double oneBrickPts = renkoBrickSize / (double)NQ_TICKS_PER_POINT;
-                        if (effRetracePts < oneBrickPts) effRetracePts = oneBrickPts;
                     }
                     if (brickTrailPriceStopEnabled
                         && trailPrice > 0
@@ -2559,8 +2289,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 consecutiveWins     = 0;
                 dailyLimitHit       = false;
                 dailyProfitHit      = false;
-                peakDailyPnL        = 0;     // v6 4.2 Phase 3
-                softProfitCapActive = false; // v6 4.2 Phase 3
                 emergencyKillActive = false;
                 flattenFired        = false;
                 rthStartedToday     = false;
@@ -3051,32 +2779,19 @@ namespace NinjaTrader.NinjaScript.Strategies
             // is over-extended from VWAP relative to ATR, the move has likely already moved enough
             // that MM stop-runs become high-probability. Only enforced when ATR is meaningful
             // (>= extensionMinAtrPoints) so we don't over-block quiet midday sessions.
-            // v6 3.5 - TrendChase bypass: today's 13:00-13:13 19-brick G run was killed at 13:13
-            // by BLOCK_EXTENSION (ratio=6.2 > max=5.0). When chasing a confirmed trend, extension
-            // is the SIGNATURE of the move, not a reason to block.
-            if (!isManual && extensionFilterEnabled && !currentEntryTrendChase && !currentEntryPullbackReentry && vwapValue > 0 && indAtr != null && indAtr.IsValidDataPoint(0))
+            if (!isManual && extensionFilterEnabled && vwapValue > 0 && indAtr != null && indAtr.IsValidDataPoint(0))
             {
                 double atrNow = indAtr[0];
                 if (atrNow >= extensionMinAtrPoints)
                 {
                     double dist = Math.Abs(Close[0] - vwapValue);
                     double ratio = dist / atrNow;
-                    // v6 3.7 - Auto-loosen cap when htfBiasConsec is strong AND brick streak agrees with direction.
-                    double effExtMax = extensionMaxAtrFromVwap;
-                    int htfConsecDir = direction == 1 ? htfBiasConsecBull : (direction == -1 ? htfBiasConsecBear : 0);
-                    bool brickAgrees = (direction == 1 && lastNrBrickColor == "G") || (direction == -1 && lastNrBrickColor == "R");
-                    bool looseFire = extLooseEnabled && htfConsecDir >= extLooseMinHtfConsec && brickAgrees && nrBrickStreakCount >= extLooseMinStreak;
-                    if (looseFire) effExtMax = Math.Max(effExtMax, extLooseMaxAtrFromVwap);
-                    if (ratio > effExtMax)
+                    if (ratio > extensionMaxAtrFromVwap)
                     {
                         // v6 2.7.12 - ExtensionTrendBypass removed (was default OFF, never validated).
                         UpdateDashboardStatus(label + " blocked: EXTENSION " + ratio.ToString("F1") + "xATR", Brushes.Orange);
-                        if (enableDiagLog) WriteDiagRow("BLOCK_EXTENSION", "dir=" + direction + " dist=" + dist.ToString("F1") + " atr=" + atrNow.ToString("F1") + " ratio=" + ratio.ToString("F2") + " max=" + effExtMax.ToString("F2") + " loose=" + looseFire);
+                        if (enableDiagLog) WriteDiagRow("BLOCK_EXTENSION", "dir=" + direction + " dist=" + dist.ToString("F1") + " atr=" + atrNow.ToString("F1") + " ratio=" + ratio.ToString("F2") + " max=" + extensionMaxAtrFromVwap.ToString("F2"));
                         return false;
-                    }
-                    else if (looseFire && ratio > extensionMaxAtrFromVwap && enableDiagLog)
-                    {
-                        WriteDiagRow("EXT_LOOSEN", "dir=" + direction + " ratio=" + ratio.ToString("F2") + " base=" + extensionMaxAtrFromVwap.ToString("F2") + " eff=" + effExtMax.ToString("F2") + " htfConsec=" + htfConsecDir + " streak=" + nrBrickStreakCount);
                     }
                 }
             }
@@ -3111,95 +2826,31 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             int ct = ToTime(Time[0]);
             bool insideHours = !tradingHoursEnabled || (ct >= tradingStartTime && ct < flattenTime);
-            // v6 4.2 Phase 4 - emit BLOCK_AUTO with reason on every silent return (throttled per state-change).
-            if (!insideHours)               { LogSilentBlock("outsideHours"); return; }
-            if (dailyLimitHit)              { LogSilentBlock("dailyLimitHit"); return; }
-            if (emergencyKillActive)        { LogSilentBlock("emergencyKill"); return; }
-            if (maxTradesPerDay > 0 && dailyTradeCount >= maxTradesPerDay) { LogSilentBlock("maxTrades"); return; }
-            // v6 4.2 Phase 3 - Soft profit cap: only TrendChase / PullbackReentry allowed (decided below).
+            if (!insideHours || dailyLimitHit || dailyProfitHit || emergencyKillActive) return;
+            if (maxTradesPerDay > 0 && dailyTradeCount >= maxTradesPerDay) return;
 
             // v6 3.2 - TrendChase override (computed FIRST so cooldowns can be bypassed in strong trends).
             // v6 3.3 - PreTrendChase widens the gate to UNKNOWN regime when brick + STRONG signal agree.
             double adxNowTC = (indAdx != null && indAdx.IsValidDataPoint(0)) ? indAdx[0] : 0;
             bool trendChaseLong  = trendChaseEnabled && currentRegime == "TREND_UP"
                                    && adxNowTC >= trendChaseMinAdx
-                                   && lastNrBrickColor == "G"
-                                   && nrBrickStreakCount >= trendChaseMinStreak
-                                   && nrBrickStreakCount <= trendChaseMaxStreak;
+                                   && lastNrBrickColor == "G" && nrBrickStreakCount >= trendChaseMinStreak;
             bool trendChaseShort = trendChaseEnabled && currentRegime == "TREND_DN"
                                    && adxNowTC >= trendChaseMinAdx
-                                   && lastNrBrickColor == "R"
-                                   && nrBrickStreakCount >= trendChaseMinStreak
-                                   && nrBrickStreakCount <= trendChaseMaxStreak;
-            // v6 3.3 - PreTrendChase: regime=UNKNOWN, brick agrees, streak in [Min,Max], STRONG conf, ADX not falling fast.
-            bool preTrendBaseLong  = preTrendChaseEnabled && currentRegime == "UNKNOWN"
-                                     && lastNrBrickColor == "G"
-                                     && nrBrickStreakCount >= preTrendChaseMinStreak
-                                     && nrBrickStreakCount <= preTrendChaseMaxStreak
-                                     && lastBullConfidence >= preTrendChaseMinConf
-                                     && lastAdxSlope >= preTrendChaseMinAdxSlope;
-            bool preTrendBaseShort = preTrendChaseEnabled && currentRegime == "UNKNOWN"
-                                     && lastNrBrickColor == "R"
-                                     && nrBrickStreakCount >= preTrendChaseMinStreak
-                                     && nrBrickStreakCount <= preTrendChaseMaxStreak
-                                     && lastBearConfidence >= preTrendChaseMinConf
-                                     && lastAdxSlope >= preTrendChaseMinAdxSlope;
-            bool preTrendLong  = preTrendBaseLong;
-            bool preTrendShort = preTrendBaseShort;
+                                   && lastNrBrickColor == "R" && nrBrickStreakCount >= trendChaseMinStreak;
+            // v6 3.3 - PreTrendChase: regime=UNKNOWN, brick agrees, streak>=N, STRONG conf.
+            bool preTrendLong  = preTrendChaseEnabled && currentRegime == "UNKNOWN"
+                                 && lastNrBrickColor == "G" && nrBrickStreakCount >= preTrendChaseMinStreak
+                                 && lastBullConfidence >= preTrendChaseMinConf;
+            bool preTrendShort = preTrendChaseEnabled && currentRegime == "UNKNOWN"
+                                 && lastNrBrickColor == "R" && nrBrickStreakCount >= preTrendChaseMinStreak
+                                 && lastBearConfidence >= preTrendChaseMinConf;
             if (preTrendLong)  trendChaseLong  = true;
             if (preTrendShort) trendChaseShort = true;
 
-            // v6 3.7 - Pullback Re-Entry: post-big-run continuation. Set currentEntryPullbackReentry
-            // so the entry inherits TrendChase-style bypasses (CHOP/UNKNOWN/extension/cooldown).
-            bool pullbackReLong = false, pullbackReShort = false;
-            if (pullbackReentryEnabled && pullbackArmedDir != 0)
-            {
-                DateTime nowPb = State == State.Realtime ? DateTime.Now : Time[0];
-                bool windowOk = (nowPb - pullbackArmedTime).TotalSeconds <= pullbackReentryWindowSec;
-                if (!windowOk)
-                {
-                    if (enableDiagLog) WriteDiagRow("PULLBACK_DISARM", "reason=window dir=" + pullbackArmedDir);
-                    pullbackArmedDir = 0;
-                }
-                else
-                {
-                    int htfCD = pullbackArmedDir == 1 ? htfBiasConsecBull : htfBiasConsecBear;
-                    double retraceNeed = htfCD >= pullbackReentryStrongHtfThresh
-                        ? pullbackReentryRetracePctStrongHtf
-                        : pullbackReentryRetracePctNormal;
-                    double need = pullbackArmedRunPts * retraceNeed;
-                    if (pullbackArmedDir == 1)
-                    {
-                        double drop = pullbackArmedExtremePx - Close[0];
-                        bool retraced = drop >= need;
-                        bool contBrick = lastNrBrickColor == "G" && nrBrickStreakCount >= pullbackReentryMinContBricks;
-                        if (retraced && contBrick)
-                        {
-                            pullbackReLong = true;
-                            if (enableDiagLog) WriteDiagRow("PULLBACK_REENTRY", "dir=1 drop=" + drop.ToString("F1") + "pt need=" + need.ToString("F1") + " runPts=" + pullbackArmedRunPts.ToString("F1") + " htfConsec=" + htfCD + " streak=" + nrBrickStreakCount);
-                        }
-                    }
-                    else if (pullbackArmedDir == -1)
-                    {
-                        double rise = Close[0] - pullbackArmedExtremePx;
-                        bool retraced = rise >= need;
-                        bool contBrick = lastNrBrickColor == "R" && nrBrickStreakCount >= pullbackReentryMinContBricks;
-                        if (retraced && contBrick)
-                        {
-                            pullbackReShort = true;
-                            if (enableDiagLog) WriteDiagRow("PULLBACK_REENTRY", "dir=-1 rise=" + rise.ToString("F1") + "pt need=" + need.ToString("F1") + " runPts=" + pullbackArmedRunPts.ToString("F1") + " htfConsec=" + htfCD + " streak=" + nrBrickStreakCount);
-                        }
-                    }
-                }
-            }
-            if (pullbackReLong)  { trendChaseLong  = true; currentEntryPullbackReentry = true; }
-            if (pullbackReShort) { trendChaseShort = true; currentEntryPullbackReentry = true; }
-
             // Bar-based cooldowns (TrendChase bypasses tooSoon/postLossCD in trend direction).
-            // v6 4.0 - postLossCD halved 8->4 bars. NinzaRenko bricks tick fast; 8 bars =
-            // ~100sec dead window after a single loss (4/30 10:40 -> blocked 7 attempts in 90sec).
             bool postLossCD = consecutiveLosses >= 1 && lastLossBarNumber > 0
-                              && (CurrentBar - lastLossBarNumber) < 4;
+                              && (CurrentBar - lastLossBarNumber) < 8;
             bool tooSoon    = lastTradeExitBar > 0 && (CurrentBar - lastTradeExitBar) < 4;
             bool trapCD     = trapEscapeCooldownBar > 0 && (CurrentBar - trapEscapeCooldownBar) < 8;
             bool voidCD     = voidBarsRemaining > 0;
@@ -3258,13 +2909,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             // This catches afternoon trend-flip days (e.g. 04-28 PB had 26-brick G run with 0 LONGs).
             bool earlyFlipL = enableEarlyEntryOnFlip && earlyEntryAlsoBypassHtf && IsEarlyFlipEntry(1);
             bool earlyFlipS = enableEarlyEntryOnFlip && earlyEntryAlsoBypassHtf && IsEarlyFlipEntry(-1);
-            // v6 3.4 - htfBias staleness override: when brick streak in trade direction >= N,
-            // the morning htfBias is stale (brick chart proved direction changed). Today's 13:01
-            // BUY at Gx8 / Bull=70 was blocked by htf=-1 left over from down move.
-            bool htfStaleL = lastNrBrickColor == "G" && nrBrickStreakCount >= htfStalenessOverrideStreak;
-            bool htfStaleS = lastNrBrickColor == "R" && nrBrickStreakCount >= htfStalenessOverrideStreak;
-            bool htfBlockL = (htfBias < 0 || sessionConfirmedBias < 0) && !earlyFlipL && !htfStaleL;
-            bool htfBlockS = (htfBias > 0 || sessionConfirmedBias > 0) && !earlyFlipS && !htfStaleS;
+            bool htfBlockL = (htfBias < 0 || sessionConfirmedBias < 0) && !earlyFlipL;
+            bool htfBlockS = (htfBias > 0 || sessionConfirmedBias > 0) && !earlyFlipS;
 
             // Order-flow tape block (only realtime; data-driven)
             double tape = orderFlowFilterEnabled ? cachedTapeDelta : 0;
@@ -3306,12 +2952,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             // v6 3.2 - Try LONG path first; emit BLOCK_AUTO with reason on silent rejection.
             bool longCandidate  = lastBullConfidence >= effMinL;
             bool shortCandidate = lastBearConfidence >= effMinS;
-            // v6 4.2 Phase 3 - Soft profit cap: above target only TrendChase / PullbackReentry allowed.
-            if (softProfitCapActive && !trendChaseLong && !trendChaseShort)
-            {
-                LogSilentBlock("softProfitCap_chaseOnly");
-                return;
-            }
             if (longCandidate)
             {
                 if (rsiDown || overLong || nearH || volSpike || htfBlockL || tapeBlockL)
@@ -3334,7 +2974,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                             + " streak=" + nrBrickStreakCount + " bull=" + lastBullConfidence.ToString("F1"));
                     ExecuteLongEntry(false);
                     currentEntryTrendChase = false;
-                    if (currentEntryPullbackReentry) { pullbackArmedDir = 0; currentEntryPullbackReentry = false; }
                     return;
                 }
             }
@@ -3360,67 +2999,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                             + " streak=" + nrBrickStreakCount + " bear=" + lastBearConfidence.ToString("F1"));
                     ExecuteShortEntry(false);
                     currentEntryTrendChase = false;
-                    if (currentEntryPullbackReentry) { pullbackArmedDir = 0; currentEntryPullbackReentry = false; }
                 }
             }
-        }
-
-        // v6 4.2 Phase 4 - Silent-Block diag throttle: only emit when (reason, bar) changes.
-        private void LogSilentBlock(string reason)
-        {
-            if (!enableDiagLog) return;
-            if (lastSilentBlockBar == CurrentBar && lastSilentBlockReason == reason) return;
-            lastSilentBlockBar    = CurrentBar;
-            lastSilentBlockReason = reason;
-            WriteDiagRow("BLOCK_AUTO", "reason=" + reason);
-        }
-
-        // v6 4.2 Phase 5 - Record capture-ratio sample per regime; trigger nightly auto-tune.
-        // Capture ratio = ProfitPts / PeakPts. Stored per regime as packed [ratio*1000 + peak/100] doubles.
-        // Simpler: store ratio (0..1) only; peak is reflected in tier coverage.
-        private void RecordCaptureSample(double profitCurrency)
-        {
-            if (trailMaxProfitPts <= 0) return;
-            double profitPts = profitCurrency / NQ_DOLLARS_PER_POINT
-                / Math.Max(1, totalContracts > 0 ? totalContracts : 1);
-            double ratio = profitPts / trailMaxProfitPts;
-            if (ratio < -2.0) ratio = -2.0; if (ratio > 1.5) ratio = 1.5;
-            string reg = string.IsNullOrEmpty(lastEntryRegime) ? "UNKNOWN" : lastEntryRegime;
-            System.Collections.Generic.Queue<double> q;
-            if (!captureRatioByRegime.TryGetValue(reg, out q))
-            {
-                q = new System.Collections.Generic.Queue<double>();
-                captureRatioByRegime[reg] = q;
-            }
-            q.Enqueue(ratio);
-            while (q.Count > captureRatioMaxSamples) q.Dequeue();
-            MaybeAutoTuneTrail();
-        }
-
-        // Nightly (per-day) auto-tune of Peak-Lock giveback tiers.
-        // If avg capture < 50% across last 30+ samples -> WIDEN giveback (let runners run, +2pt).
-        // If avg capture > 80% AND avg peak small -> TIGHTEN giveback (lock faster, -2pt, floor 6pt).
-        private void MaybeAutoTuneTrail()
-        {
-            if (Time[0].Date == lastTrailTuneDate) return;
-            lastTrailTuneDate = Time[0].Date;
-            int totalN = 0; double sumRatio = 0;
-            foreach (var kv in captureRatioByRegime)
-                foreach (var r in kv.Value) { totalN++; sumRatio += r; }
-            if (totalN < 30) return;
-            double avg = sumRatio / totalN;
-            double[] tiers = { peakLockT1GivebackPts, peakLockT2GivebackPts, peakLockT3GivebackPts,
-                               peakLockT4GivebackPts, peakLockT5GivebackPts };
-            string action = "hold";
-            if (avg < 0.50)       { for (int i = 0; i < 5; i++) tiers[i] = Math.Min(tiers[i] + 2.0, 30.0); action = "widen"; }
-            else if (avg > 0.80)  { for (int i = 0; i < 5; i++) tiers[i] = Math.Max(tiers[i] - 2.0, 6.0);  action = "tighten"; }
-            peakLockT1GivebackPts = tiers[0]; peakLockT2GivebackPts = tiers[1];
-            peakLockT3GivebackPts = tiers[2]; peakLockT4GivebackPts = tiers[3];
-            peakLockT5GivebackPts = tiers[4];
-            if (enableDiagLog)
-                WriteDiagRow("TRAIL_TUNE_DAILY",
-                    "n=" + totalN + " avgRatio=" + avg.ToString("F2") + " action=" + action
-                    + " tiers=[" + string.Join(",", Array.ConvertAll(tiers, t => t.ToString("F0"))) + "]");
         }
 
         private void ExecuteLongEntry(bool isManual)
@@ -4069,8 +3649,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             lastLossDirection   = 0;
             dailyLimitHit       = false;
             dailyProfitHit      = false;
-            peakDailyPnL        = 0;       // v6 4.2 Phase 3
-            softProfitCapActive = false;   // v6 4.2 Phase 3
             emergencyKillActive = false;
             flattenFired        = false;
             // Restore aggressive trail factor to its base if streak-adapted
@@ -4128,13 +3706,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             // v6 3.0 — clear Smart BE Ladder per-trade state.
             smartBeTierActive = 0;
             smartBeManualHandoffLogged = false; // v6 3.1
-            profitSafeguardTierActive = 0;       // v6 3.6
-            peakLockTierActive = 0;              // v6 4.0
-            // v6 3.7 - clear pullback re-entry arm so a fresh trade can re-arm on its next big run.
-            pullbackArmedDir = 0;
-            pullbackArmedExtremePx = 0;
-            pullbackArmedRunPts = 0;
-            currentEntryPullbackReentry = false;
             // Auto-clear Runner Mode when position goes flat — it's a per-trade opt-in.
             if (runnerModeActive_user)
             {
@@ -4297,7 +3868,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                                     }
                                 }
                                 if (enableDiagLog) WriteDiagRow("EXIT_LOSS_" + reason, "pnl=" + last.ProfitCurrency.ToString("F2") + " consec=" + consecutiveLosses);
-                                RecordCaptureSample(last.ProfitCurrency); // v6 4.2 Phase 5
                                 // v6 3.0 - REGIME_PNL: attribute exit pnl to entry regime; emit running per-regime totals.
                                 if (regimeQualityGateEnabled && !string.IsNullOrEmpty(lastEntryRegime))
                                 {
@@ -4346,7 +3916,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                                         + " minStreak=" + brickReentryMinStreak);
                                 }
                                 if (enableDiagLog) WriteDiagRow("EXIT_WIN_" + reason, "pnl=" + last.ProfitCurrency.ToString("F2") + " consec=" + consecutiveWins);
-                                RecordCaptureSample(last.ProfitCurrency); // v6 4.2 Phase 5
                                 // v6 3.0 - REGIME_PNL: attribute win pnl to entry regime; emit running per-regime totals.
                                 if (regimeQualityGateEnabled && !string.IsNullOrEmpty(lastEntryRegime))
                                 {
@@ -5236,21 +4805,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                         + " durSec=" + runDurSec.ToString("F0")
                         + " startPx=" + runStartPrice.ToString("F2")
                         + " endPx=" + bClose.ToString("F2"));
-                }
-                // v6 3.7 - Arm Pullback Re-Entry on big runs.
-                if (pullbackReentryEnabled && runCurrentLen >= pullbackReentryMinRunLen && runMaxFavPts >= pullbackReentryMinMaxFavPts)
-                {
-                    double runPtsArm = Math.Abs(bClose - runStartPrice);
-                    pullbackArmedDir = (runCurrentColor == "G") ? 1 : (runCurrentColor == "R" ? -1 : 0);
-                    pullbackArmedExtremePx = bClose; // run-end = local extreme
-                    pullbackArmedRunPts = runPtsArm;
-                    pullbackArmedTime = now;
-                    if (enableDiagLog) WriteDiagRow("PULLBACK_ARM",
-                        "dir=" + pullbackArmedDir + " runLen=" + runCurrentLen
-                        + " runPts=" + runPtsArm.ToString("F1")
-                        + " maxFav=" + runMaxFavPts.ToString("F1")
-                        + " extremePx=" + bClose.ToString("F2")
-                        + " windowSec=" + pullbackReentryWindowSec);
                 }
                 // v6 2.7.12 - lastEndedRun tracking removed (was used only by removed bypasses).
                 // Update last-10 max (regime context: "are we in a high-streak environment?")
@@ -7124,138 +6678,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             Description = "PHASE 3.3 - Minimum brick streak in direction for PreTrendChase. Default 5 (clear run, not 1-2 brick noise).")]
         public int PreTrendChaseMinStreak { get { return preTrendChaseMinStreak; } set { preTrendChaseMinStreak = value; } }
 
-        [NinjaScriptProperty, Range(30, 120)]
+        [NinjaScriptProperty, Range(60, 120)]
         [Display(Name = "  PreTrendChase Min Conf", Order = 67, GroupName = "10 - Regime",
-            Description = "PHASE 3.3 - Minimum Bull/Bear confidence for PreTrendChase to fire. v4.1 lowered to 55 (catches strong UNKNOWN runs at 77.5 conf then 35-57).")]
+            Description = "PHASE 3.3 - Minimum Bull/Bear confidence for PreTrendChase to fire. Default 80 (STRONG_BUY/STRONG_SELL territory).")]
         public double PreTrendChaseMinConf { get { return preTrendChaseMinConf; } set { preTrendChaseMinConf = value; } }
-
-        [NinjaScriptProperty, Range(5, 40)]
-        [Display(Name = "  PreTrendChase Max Streak", Order = 68, GroupName = "10 - Regime",
-            Description = "PHASE 3.4 - Exhaustion cap. Don't fire PreTrendChase when brick streak exceeds this (e.g. brick 13 of a 13-brick run = capitulation, not continuation). Default 9.")]
-        public int PreTrendChaseMaxStreak { get { return preTrendChaseMaxStreak; } set { preTrendChaseMaxStreak = value; } }
-
-        [NinjaScriptProperty, Range(-2.0, 2.0)]
-        [Display(Name = "  PreTrendChase Min ADX Slope", Order = 69, GroupName = "10 - Regime",
-            Description = "PHASE 3.4 - Minimum ADX slope (last bar delta) for PreTrendChase. Block fires when ADX is clearly falling. Default -0.25 (allow flat-ish, block clearly falling).")]
-        public double PreTrendChaseMinAdxSlope { get { return preTrendChaseMinAdxSlope; } set { preTrendChaseMinAdxSlope = value; } }
-
-        [NinjaScriptProperty, Range(4, 30)]
-        [Display(Name = "htfBias Staleness Override Streak", Order = 70, GroupName = "10 - Regime",
-            Description = "PHASE 3.4 - Bypass htfBias entry block when brick streak in trade direction >= this (htfBias is stale: brick chart already proved direction changed). Default 8.")]
-        public int HtfStalenessOverrideStreak { get { return htfStalenessOverrideStreak; } set { htfStalenessOverrideStreak = value; } }
-
-        [NinjaScriptProperty, Range(10, 100)]
-        [Display(Name = "  TrendChase Max Streak", Order = 71, GroupName = "10 - Regime",
-            Description = "PHASE 3.6 - Exhaustion cap for TrendChase. Don't enter when brick streak in trend dir exceeds this. Today's 13:42 32-brick LONG trapped -$175. Default 25.")]
-        public int TrendChaseMaxStreak { get { return trendChaseMaxStreak; } set { trendChaseMaxStreak = value; } }
-
-        // ===== v6 3.7 - PULLBACK RE-ENTRY (post big-run continuation) =====
-        [NinjaScriptProperty]
-        [Display(Name = "Pullback Re-Entry Enabled", Order = 80, GroupName = "10 - Regime",
-            Description = "PHASE 3.7 - After a big run (len>=MinRunLen AND maxFav>=MinMaxFavPts), arms a window where a continuation entry in the same dir is allowed AFTER a meaningful retrace, even through the extension filter. Today 14:25 a 52-brick +192pt run ended; at 15:06 a clean 5-brick continuation broke to new highs but ALL 5 BUY signals were BLOCK_EXTENSION'd. Default ON.")]
-        public bool PullbackReentryEnabled { get { return pullbackReentryEnabled; } set { pullbackReentryEnabled = value; } }
-
-        [NinjaScriptProperty, Range(10, 80)]
-        [Display(Name = "  Pullback Min Run Len", Order = 81, GroupName = "10 - Regime",
-            Description = "PHASE 3.7 - Minimum brick streak length of the run that just ended to arm pullback re-entry. Default 20.")]
-        public int PullbackReentryMinRunLen { get { return pullbackReentryMinRunLen; } set { pullbackReentryMinRunLen = value; } }
-
-        [NinjaScriptProperty, Range(20.0, 200.0)]
-        [Display(Name = "  Pullback Min MaxFav (pts)", Order = 82, GroupName = "10 - Regime",
-            Description = "PHASE 3.7 - Minimum max favorable excursion (pts) of the run to arm. Default 40pt = $800.")]
-        public double PullbackReentryMinMaxFavPts { get { return pullbackReentryMinMaxFavPts; } set { pullbackReentryMinMaxFavPts = value; } }
-
-        [NinjaScriptProperty, Range(0.10, 0.60)]
-        [Display(Name = "  Pullback Retrace % (Normal)", Order = 83, GroupName = "10 - Regime",
-            Description = "PHASE 3.7 - Required retracement of the run as fraction (0.30 = 30%) in normal trends. Default 0.30.")]
-        public double PullbackReentryRetracePctNormal { get { return pullbackReentryRetracePctNormal; } set { pullbackReentryRetracePctNormal = value; } }
-
-        [NinjaScriptProperty, Range(0.10, 0.50)]
-        [Display(Name = "  Pullback Retrace % (Strong htf)", Order = 84, GroupName = "10 - Regime",
-            Description = "PHASE 3.7 - Required retracement when |htfBiasConsec| >= StrongHtfThresh (one-sided trend - shallow retrace OK). Default 0.20.")]
-        public double PullbackReentryRetracePctStrongHtf { get { return pullbackReentryRetracePctStrongHtf; } set { pullbackReentryRetracePctStrongHtf = value; } }
-
-        [NinjaScriptProperty, Range(4, 20)]
-        [Display(Name = "  Pullback Strong htf Threshold", Order = 85, GroupName = "10 - Regime",
-            Description = "PHASE 3.7 - htfBiasConsec value at/above which the strong-htf retrace % applies. Default 7.")]
-        public int PullbackReentryStrongHtfThresh { get { return pullbackReentryStrongHtfThresh; } set { pullbackReentryStrongHtfThresh = value; } }
-
-        [NinjaScriptProperty, Range(1, 10)]
-        [Display(Name = "  Pullback Min Cont Bricks", Order = 86, GroupName = "10 - Regime",
-            Description = "PHASE 3.7 - Minimum bricks in original direction after retrace required to fire. Default 2.")]
-        public int PullbackReentryMinContBricks { get { return pullbackReentryMinContBricks; } set { pullbackReentryMinContBricks = value; } }
-
-        [NinjaScriptProperty, Range(60, 3600)]
-        [Display(Name = "  Pullback Window (sec)", Order = 87, GroupName = "10 - Regime",
-            Description = "PHASE 3.7 - Arm-window in seconds. After expiry the arm clears. Default 900 (15 min).")]
-        public int PullbackReentryWindowSec { get { return pullbackReentryWindowSec; } set { pullbackReentryWindowSec = value; } }
-
-        // ===== v6 3.7 - EXTENSION RATIO AUTO-LOOSEN (strong htf trend bypass) =====
-        [NinjaScriptProperty]
-        [Display(Name = "Extension Auto-Loosen Enabled", Order = 90, GroupName = "10 - Regime",
-            Description = "PHASE 3.7 - When htfBiasConsec is strong AND a 3+ brick streak agrees with direction, allow extension up to ExtLooseMaxAtrFromVwap instead of the default cap. Today's 15:06 5 bricks all blocked at ratio 10.7-12.0 vs default cap 5.0. Default ON.")]
-        public bool ExtensionAutoLoosenEnabled { get { return extLooseEnabled; } set { extLooseEnabled = value; } }
-
-        [NinjaScriptProperty, Range(4, 20)]
-        [Display(Name = "  Ext Loose Min htf Consec", Order = 91, GroupName = "10 - Regime",
-            Description = "PHASE 3.7 - Minimum htfBiasConsec (in trade direction) to apply auto-loosen. Default 7.")]
-        public int ExtLooseMinHtfConsec { get { return extLooseMinHtfConsec; } set { extLooseMinHtfConsec = value; } }
-
-        [NinjaScriptProperty, Range(1, 15)]
-        [Display(Name = "  Ext Loose Min Streak", Order = 92, GroupName = "10 - Regime",
-            Description = "PHASE 3.7 - Minimum brick streak in direction to apply auto-loosen. Default 3.")]
-        public int ExtLooseMinStreak { get { return extLooseMinStreak; } set { extLooseMinStreak = value; } }
-
-        [NinjaScriptProperty, Range(5.0, 25.0)]
-        [Display(Name = "  Ext Loose Max ATR from VWAP", Order = 93, GroupName = "10 - Regime",
-            Description = "PHASE 3.7 - Effective extension cap when auto-loosen fires. Default 8.0 (vs base cap typically 5.0).")]
-        public double ExtLooseMaxAtrFromVwap { get { return extLooseMaxAtrFromVwap; } set { extLooseMaxAtrFromVwap = value; } }
-
-        // ===== v6 3.6 - PROFIT SAFEGUARD LADDER ($-based ratchet, fires in ALL modes incl. RUNNER) =====
-        [NinjaScriptProperty]
-        [Display(Name = "Profit Safeguard Enabled", Order = 60, GroupName = "3 - Trail / SL",
-            Description = "PHASE 3.6 - $-based SL ratchet that fires in ALL modes (including RUNNER, where Smart BE is suppressed). Today's 13:26 LONG hit peak +46pt = +$925 unrealized but SL stayed at entry-18 = -$360 risk. Strict ratchet: only tightens, never loosens. Respects manual SL moves. Default ON.")]
-        public bool ProfitSafeguardEnabled { get { return profitSafeguardEnabled; } set { profitSafeguardEnabled = value; } }
-
-        [NinjaScriptProperty, Range(4, 50)]
-        [Display(Name = "  Safeguard T1 Peak Pts", Order = 61, GroupName = "3 - Trail / SL",
-            Description = "PHASE 3.6 - Tier 1 trigger (peak profit pts). Default 10pt = $200.")]
-        public double ProfitSafeguardT1Pts { get { return profitSafeguardT1Pts; } set { profitSafeguardT1Pts = value; } }
-
-        [NinjaScriptProperty, Range(-10, 20)]
-        [Display(Name = "  Safeguard T1 SL Offset (pts from entry)", Order = 62, GroupName = "3 - Trail / SL",
-            Description = "PHASE 3.6 - Tier 1 SL offset from entry (signed). Negative = below entry (loss-cap). Default -2pt (cap loss at -$40).")]
-        public double ProfitSafeguardT1SlPts { get { return profitSafeguardT1SlPts; } set { profitSafeguardT1SlPts = value; } }
-
-        [NinjaScriptProperty, Range(8, 80)]
-        [Display(Name = "  Safeguard T2 Peak Pts", Order = 63, GroupName = "3 - Trail / SL",
-            Description = "PHASE 3.6 - Tier 2 trigger. Default 20pt = $400.")]
-        public double ProfitSafeguardT2Pts { get { return profitSafeguardT2Pts; } set { profitSafeguardT2Pts = value; } }
-
-        [NinjaScriptProperty, Range(-10, 30)]
-        [Display(Name = "  Safeguard T2 SL Offset (pts from entry)", Order = 64, GroupName = "3 - Trail / SL",
-            Description = "PHASE 3.6 - Tier 2 SL offset. Default +1pt (BE+).")]
-        public double ProfitSafeguardT2SlPts { get { return profitSafeguardT2SlPts; } set { profitSafeguardT2SlPts = value; } }
-
-        [NinjaScriptProperty, Range(15, 120)]
-        [Display(Name = "  Safeguard T3 Peak Pts", Order = 65, GroupName = "3 - Trail / SL",
-            Description = "PHASE 3.6 - Tier 3 trigger. Default 30pt = $600.")]
-        public double ProfitSafeguardT3Pts { get { return profitSafeguardT3Pts; } set { profitSafeguardT3Pts = value; } }
-
-        [NinjaScriptProperty, Range(0, 60)]
-        [Display(Name = "  Safeguard T3 SL Offset (pts from entry)", Order = 66, GroupName = "3 - Trail / SL",
-            Description = "PHASE 3.6 - Tier 3 SL offset. Default +8pt (lock $160 of $600 peak ~27%).")]
-        public double ProfitSafeguardT3SlPts { get { return profitSafeguardT3SlPts; } set { profitSafeguardT3SlPts = value; } }
-
-        [NinjaScriptProperty, Range(25, 200)]
-        [Display(Name = "  Safeguard T4 Peak Pts", Order = 67, GroupName = "3 - Trail / SL",
-            Description = "PHASE 3.6 - Tier 4 trigger. Default 50pt = $1000.")]
-        public double ProfitSafeguardT4Pts { get { return profitSafeguardT4Pts; } set { profitSafeguardT4Pts = value; } }
-
-        [NinjaScriptProperty, Range(0, 100)]
-        [Display(Name = "  Safeguard T4 SL Offset (pts from entry)", Order = 68, GroupName = "3 - Trail / SL",
-            Description = "PHASE 3.6 - Tier 4 SL offset. Default +15pt (lock $300 of $1000 peak = 30%).")]
-        public double ProfitSafeguardT4SlPts { get { return profitSafeguardT4SlPts; } set { profitSafeguardT4SlPts = value; } }
 
         // ===== v6 2.7.12 - REMOVED FreshReversalBypass + ChopFreshReversalBypass properties =====
         // (Day-28 Playback15: every bypass-triggered entry LOST, -$1,545 swing.)

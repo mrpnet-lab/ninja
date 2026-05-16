@@ -1,0 +1,3245 @@
+// ============================================================
+//  Mm-ATM v5.0 Strategy for NinjaTrader 8
+//  Complete rewrite: simplified architecture, 12 filters, unified exits,
+//  smart-trail backtrack vs MM stop-hunts, optional order-flow tape filter,
+//  redesigned dashboard with explicit BUY/SELL trade-signal indicator.
+// ============================================================
+
+#region Using declarations
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.ComponentModel.DataAnnotations;
+using System.Linq;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Media;
+using NinjaTrader.Cbi;
+using NinjaTrader.Gui;
+using NinjaTrader.Gui.Chart;
+using NinjaTrader.Data;
+using NinjaTrader.NinjaScript;
+using NinjaTrader.NinjaScript.DrawingTools;
+using NinjaTrader.NinjaScript.Indicators;
+#endregion
+
+namespace NinjaTrader.NinjaScript.Strategies
+{
+    public class Mm_ATM_v5 : Strategy
+    {
+        // ===========================================================
+        //  CONSTANTS
+        // ===========================================================
+        #region Constants
+        private const double NQ_TICKS_PER_POINT  = 4.0;
+        private const double NQ_DOLLARS_PER_POINT = 20.0;
+        private const int    DASH_UPDATE_MS       = 333;
+        private const int    AGGRESSIVE_LIMIT_TIMEOUT_SEC = 3;
+        private const int    STALE_EXIT_TICKS     = 250;
+        private const int    FLAT_SYNC_MAX_TICKS  = 200;
+        private const string TAG = "[Mm-ATM v5] ";
+        #endregion
+
+        // ===========================================================
+        //  USER PARAMETERS (backing fields)
+        // ===========================================================
+        #region User parameter fields
+        private int    slPoints;
+        private int    tpPoints;
+        private int    maxDailyLossDollars;
+        private int    maxDailyProfitDollars;
+        private int    maxTradesPerDay;
+        private int    contracts;
+        private int    maxContracts;
+        private bool   autoMode;
+        private int    autoStrategy;          // 0=Mom+VWAP, 1=KeyLvl, 2=Auto
+        private double minSignalConfidence;
+        private int    entryDelaySeconds;
+        private int    emaPeriodFast;
+        private int    emaPeriodSlow;
+        private int    rsiPeriod;
+        private int    atrPeriod;
+        private int    htfEmaPeriod;
+        private int    slTpAdjustStep;
+        private int    jumpSlPercent;
+        private int    breakevenAtPoints;
+        private bool   breakevenEnabled;          // master toggle (button on dashboard mirrors this)
+        private bool   allowMultiEntryPerBar;     // when true, enteredThisBar guard is bypassed
+        private bool   trailEnabled;
+        private int    trailActivationPoints;
+        private double trailAtrMultiplier;
+        private int    smartTrailBacktrackTicks;
+        private bool   orderFlowFilterEnabled;
+        private bool   enableTrapDetector;
+        private int    tradingStartTime;
+        private int    flattenTime;
+        private bool   tradingHoursEnabled;
+        private bool   showVwap;
+        private bool   showEma;
+        private bool   enableDiagLog;
+        #endregion
+
+        // ===========================================================
+        //  INDICATORS
+        // ===========================================================
+        #region Indicators
+        private EMA indEmaFast, indEmaSlow, indEmaHtf, indEma5mFast, indEma5mSlow;
+        private RSI indRsi;
+        private ATR indAtr;
+        #endregion
+
+        // ===========================================================
+        //  STATE — daily/session
+        // ===========================================================
+        #region Session state
+        private DateTime sessionDate;
+        private double   dailyRealizedPnL;
+        private int      dailyTradeCount;
+        private int      processedTradeCount;
+        private bool     dailyLimitHit;
+        private bool     dailyProfitHit;
+        private bool     emergencyKillActive;
+        private bool     flattenFired;
+        private bool     rthStartedToday;
+        private double   prevDayHigh, prevDayLow, prevDayClose, prevDayOpen;
+        private double   currDayHigh, currDayLow, currDayOpen;
+        private bool     firstBarSeen;
+        #endregion
+
+        // ===========================================================
+        //  STATE — position / order management
+        // ===========================================================
+        #region Position state
+        private int      openTradeDirection;       // 1=long, -1=short, 0=flat
+        private double   averageEntryPrice;
+        private double   totalContracts;
+        private int      openDcaCount;
+        private int      tradeSequence;
+        private double   hiddenStopPrice;
+        private double   hiddenTargetPrice;
+        private double   originalSlPrice;          // first-arm reference for SmartSL backtrack
+        private bool     stopsArmed;
+        private bool     breakevenLocked;
+        private bool     runnerModeActive;
+        private int      entryBar;
+        private DateTime lastEntryWallTime;
+        private DateTime aggressiveLimitSubmitTime;
+        private bool     enteredThisBar;           // single-shot guard per bar
+        // Originals snapshotted at DataLoaded so each new arm RESETS to user-configured values
+        // (not the previous trade's nudged values).
+        private int      origSlPoints, origTpPoints, origJumpSlPercent;
+        private bool     originalsSnapshotted;
+        private readonly List<string> activeEntrySignals = new List<string>();
+        #endregion
+
+        // ===========================================================
+        //  STATE — pending button flags (volatile = thread-safe)
+        // ===========================================================
+        #region Pending flags
+        private volatile bool pendingLong, pendingShort;
+        private volatile bool pendingBuyAsk, pendingSellBid;
+        private volatile bool pendingLongLimit, pendingShortLimit;
+        private volatile bool pendingFlatten, pendingCloseTrade, pendingCloseOne;
+        private volatile bool pendingJumpSL, pendingRearm, pendingSlTpResize, pendingEmergencyKill;
+        private volatile bool pendingTrailActivate;
+        private volatile int  pendingTrailNudgePoints;          // signed: + = looser (away from price), − = tighter
+        private double        trailNudgeStepPoints = 1.0;       // 1 NQ point = 4 ticks = $20
+        private double        aggressiveTrailMaxAtrFactor = 0.5; // TRL NOW initial distance = max(2pt, factor×ATR)
+        private double        beSafeAtrFactor             = 0.35; // Smart BE: SL must stay >= max(beSafeMinTicks, factor×ATR) below price
+        private int           beSafeMinTicks              = 6;    // Hard floor in ticks (1.5pt on NQ) so MM stop-hunts can't tag us
+        private volatile bool pendingPositionFlat;
+        private volatile bool pendingExit;
+        private int  pendingExitTicks;
+        private int  flatSyncGraceTicks;
+        #endregion
+
+        // ===========================================================
+        //  STATE — adaptive trail
+        // ===========================================================
+        #region Trail state
+        private bool   trailActive;
+        private bool   manualTrailMode;        // legacy flag (kept for backward refs); no longer pauses ratchet
+        private bool   manualTrailEarlyStart;  // TRL NOW set this -> activation profit threshold bypassed
+        private double manualTrailOffsetPoints; // signed offset added to auto trail distance (− = tighter, + = looser)
+        private double trailPrice;
+        private double trailMaxProfitPts;
+        private double trailTrendScore;
+        private string trailTierName = "";
+        private double cachedTrailDistance;
+        private int    cachedTrailBar = -1;
+        private DateTime lastTrailDiagTime = DateTime.MinValue;
+        private int    backtrackUsedBar = -1;       // bar# when MM-avoidance backtrack last applied
+        #endregion
+
+        // ===========================================================
+        //  STATE — trap detector
+        // ===========================================================
+        #region Trap state
+        private double trapScore;
+        private bool   trapDetected;
+        private int    trapBarsInTrade;
+        private int    trapEscapeBars;
+        private int    trapEscapeCooldownBar;
+        private int    stopHuntSuspendBars;        // when >0, MM stop-hunt just fired → trail paused / backtrack window open
+        #endregion
+
+        // ===========================================================
+        //  STATE — signals / confidence
+        // ===========================================================
+        #region Signal state
+        private double lastBullConfidence;
+        private double lastBearConfidence;
+        private double rawBullConfidence;
+        private double rawBearConfidence;
+        private int    htfBias;            // +1 bull, -1 bear, 0 mixed
+        private int    sessionOpenBias;
+        private int    htfBiasConsecBull;
+        private int    htfBiasConsecBear;
+        private int    sessionConfirmedBias;
+        private int    bestAutoStrategy;
+        private string lastAutoStrategyUsed = "";
+        private int    consecutiveLosses;
+        private int    lastLossDirection;
+        private int    lastLossBarNumber;
+        private int    lastTradeExitBar;
+        private double[] strategyScores = new double[2];
+        private int    prevDominantDir;
+        private bool   confidenceFlip;
+        private int    emaCrossBarsAgo;
+        private int    emaCrossDir;
+        private int    openType;           // 1=Open-Drive bull, -1=Open-Drive bear, 0=other
+        private bool   openTypeSet;
+        private int    voidBarsRemaining;  // liquidity-void cooldown
+        // Trade signal explicit indicator for manual trading
+        private int    manualSignalLevel;  // -2 strong sell, -1 sell, 0 wait, 1 buy, 2 strong buy
+        private string manualSignalReason = "";
+        #endregion
+
+        // ===========================================================
+        //  STATE — VWAP / volume profile
+        // ===========================================================
+        #region VWAP / VP state
+        private double vwapCumTPV, vwapCumVol, vwapValue, prevBarVwap;
+        private double currBarTPV, currBarVol;
+        private SortedDictionary<double, double> volumeAtPrice;
+        private double pocLevel, vahLevel, valLevel;
+        private double cachedAvgVolume;
+        private int    cachedAvgVolumeBar = -1;
+        #endregion
+
+        // ===========================================================
+        //  STATE — order-flow tape (live only; OnMarketData)
+        // ===========================================================
+        #region Order-flow state
+        private double tapeBidVol, tapeAskVol;     // rolling 30s window
+        private DateTime tapeWindowStart;
+        private double cachedTapeDelta;            // -1..+1 (bid-side bias .. ask-side bias)
+        #endregion
+
+        // ===========================================================
+        //  STATE — dashboard / WPF
+        // ===========================================================
+        #region Dashboard state
+        private bool      dashboardAttached;
+        private int       dashBuildRetryCount;
+        private int       dashBuildTickCounter;
+        private DateTime  lastDashboardTime = DateTime.MinValue;
+        private Grid      dashboardPanel;
+        private Panel     dashboardHostPanel;
+        private TranslateTransform dashTranslate;
+        private bool      dashDragging;
+        private Point     dashDragStart;
+        private Border    dashTitleBar;
+        // resize state
+        private Border    dashOuterBorder;
+        private ScrollViewer dashScroller;
+        private bool      dashResizing;
+        private Point     dashResizeStart;
+        private double    dashResizeStartW, dashResizeStartH;
+        private double    dashWidth  = 340;   // user-resizable, persists in field
+        private double    dashHeight = 720;
+        // labels
+        private TextBlock lblSignal;          // BIG trade-signal indicator
+        private TextBlock lblSignalReason;
+        private TextBlock lblStatus;
+        private TextBlock lblPnL;
+        private TextBlock lblUnrealized;
+        private TextBlock lblAccountPnL;
+        private TextBlock lblAccountBal;
+        private TextBlock lblPosition;
+        private TextBlock lblHiddenSL;
+        private TextBlock lblHiddenTP;
+        private TextBlock lblTrailInfo;
+        private TextBlock lblTrapInfo;
+        private TextBlock lblConfBull;
+        private TextBlock lblConfBear;
+        private TextBlock lblVwapVal;
+        private TextBlock lblTradeHours;
+        private TextBlock lblQtyVal;
+        private TextBlock lblSlVal;
+        private TextBlock lblTpVal;
+        private TextBlock lblJumpPct;
+        private TextBlock lblTrailDistVal;        // shows current trail distance in pt | tk
+        private TextBlock lblStratName;
+        private TextBlock lblActiveStrategy;
+        private TextBlock lblTapeDelta;
+        // buttons
+        private Button btnBuyMkt, btnSellMkt;
+        private Button btnBuyAsk, btnSellBid;
+        private Button btnBuyLmt, btnSellLmt;
+        private Button btnCloseTrade, btnCloseOne;
+        private Button btnJumpSL, btnFlatten, btnKill;
+        private Button btnTrailNow;
+        private Button btnModeManual, btnModeAuto;
+        private Button btnHoursToggle;
+        private Button btnTrailToggle, btnTrapToggle;
+        private Button btnBeToggle;
+        private Button btnStratPrev, btnStratNext;
+        #endregion
+
+        // ===========================================================
+        //  STATE — diagnostics
+        // ===========================================================
+        #region Diagnostics state
+        private System.IO.StreamWriter diagWriter;
+        private bool diagHeaderWritten;
+        private DateTime diagLogDate;
+        #endregion
+
+        // ===========================================================
+        //  ON STATE CHANGE
+        // ===========================================================
+        #region OnStateChange
+        protected override void OnStateChange()
+        {
+            try
+            {
+                if (State == State.SetDefaults)
+                {
+                    Description  = "Mm-ATM v5 — unified exits, 12 filters, MM-avoidance trail, optional order-flow tape, manual trade-signal indicator.";
+                    Name         = "Mm_ATM_v5";
+                    Calculate    = Calculate.OnEachTick;
+                    EntriesPerDirection = 40;
+                    EntryHandling = EntryHandling.AllEntries;
+                    IsExitOnSessionCloseStrategy = false;
+                    ExitOnSessionCloseSeconds    = 30;
+                    ConnectionLossHandling = ConnectionLossHandling.KeepRunning;
+                    DisconnectDelaySeconds = 10;
+                    IsUnmanaged = false;
+                    BarsRequiredToTrade = 25;
+
+                    // Risk
+                    slPoints              = 18;
+                    tpPoints              = 50;
+                    maxDailyLossDollars   = 1000;
+                    maxDailyProfitDollars = 1000;
+                    maxTradesPerDay       = 4;
+                    contracts             = 1;
+                    maxContracts          = 4;
+
+                    // Mode
+                    autoMode              = false;
+                    autoStrategy          = 2;       // Auto-Select
+                    minSignalConfidence   = 55.0;
+                    entryDelaySeconds     = 1;
+
+                    // Indicators
+                    emaPeriodFast         = 9;
+                    emaPeriodSlow         = 21;
+                    rsiPeriod             = 14;
+                    atrPeriod             = 14;
+                    htfEmaPeriod          = 45;
+
+                    // Trail
+                    trailEnabled          = true;
+                    trailActivationPoints = 5;
+                    trailAtrMultiplier    = 1.5;
+                    smartTrailBacktrackTicks = 4;
+                    aggressiveTrailMaxAtrFactor = 0.5;
+
+                    // SmartSL / JumpSL
+                    breakevenAtPoints     = 8;
+                    beSafeAtrFactor       = 0.35;
+                    beSafeMinTicks        = 6;
+                    breakevenEnabled      = true;
+                    allowMultiEntryPerBar = true;     // default ALLOW
+                    jumpSlPercent         = 50;
+                    slTpAdjustStep        = 5;
+
+                    // Hours
+                    tradingStartTime      = 93000;
+                    flattenTime           = 160000;
+                    tradingHoursEnabled   = true;
+
+                    // Smart logic
+                    orderFlowFilterEnabled = true;
+                    enableTrapDetector     = true;
+
+                    // Display
+                    showVwap = true;
+                    showEma  = true;
+                    enableDiagLog = false;
+                }
+                else if (State == State.Configure)
+                {
+                    indEmaFast = EMA(emaPeriodFast);
+                    indEmaSlow = EMA(emaPeriodSlow);
+                    indEmaHtf  = EMA(htfEmaPeriod);
+                    indRsi     = RSI(rsiPeriod, 3);
+                    indAtr     = ATR(atrPeriod);
+
+                    AddDataSeries(BarsPeriodType.Minute, 5);
+                    indEma5mFast = EMA(BarsArray[1], 9);
+                    indEma5mSlow = EMA(BarsArray[1], 21);
+
+                    if (showEma)
+                    {
+                        indEmaFast.Plots[0].Brush = Brushes.LimeGreen; indEmaFast.Plots[0].Width = 2;
+                        indEmaSlow.Plots[0].Brush = Brushes.Red;       indEmaSlow.Plots[0].Width = 2;
+                        AddChartIndicator(indEmaFast);
+                        AddChartIndicator(indEmaSlow);
+                    }
+                }
+                else if (State == State.DataLoaded)
+                {
+                    ResetVwap();
+                    volumeAtPrice = new SortedDictionary<double, double>();
+                    ResetSessionFlags();
+                    ResetPositionStateInternal(true);
+                    // Snapshot user's property-panel values so each new arm restores them
+                    if (!originalsSnapshotted)
+                    {
+                        origSlPoints      = slPoints;
+                        origTpPoints      = tpPoints;
+                        origJumpSlPercent = jumpSlPercent;
+                        originalsSnapshotted = true;
+                    }
+                }
+                else if (State == State.Realtime)
+                {
+                    ResetSessionFlags();
+                    ResetPositionStateInternal(true);
+                    if (Position.MarketPosition != MarketPosition.Flat)
+                    {
+                        openTradeDirection = Position.MarketPosition == MarketPosition.Long ? 1 : -1;
+                        totalContracts     = Position.Quantity;
+                        averageEntryPrice  = Position.AveragePrice;
+                        openDcaCount       = (int)Math.Max(1, totalContracts / Math.Max(1, contracts));
+                        for (int i = 1; i <= openDcaCount; i++) activeEntrySignals.Add(" ");
+                        ArmHiddenStops();
+                        Print(TAG + "Realtime POSITION RECOVERY " + Position.MarketPosition + " qty=" + totalContracts);
+                    }
+                    CancelPendingOrders();
+
+                    rthStartedToday = false;
+                    int warmStart = ToTime(Time[0]);
+                    if (warmStart >= tradingStartTime && warmStart < flattenTime)
+                        rthStartedToday = true;
+                    Print(TAG + "Realtime ready. SL=" + slPoints + " TP=" + tpPoints + " contracts=" + contracts);
+                }
+                else if (State == State.Terminated)
+                {
+                    RemoveDashboard();
+                    CloseDiagLog();
+                }
+            }
+            catch (Exception ex)
+            {
+                Print(TAG + "OnStateChange EX " + State + ": " + ex.Message + " | " + ex.StackTrace);
+            }
+        }
+
+        private void ResetSessionFlags()
+        {
+            dailyTradeCount = 0;
+            dailyRealizedPnL = 0;
+            processedTradeCount = 0;
+            dailyLimitHit = false;
+            dailyProfitHit = false;
+            flattenFired = false;
+            emergencyKillActive = false;
+            consecutiveLosses = 0;
+            lastLossDirection = 0;
+            lastLossBarNumber = 0;
+            lastTradeExitBar = 0;
+            trapEscapeCooldownBar = 0;
+            voidBarsRemaining = 0;
+            firstBarSeen = false;
+            openType = 0;
+            openTypeSet = false;
+            htfBiasConsecBull = htfBiasConsecBear = 0;
+            sessionConfirmedBias = 0;
+            tapeBidVol = tapeAskVol = 0;
+            cachedTapeDelta = 0;
+            tapeWindowStart = DateTime.MinValue;
+        }
+        #endregion
+
+        // ===========================================================
+        //  ON BAR UPDATE  (main pump)
+        // ===========================================================
+        #region OnBarUpdate
+        protected override void OnBarUpdate()
+        {
+            if (BarsInProgress != 0) return;
+            if (CurrentBar < BarsRequiredToTrade) return;
+
+            try
+            {
+                if (!firstBarSeen)
+                {
+                    firstBarSeen = true;
+                    sessionDate  = Time[0].Date;
+                    Print(TAG + "OnBarUpdate ALIVE first bar @ " + Time[0]);
+                }
+                if (IsFirstTickOfBar) enteredThisBar = false;
+
+                // -------- DiagLog daily file --------
+                if (enableDiagLog && IsFirstTickOfBar)
+                {
+                    if (diagWriter == null) { diagLogDate = Time[0].Date; OpenDiagLog(); }
+                    else if (Time[0].Date > diagLogDate) { CloseDiagLog(); diagLogDate = Time[0].Date; OpenDiagLog(); }
+                }
+
+                // -------- CRITICAL pending button paths --------
+                ProcessPendingButtons();
+
+                // -------- Position state sync --------
+                SyncPositionState();
+
+                // -------- Pending exit watchdog --------
+                if (pendingExit)
+                {
+                    pendingExitTicks++;
+                    if (pendingExitTicks >= STALE_EXIT_TICKS && Position.MarketPosition != MarketPosition.Flat)
+                    {
+                        Print(TAG + "STALE EXIT — force flatten");
+                        if (State == State.Realtime)
+                            try { Account.Flatten(new[] { Instrument }); } catch { ManagedExitAll(); }
+                        else
+                            ManagedExitAll();
+                        pendingExitTicks = STALE_EXIT_TICKS / 2;
+                    }
+                }
+                else pendingExitTicks = 0;
+
+                // -------- Aggressive limit timeout --------
+                if (aggressiveLimitSubmitTime != DateTime.MinValue
+                    && ((State == State.Realtime ? DateTime.Now : Time[0]) - aggressiveLimitSubmitTime).TotalSeconds >= AGGRESSIVE_LIMIT_TIMEOUT_SEC
+                    && Position.MarketPosition == MarketPosition.Flat && openTradeDirection != 0)
+                {
+                    Print(TAG + "ASK/BID order expired — cancel");
+                    CancelPendingOrders();
+                    ResetPositionStateInternal(false);
+                    aggressiveLimitSubmitTime = DateTime.MinValue;
+                    UpdateDashboardStatus("ASK/BID order expired", Brushes.Orange);
+                }
+
+                // -------- Live exit monitors (every tick when in trade) --------
+                if (Position.MarketPosition != MarketPosition.Flat && stopsArmed && !pendingExit)
+                {
+                    MonitorHiddenStops();
+                    if (trailEnabled) MonitorAdaptiveTrail();
+                    if (IsFirstTickOfBar && enableTrapDetector) MonitorTrapDetector();
+                    LiveDailyPnLCheck();
+                }
+
+                // -------- Session housekeeping --------
+                if (Time[0].Date != sessionDate)
+                {
+                    ResetDailyTracking();
+                    ResetVwap();
+                }
+                UpdateVwap();
+                if (IsFirstTickOfBar)
+                {
+                    if (High[0] > currDayHigh) currDayHigh = High[0];
+                    if (Low[0]  < currDayLow || currDayLow == 0) currDayLow = Low[0];
+                    UpdateHtfBias();
+                    TrackEmaCross();
+                    UpdateOpenTypeClassification();
+                    UpdateLiquidityVoid();
+                    UpdateVolumeProfile();
+                    if (CurrentBar % 20 == 0) RecalcVolumeProfileLevels();
+                }
+
+                // -------- Build dashboard --------
+                if (ChartControl != null && !dashboardAttached && dashBuildRetryCount < 10)
+                {
+                    if (dashBuildRetryCount == 0) BuildDashboard();
+                    else
+                    {
+                        dashBuildTickCounter++;
+                        if (dashBuildTickCounter >= 5) { dashBuildTickCounter = 0; BuildDashboard(); }
+                    }
+                }
+
+                // -------- Auto flatten / CME maintenance --------
+                AutoFlattenCheck();
+
+                // -------- Signal calc + auto-entry (once per bar when flat) --------
+                if (IsFirstTickOfBar && Position.MarketPosition == MarketPosition.Flat)
+                {
+                    CalculateSignals();
+                    UpdateManualSignal();      // explicit manual indicator
+                    if (autoMode) TryAutoEntry();
+                }
+
+                // -------- Chart annotations --------
+                DrawChartAnnotations();
+                if (IsFirstTickOfBar) DrawSessionLevels();
+
+                // -------- Dashboard update (throttled) --------
+                if (dashboardAttached)
+                {
+                    if (State == State.Realtime)
+                    {
+                        if ((DateTime.Now - lastDashboardTime).TotalMilliseconds >= DASH_UPDATE_MS)
+                        { lastDashboardTime = DateTime.Now; UpdateDashboard(); }
+                    }
+                    else if (IsFirstTickOfBar) UpdateDashboard();
+                }
+            }
+            catch (Exception ex)
+            {
+                Print(TAG + "OnBarUpdate EX: " + ex.Message + " | " + ex.StackTrace);
+            }
+        }
+
+        private void ProcessPendingButtons()
+        {
+            if (State != State.Realtime && State != State.Historical) return;
+            if (pendingEmergencyKill) { pendingEmergencyKill = false; ExecuteEmergencyKill(); return; }
+            if (pendingCloseTrade)    { pendingCloseTrade    = false; ExecuteCloseTrade();    return; }
+            if (pendingFlatten)       { pendingFlatten       = false; ExecuteFlatten();       return; }
+            if (pendingExit) return;
+            if (pendingLong)       { pendingLong       = false; ExecuteLongEntry(true); }
+            if (pendingShort)      { pendingShort      = false; ExecuteShortEntry(true); }
+            if (pendingBuyAsk)     { pendingBuyAsk     = false; ExecuteBuyAskEntry(); }
+            if (pendingSellBid)    { pendingSellBid    = false; ExecuteSellBidEntry(); }
+            if (pendingLongLimit)  { pendingLongLimit  = false; ExecuteLongLimitEntry(); }
+            if (pendingShortLimit) { pendingShortLimit = false; ExecuteShortLimitEntry(); }
+            if (pendingCloseOne)   { pendingCloseOne   = false; ExecuteCloseOne(); }
+            if (pendingJumpSL)     { pendingJumpSL     = false; ExecuteJumpSL(); }
+            if (pendingRearm)      { pendingRearm      = false; if (stopsArmed) ArmHiddenStops(); }
+            if (pendingSlTpResize) { pendingSlTpResize = false; if (stopsArmed) ResizeHiddenStops(); }
+            if (pendingTrailActivate) { pendingTrailActivate = false; ActivateTrailManual(); }
+            if (pendingTrailNudgePoints != 0) { int n = pendingTrailNudgePoints; pendingTrailNudgePoints = 0; NudgeTrailDistancePoints(n); }
+        }
+
+        private void SyncPositionState()
+        {
+            if (pendingPositionFlat)
+            {
+                pendingPositionFlat = false;
+                if (Position.MarketPosition == MarketPosition.Flat)
+                {
+                    ResetPositionStateInternal(false);
+                    flatSyncGraceTicks = 0;
+                    return;
+                }
+            }
+            if (Position.MarketPosition == MarketPosition.Flat)
+            {
+                if (pendingExit) { ResetPositionStateInternal(false); flatSyncGraceTicks = 0; }
+                else if (openTradeDirection != 0)
+                {
+                    flatSyncGraceTicks++;
+                    if (flatSyncGraceTicks > FLAT_SYNC_MAX_TICKS)
+                    { ResetPositionStateInternal(false); flatSyncGraceTicks = 0; }
+                }
+                else flatSyncGraceTicks = 0;
+            }
+            else
+            {
+                flatSyncGraceTicks = 0;
+                int posDir = Position.MarketPosition == MarketPosition.Long ? 1 : -1;
+                bool desync = false;
+                if (openTradeDirection != posDir) { openTradeDirection = posDir; desync = true; }
+                if (averageEntryPrice == 0 && Position.AveragePrice > 0) { averageEntryPrice = Position.AveragePrice; desync = true; }
+                if (totalContracts < Position.Quantity) { totalContracts = Position.Quantity; desync = true; }
+                if (openDcaCount == 0 && totalContracts > 0) { openDcaCount = (int)Math.Max(1, totalContracts / Math.Max(1, contracts)); desync = true; }
+                if (activeEntrySignals.Count == 0 && openDcaCount > 0)
+                    for (int i = 1; i <= openDcaCount; i++) activeEntrySignals.Add(" ");
+                if (!stopsArmed && averageEntryPrice > 0 && !pendingExit) { ArmHiddenStops(); desync = true; }
+                if (desync) Print(TAG + "SYNC " + Position.MarketPosition + " qty=" + totalContracts + " avg=" + averageEntryPrice.ToString("F2"));
+            }
+        }
+
+        private void AutoFlattenCheck()
+        {
+            int currentTime = ToTime(Time[0]);
+            if (!rthStartedToday && currentTime >= tradingStartTime && currentTime < flattenTime)
+                rthStartedToday = true;
+            if (rthStartedToday && currentTime >= flattenTime && !flattenFired
+                && Position.MarketPosition != MarketPosition.Flat)
+            {
+                flattenFired = true;
+                Print(TAG + "AUTO-FLATTEN @ " + Time[0].ToString("HH:mm:ss"));
+                ExecuteFlatten();
+            }
+            if (rthStartedToday && currentTime >= 165500 && currentTime < 180000
+                && Position.MarketPosition != MarketPosition.Flat)
+            {
+                Print(TAG + "CME maintenance flatten");
+                ExecuteFlatten();
+            }
+        }
+
+        private void LiveDailyPnLCheck()
+        {
+            if (dailyLimitHit || dailyProfitHit) return;
+            double unreal = 0;
+            if (Position.MarketPosition == MarketPosition.Long)
+                unreal = (Close[0] - averageEntryPrice) * NQ_DOLLARS_PER_POINT * Math.Max(totalContracts, Position.Quantity);
+            else if (Position.MarketPosition == MarketPosition.Short)
+                unreal = (averageEntryPrice - Close[0]) * NQ_DOLLARS_PER_POINT * Math.Max(totalContracts, Position.Quantity);
+            double live = dailyRealizedPnL + unreal;
+            if (live <= -maxDailyLossDollars)
+            {
+                dailyLimitHit = true;
+                Print(TAG + "LIVE LOSS LIMIT " + live.ToString("C0"));
+                ExecuteFlatten();
+                UpdateDashboardStatus("DAILY LOSS LIMIT (" + live.ToString("C0") + ")", Brushes.OrangeRed);
+            }
+            else if (live >= maxDailyProfitDollars)
+            {
+                dailyProfitHit = true;
+                Print(TAG + "LIVE PROFIT TARGET " + live.ToString("C0"));
+                ExecuteFlatten();
+                UpdateDashboardStatus("PROFIT TARGET (" + live.ToString("C0") + ")", Brushes.Gold);
+            }
+        }
+        #endregion
+
+        // ===========================================================
+        //  HIDDEN SL/TP — fail-safe layer
+        // ===========================================================
+        #region Hidden SL/TP
+        private void MonitorHiddenStops()
+        {
+            if (dailyLimitHit || emergencyKillActive) return;
+            if (averageEntryPrice <= 0) return;
+
+            double priceLong  = Close[0];
+            double priceShort = Close[0];
+            if (State == State.Realtime)
+            {
+                double bid = GetCurrentBid(0); if (bid > 0) priceLong  = bid;
+                double ask = GetCurrentAsk(0); if (ask > 0) priceShort = ask;
+            }
+
+            // SMART BE — dynamic trigger and ratcheting micro-BE
+            //  Trigger = max(BreakevenAtPoints, 0.5×ATR, 0.4×TP)  — prevents firing too early on volatile NQ
+            //  Lock 1: at trigger → SL = entry + 2 ticks (locks $10 + commission cushion)
+            //  Lock 2+: every additional 5 pts of profit → SL ratchets +2 ticks above entry
+            //  Capped at TP-2pt to never get stopped out at TP-mark
+            if (breakevenEnabled && !runnerModeActive)
+            {
+                double profitPx2 = openTradeDirection == 1 ? priceLong : priceShort;
+                double tickPt2 = TickSize * NQ_TICKS_PER_POINT;
+                double profitPts2 = openTradeDirection == 1
+                    ? (profitPx2 - averageEntryPrice) / tickPt2
+                    : (averageEntryPrice - profitPx2) / tickPt2;
+                double atrPts2 = indAtr[0] / tickPt2;
+                double smartTrigger = Math.Max(breakevenAtPoints, Math.Max(atrPts2 * 0.5, tpPoints * 0.4));
+                if (profitPts2 >= smartTrigger)
+                {
+                    // Compute target BE-stop: entry + (2tk + extra ratchet from profit beyond trigger)
+                    int extraTicks = 2 + (int)Math.Floor(Math.Max(0, profitPts2 - smartTrigger) / 5.0) * 2;
+                    double beOffset = extraTicks * TickSize;
+                    double targetBe = openTradeDirection == 1
+                        ? averageEntryPrice + beOffset
+                        : averageEntryPrice - beOffset;
+                    // Cap at TP - 2pt so we don't camp at TP
+                    double tpCap = openTradeDirection == 1
+                        ? hiddenTargetPrice - 2 * tickPt2
+                        : hiddenTargetPrice + 2 * tickPt2;
+                    if (openTradeDirection == 1 && targetBe > tpCap) targetBe = tpCap;
+                    if (openTradeDirection == -1 && targetBe < tpCap) targetBe = tpCap;
+                    targetBe = Math.Round(targetBe / TickSize) * TickSize;
+                    // ANTI-STOP-HUNT SAFETY: never let SL sit too close to current price.
+                    //  MM algos love to wick 4-8 ticks past obvious BE/round-number levels then reverse.
+                    //  Force a buffer = max(BeSafeMinTicks, BeSafeAtrFactor×ATR_ticks) below price.
+                    double safeBufTicks = Math.Max(beSafeMinTicks, atrPts2 * NQ_TICKS_PER_POINT * beSafeAtrFactor);
+                    double safeBufPx = safeBufTicks * TickSize;
+                    if (openTradeDirection == 1)
+                    {
+                        double maxAllowed = profitPx2 - safeBufPx;
+                        if (targetBe > maxAllowed) targetBe = Math.Round(maxAllowed / TickSize) * TickSize;
+                        // Skip if safety capped the SL below profitable BE \u2014 wait for more room.
+                        if (targetBe < averageEntryPrice + TickSize) goto SkipBe;
+                    }
+                    else
+                    {
+                        double minAllowed = profitPx2 + safeBufPx;
+                        if (targetBe < minAllowed) targetBe = Math.Round(minAllowed / TickSize) * TickSize;
+                        if (targetBe > averageEntryPrice - TickSize) goto SkipBe;
+                    }
+                    // Ratchet only — never weaken SL
+                    bool moved = false;
+                    if (openTradeDirection == 1 && targetBe > hiddenStopPrice)
+                    { hiddenStopPrice = targetBe; moved = true; }
+                    else if (openTradeDirection == -1 && targetBe < hiddenStopPrice)
+                    { hiddenStopPrice = targetBe; moved = true; }
+                    if (moved)
+                    {
+                        if (!breakevenLocked)
+                        {
+                            breakevenLocked = true;
+                            Print(TAG + "BREAKEVEN LOCK (smart) @ " + hiddenStopPrice.ToString("F2")
+                                + " profit=" + profitPts2.ToString("F1") + "pt trigger=" + smartTrigger.ToString("F1") + "pt");
+                        }
+                        else
+                        {
+                            Print(TAG + "BE RATCHET +" + extraTicks + "tk @ " + hiddenStopPrice.ToString("F2") + " profit=" + profitPts2.ToString("F1") + "pt");
+                        }
+                    }
+                    SkipBe:;
+                }
+            }
+
+            if (openTradeDirection == 1)
+            {
+                if (priceLong <= hiddenStopPrice)
+                {
+                    Print(TAG + "HIDDEN SL LONG @ " + priceLong.ToString("F2"));
+                    ExitLong(" ", " "); stopsArmed = false; pendingExit = true;
+                }
+                else if (priceLong >= hiddenTargetPrice && !runnerModeActive)
+                {
+                    Print(TAG + "HIDDEN TP LONG @ " + priceLong.ToString("F2"));
+                    ExitLong(" ", " "); stopsArmed = false; pendingExit = true;
+                }
+            }
+            else if (openTradeDirection == -1)
+            {
+                if (priceShort >= hiddenStopPrice)
+                {
+                    Print(TAG + "HIDDEN SL SHORT @ " + priceShort.ToString("F2"));
+                    ExitShort(" ", " "); stopsArmed = false; pendingExit = true;
+                }
+                else if (priceShort <= hiddenTargetPrice && !runnerModeActive)
+                {
+                    Print(TAG + "HIDDEN TP SHORT @ " + priceShort.ToString("F2"));
+                    ExitShort(" ", " "); stopsArmed = false; pendingExit = true;
+                }
+            }
+        }
+        #endregion
+
+        // ===========================================================
+        //  ADAPTIVE TRAIL (with MM-avoidance backtrack)
+        // ===========================================================
+        #region Adaptive Trail
+        private void MonitorAdaptiveTrail()
+        {
+            if (!trailEnabled || averageEntryPrice <= 0) return;
+            double price = Close[0];
+            if (State == State.Realtime)
+            {
+                double v = openTradeDirection == 1 ? GetCurrentBid(0) : GetCurrentAsk(0);
+                if (v > 0) price = v;
+            }
+            double tickPt = TickSize * NQ_TICKS_PER_POINT;
+            double profitPts = openTradeDirection == 1
+                ? (price - averageEntryPrice) / tickPt
+                : (averageEntryPrice - price) / tickPt;
+            if (profitPts > trailMaxProfitPts) trailMaxProfitPts = profitPts;
+
+            double atrPts = indAtr[0] / tickPt;
+            double dynamicActivation = Math.Max(trailActivationPoints, atrPts * 0.4);
+            bool htfAgrees = (openTradeDirection == 1 && htfBias > 0) || (openTradeDirection == -1 && htfBias < 0);
+
+            if (!trailActive)
+            {
+                if ((CurrentBar - entryBar) < 2)
+                {
+                    if (enableDiagLog && (DateTime.Now - lastTrailDiagTime).TotalSeconds >= 5)
+                    { lastTrailDiagTime = DateTime.Now; Print(TAG + "TRAIL diag: waiting bar-guard barsSinceEntry=" + (CurrentBar - entryBar)); }
+                    return;
+                }
+                // Profit-activation gate — BYPASSED if user pressed TRL NOW (early-start)
+                if (!manualTrailEarlyStart && profitPts < dynamicActivation)
+                {
+                    if (enableDiagLog && (DateTime.Now - lastTrailDiagTime).TotalSeconds >= 5)
+                    {
+                        lastTrailDiagTime = DateTime.Now;
+                        Print(TAG + "TRAIL diag: waiting profit " + profitPts.ToString("F2") + " / activation " + dynamicActivation.ToString("F2") + "pt (need " + (dynamicActivation - profitPts).ToString("F2") + " more)");
+                    }
+                    return;
+                }
+                trailActive = true;
+                manualTrailMode = false;
+                // Distance choice:
+                //  - Early-start (TRL NOW): aggressive lock = max(2pt, 0.5×ATR) — protect profit fast
+                //  - HTF-agreeing runner:    GetTrailDistance() × 1.8
+                //  - Default:                GetTrailDistance()
+                double dist;
+                if (manualTrailEarlyStart)
+                {
+                    dist = Math.Max(2.0, atrPts * aggressiveTrailMaxAtrFactor);
+                    trailTierName = "Aggr";
+                }
+                else if (htfAgrees)
+                {
+                    dist = Math.Max(GetTrailDistance() * 1.8, atrPts * 0.8);
+                    trailTierName = "Runner";
+                }
+                else
+                {
+                    dist = GetTrailDistance();
+                    trailTierName = "Active";
+                }
+                dist = Math.Max(1.0, dist + manualTrailOffsetPoints);
+                trailPrice = openTradeDirection == 1
+                    ? Math.Round((price - dist * tickPt) / TickSize) * TickSize
+                    : Math.Round((price + dist * tickPt) / TickSize) * TickSize;
+                Print(TAG + "TRAIL ACTIVATED " + (manualTrailEarlyStart ? "(TRL NOW — aggressive) " : "")
+                    + "profit=" + profitPts.ToString("F1") + " dist=" + dist.ToString("F1") + " tier=" + trailTierName);
+                return;
+            }
+
+            // ----- compute candidate new trail price -----
+            // Manual offset applied every pass so user nudges persist through auto-ratchet.
+            double curDist = Math.Max(1.0, GetTrailDistance() + manualTrailOffsetPoints);
+            // Time-based ratchet: every 5 bars in profit, tighten 10%
+            int barsInTrade = CurrentBar - entryBar;
+            if (barsInTrade > 0 && barsInTrade % 5 == 0 && profitPts > dynamicActivation * 1.5)
+                curDist *= 0.90;
+            // Trap tighten
+            if (trapDetected && stopHuntSuspendBars <= 0) curDist *= 0.60;
+            // EMA against → tighter
+            if (openTradeDirection == 1 && indEmaFast[0] < indEmaSlow[0]) curDist *= 0.75;
+            else if (openTradeDirection == -1 && indEmaFast[0] > indEmaSlow[0]) curDist *= 0.75;
+
+            // Profit tier floors
+            double tierFloor = 0;
+            if (trailMaxProfitPts >= dynamicActivation * 4)
+            { tierFloor = (htfAgrees ? 0.50 : 0.45) * trailMaxProfitPts * tickPt; trailTierName = "T3-Runner"; }
+            else if (trailMaxProfitPts >= dynamicActivation * 2.5)
+            { tierFloor = 0.40 * trailMaxProfitPts * tickPt; trailTierName = "T2-Strong"; }
+            else if (!htfAgrees && trailMaxProfitPts >= dynamicActivation * 1.5)
+            { tierFloor = TickSize; trailTierName = "T1-BE"; }
+            else trailTierName = htfAgrees ? "Runner" : "Active";
+
+            double off = curDist * tickPt;
+            double candidateNewTrail = openTradeDirection == 1
+                ? Math.Round((price - off) / TickSize) * TickSize
+                : Math.Round((price + off) / TickSize) * TickSize;
+
+            // Structural snap (last 5 bars structure)
+            if (CurrentBar >= 6)
+            {
+                if (openTradeDirection == 1)
+                {
+                    double lo = double.MaxValue;
+                    for (int i = 1; i <= 5; i++) lo = Math.Min(lo, Low[i]);
+                    double s = lo - TickSize;
+                    if (s > candidateNewTrail && (price - s) / tickPt >= trailActivationPoints * 0.6)
+                        candidateNewTrail = s;
+                }
+                else
+                {
+                    double hi = double.MinValue;
+                    for (int i = 1; i <= 5; i++) hi = Math.Max(hi, High[i]);
+                    double s = hi + TickSize;
+                    if (s < candidateNewTrail && (s - price) / tickPt >= trailActivationPoints * 0.6)
+                        candidateNewTrail = s;
+                }
+            }
+
+            // Floor
+            if (tierFloor > 0)
+            {
+                double fp = openTradeDirection == 1
+                    ? averageEntryPrice + tierFloor
+                    : averageEntryPrice - tierFloor;
+                fp = Math.Round(fp / TickSize) * TickSize;
+                if (openTradeDirection == 1 && candidateNewTrail < fp) candidateNewTrail = fp;
+                else if (openTradeDirection == -1 && candidateNewTrail > fp) candidateNewTrail = fp;
+            }
+
+            // -------- MM-AVOIDANCE BACKTRACK --------
+            // If a stop-hunt was just detected (suspend window open) AND the candidate trail
+            // would put us closer to price than now, instead allow trail to RELAX up to
+            // smartTrailBacktrackTicks behind its current value (away from price).
+            // This sacrifices small ticks intentionally to avoid being swept by an MM spike.
+            if (stopHuntSuspendBars > 0 && smartTrailBacktrackTicks > 0
+                && backtrackUsedBar != CurrentBar)
+            {
+                double backDist = smartTrailBacktrackTicks * TickSize;
+                if (openTradeDirection == 1)
+                {
+                    double relaxed = trailPrice - backDist;
+                    // never below original SL; never above price - minDist
+                    if (relaxed < originalSlPrice) relaxed = originalSlPrice;
+                    if (relaxed < candidateNewTrail)
+                    {
+                        Print(TAG + "TRAIL BACKTRACK long " + trailPrice.ToString("F2") + " -> " + relaxed.ToString("F2") + " (MM avoid)");
+                        candidateNewTrail = relaxed;
+                        backtrackUsedBar  = CurrentBar;
+                    }
+                }
+                else if (openTradeDirection == -1)
+                {
+                    double relaxed = trailPrice + backDist;
+                    if (relaxed > originalSlPrice) relaxed = originalSlPrice;
+                    if (relaxed > candidateNewTrail)
+                    {
+                        Print(TAG + "TRAIL BACKTRACK short " + trailPrice.ToString("F2") + " -> " + relaxed.ToString("F2") + " (MM avoid)");
+                        candidateNewTrail = relaxed;
+                        backtrackUsedBar  = CurrentBar;
+                    }
+                }
+            }
+
+            // Apply (ratchet only — never moves against profit unless backtrack just rewrote it)
+            double prevTrail = trailPrice;
+            if (openTradeDirection == 1)
+            {
+                if (candidateNewTrail > trailPrice || backtrackUsedBar == CurrentBar) trailPrice = candidateNewTrail;
+                if (price <= trailPrice)
+                {
+                    Print(TAG + "TRAIL HIT LONG @ " + price.ToString("F2") + " trail=" + trailPrice.ToString("F2") + " tier=" + trailTierName);
+                    ExitLong(" ", " "); stopsArmed = false; pendingExit = true;
+                }
+            }
+            else if (openTradeDirection == -1)
+            {
+                if (candidateNewTrail < trailPrice || backtrackUsedBar == CurrentBar) trailPrice = candidateNewTrail;
+                if (price >= trailPrice)
+                {
+                    Print(TAG + "TRAIL HIT SHORT @ " + price.ToString("F2") + " trail=" + trailPrice.ToString("F2") + " tier=" + trailTierName);
+                    ExitShort(" ", " "); stopsArmed = false; pendingExit = true;
+                }
+            }
+
+            // Diagnostic: log every move, plus throttled "why no move" pings.
+            if (Math.Abs(trailPrice - prevTrail) > TickSize * 0.5)
+            {
+                Print(TAG + "TRAIL MOVE " + prevTrail.ToString("F2") + " -> " + trailPrice.ToString("F2")
+                    + " (price=" + price.ToString("F2") + " off=" + curDist.ToString("F2") + "pt tier=" + trailTierName + " maxProf=" + trailMaxProfitPts.ToString("F1") + "pt)");
+            }
+            else if (enableDiagLog && (DateTime.Now - lastTrailDiagTime).TotalSeconds >= 5)
+            {
+                lastTrailDiagTime = DateTime.Now;
+                Print(TAG + "TRAIL diag: stable trail=" + trailPrice.ToString("F2")
+                    + " cand=" + candidateNewTrail.ToString("F2") + " price=" + price.ToString("F2")
+                    + " off=" + curDist.ToString("F2") + "pt prof=" + profitPts.ToString("F2") + "pt max=" + trailMaxProfitPts.ToString("F2") + "pt tier=" + trailTierName
+                    + (openTradeDirection == 1 ? " (cand<=trail → hold)" : " (cand>=trail → hold)"));
+            }
+        }
+
+        private double GetTrailDistance()
+        {
+            if (cachedTrailBar == CurrentBar) return cachedTrailDistance;
+            cachedTrailBar = CurrentBar;
+            cachedTrailDistance = CalculateTrailDistance();
+            return cachedTrailDistance;
+        }
+
+        private double CalculateTrailDistance()
+        {
+            trailTrendScore = 0.5;
+            if (CurrentBar < emaPeriodSlow + 5) return Math.Max(3, trailActivationPoints * 0.6);
+            double atr = indAtr[0]; if (atr <= 0) atr = TickSize;
+            double atrSum = 0;
+            int lb = Math.Min(10, CurrentBar);
+            for (int i = 0; i < lb; i++) atrSum += indAtr[i];
+            double atrAvg = atrSum / lb;
+            double atrExp = atrAvg > 0 ? atr / atrAvg : 1;
+            double atrScore = Clamp01((atrExp - 0.9) / 0.5);
+            double emaScore = Clamp01(Math.Abs(indEmaFast[0] - indEmaSlow[0]) / atr / 2.5);
+            int dirBars = 0; int chk = Math.Min(8, CurrentBar - 1);
+            for (int i = 0; i < chk; i++)
+                if (openTradeDirection == 1 && Close[i] > Close[i + 1]) dirBars++;
+                else if (openTradeDirection == -1 && Close[i] < Close[i + 1]) dirBars++;
+            double dirScore = chk > 0 ? (double)dirBars / chk : 0.5;
+            trailTrendScore = Clamp01(atrScore * 0.3 + emaScore * 0.3 + dirScore * 0.4);
+
+            double atrDist = atr * trailAtrMultiplier / (TickSize * NQ_TICKS_PER_POINT);
+            double regimeDist = LerpD(3, 25, trailTrendScore);
+            double dist = regimeDist * 0.6 + atrDist * 0.4;
+            return Math.Max(3, Math.Min(40, dist));
+        }
+        #endregion
+
+        // ===========================================================
+        //  TRAP DETECTOR + STOP-HUNT
+        // ===========================================================
+        #region Trap detector
+        private void MonitorTrapDetector()
+        {
+            if (averageEntryPrice <= 0) return;
+            if (CurrentBar < 5) return;
+            double price = Close[0];
+            double atr = indAtr[0]; if (atr <= 0) return;
+            double tickPt = TickSize * NQ_TICKS_PER_POINT;
+            double adverse = openTradeDirection == 1
+                ? (averageEntryPrice - price) / tickPt
+                : (price - averageEntryPrice) / tickPt;
+
+            double s = 0;
+            double atrPts = Math.Max(atr / tickPt, 10.0);
+            if (adverse > 0)
+            {
+                s += Math.Min(30.0, adverse / atrPts * 30);
+                if (adverse > 6) s += Math.Min(15.0, adverse - 6);
+            }
+            // EMA conflict
+            if (openTradeDirection == 1 && indEmaFast[0] < indEmaSlow[0]) s += 20;
+            else if (openTradeDirection == -1 && indEmaFast[0] > indEmaSlow[0]) s += 20;
+            // High-volume adverse
+            double avgVol = GetCachedAvgVolume();
+            if (avgVol > 0 && Volume[0] > avgVol * 1.5 && adverse > 0) s += 15;
+
+            // Stop-hunt spike detection (sets suspend window)
+            if (stopHuntSuspendBars > 0) stopHuntSuspendBars--;
+            if (CurrentBar >= 6)
+            {
+                bool huntDetected = false;
+                if (openTradeDirection == 1)
+                {
+                    double pl = double.MaxValue; for (int i = 1; i <= 5; i++) pl = Math.Min(pl, Low[i]);
+                    if (Low[0] < pl && Close[0] > Low[1]) huntDetected = true;
+                }
+                else
+                {
+                    double ph = double.MinValue; for (int i = 1; i <= 5; i++) ph = Math.Max(ph, High[i]);
+                    if (High[0] > ph && Close[0] < High[1]) huntDetected = true;
+                }
+                if (huntDetected)
+                {
+                    stopHuntSuspendBars = 4;
+                    Print(TAG + "STOP-HUNT SPIKE — backtrack window 4 bars");
+                    UpdateDashboardStatus("MM stop-hunt — backtrack armed", Brushes.Yellow);
+                }
+            }
+            // Decay if stop-hunt is suspending
+            if (stopHuntSuspendBars > 0) s *= 0.5;
+
+            // Smooth blend
+            if (trapScore > 0 && s < trapScore) trapScore = trapScore * 0.85 + s * 0.15;
+            else trapScore = s;
+
+            trapBarsInTrade++;
+            trapDetected = trapScore >= 50;
+
+            // Trap escape
+            if (trapScore >= 65 && adverse > 10)
+            {
+                Print(TAG + "TRAP ESCAPE IMMEDIATE score=" + trapScore.ToString("F0") + " adv=" + adverse.ToString("F1"));
+                trapEscapeCooldownBar = CurrentBar;
+                if (openTradeDirection == 1) ExitLong(" ", " ");
+                else ExitShort(" ", " ");
+                stopsArmed = false; pendingExit = true;
+                return;
+            }
+            if (trapScore >= 50 && adverse > 5)
+            {
+                trapEscapeBars++;
+                if (trapEscapeBars >= 2)
+                {
+                    Print(TAG + "TRAP ESCAPE GRAD bars=" + trapEscapeBars + " adv=" + adverse.ToString("F1"));
+                    trapEscapeCooldownBar = CurrentBar;
+                    if (openTradeDirection == 1) ExitLong(" ", " ");
+                    else ExitShort(" ", " ");
+                    stopsArmed = false; pendingExit = true;
+                }
+            }
+            else trapEscapeBars = 0;
+        }
+        #endregion
+
+        // ===========================================================
+        //  ENTRY / EXIT EXECUTION
+        // ===========================================================
+        #region Entries & exits
+        private bool CanEnterTrade(string label, bool isManual, int direction)
+        {
+            if (pendingExit) { UpdateDashboardStatus(label + " blocked: exit pending", Brushes.Orange); return false; }
+            if (dailyLimitHit || dailyProfitHit) { UpdateDashboardStatus(label + " blocked: daily limit", Brushes.OrangeRed); return false; }
+            if (emergencyKillActive) { UpdateDashboardStatus(label + " blocked: KILL", Brushes.OrangeRed); return false; }
+            if (enteredThisBar && !allowMultiEntryPerBar) { UpdateDashboardStatus(label + " blocked: already entered this bar", Brushes.Orange); return false; }
+            if (maxTradesPerDay > 0 && !isManual && dailyTradeCount >= maxTradesPerDay
+                && Position.MarketPosition == MarketPosition.Flat)
+            { UpdateDashboardStatus(label + " blocked: max trades/day", Brushes.Orange); return false; }
+            int ct = ToTime(Time[0]);
+            if (ct >= 165500 && ct < 180000) { UpdateDashboardStatus(label + " blocked: CME maint", Brushes.OrangeRed); return false; }
+            if (!isManual && tradingHoursEnabled && (ct < tradingStartTime || ct >= flattenTime))
+            { UpdateDashboardStatus(label + " blocked: outside auto hours", Brushes.Orange); return false; }
+            if (direction == 1 && Position.MarketPosition == MarketPosition.Short) { ExecutePartialClose(contracts); return false; }
+            if (direction == -1 && Position.MarketPosition == MarketPosition.Long) { ExecutePartialClose(contracts); return false; }
+            if (Position.MarketPosition != MarketPosition.Flat)
+            {
+                bool sameDir = (direction == 1 && Position.MarketPosition == MarketPosition.Long)
+                            || (direction == -1 && Position.MarketPosition == MarketPosition.Short);
+                if (sameDir && Position.Quantity >= maxContracts)
+                { UpdateDashboardStatus("Max contracts (" + maxContracts + ")", Brushes.Orange); return false; }
+            }
+            if (entryDelaySeconds > 0
+                && ((State == State.Realtime ? DateTime.Now : Time[0]) - lastEntryWallTime).TotalSeconds < entryDelaySeconds)
+            { UpdateDashboardStatus(label + " blocked: cooldown", Brushes.Orange); return false; }
+            return true;
+        }
+
+        private void TryAutoEntry()
+        {
+            int ct = ToTime(Time[0]);
+            bool insideHours = !tradingHoursEnabled || (ct >= tradingStartTime && ct < flattenTime);
+            if (!insideHours || dailyLimitHit || dailyProfitHit || emergencyKillActive) return;
+            if (maxTradesPerDay > 0 && dailyTradeCount >= maxTradesPerDay) return;
+
+            // Bar-based cooldowns
+            bool postLossCD = consecutiveLosses >= 1 && lastLossBarNumber > 0
+                              && (CurrentBar - lastLossBarNumber) < 8;
+            bool tooSoon    = lastTradeExitBar > 0 && (CurrentBar - lastTradeExitBar) < 4;
+            bool trapCD     = trapEscapeCooldownBar > 0 && (CurrentBar - trapEscapeCooldownBar) < 8;
+            bool voidCD     = voidBarsRemaining > 0;
+            if (postLossCD || tooSoon || trapCD || voidCD) return;
+
+            // RSI direction + slope
+            double rsiSlope = (CurrentBar > 2 && indRsi != null) ? indRsi[0] - indRsi[2] : 0;
+            bool rsiUp = rsiSlope > 0.5, rsiDown = rsiSlope < -0.5;
+
+            // Midday penalty: require +5 conf
+            int hour = ct / 10000;
+            bool isMidday = hour >= 11 && hour < 14;
+            double effMin = isMidday ? Math.Max(minSignalConfidence, minSignalConfidence + 5) : minSignalConfidence;
+
+            // Volatility spike block
+            double atrNow = indAtr[0];
+            bool volSpike = atrNow > 0 && (High[0] - Low[0]) > 2.0 * atrNow;
+
+            // Overextension
+            double distFromEma = Math.Abs(Close[0] - indEmaFast[0]);
+            double overextL = sessionConfirmedBias > 0 ? 3.0 : 1.5;
+            double overextS = sessionConfirmedBias < 0 ? 3.0 : 1.5;
+            bool overLong  = atrNow > 0 && distFromEma > overextL * atrNow;
+            bool overShort = atrNow > 0 && distFromEma > overextS * atrNow;
+
+            // Near prevDay levels (block only on approach side)
+            bool nearH = prevDayHigh > 0 && Close[0] <= prevDayHigh + atrNow * 0.1 && Close[0] > prevDayHigh - atrNow * 0.5;
+            bool nearL = prevDayLow  > 0 && Close[0] >= prevDayLow                 && Close[0] < prevDayLow  + atrNow * 0.5;
+
+            // HTF block
+            bool htfBlockL = htfBias < 0 || sessionConfirmedBias < 0;
+            bool htfBlockS = htfBias > 0 || sessionConfirmedBias > 0;
+
+            // Order-flow tape block (only realtime; data-driven)
+            double tape = orderFlowFilterEnabled ? cachedTapeDelta : 0;
+            bool tapeBlockL = orderFlowFilterEnabled && tape < -0.3;
+            bool tapeBlockS = orderFlowFilterEnabled && tape >  0.3;
+
+            if (lastBullConfidence >= effMin && !rsiDown && !overLong && !nearH && !volSpike
+                && !htfBlockL && !tapeBlockL)
+            {
+                ExecuteLongEntry(false);
+            }
+            else if (lastBearConfidence >= effMin && !rsiUp && !overShort && !nearL && !volSpike
+                && !htfBlockS && !tapeBlockS)
+            {
+                ExecuteShortEntry(false);
+            }
+        }
+
+        private void ExecuteLongEntry(bool isManual)
+        {
+            if (!CanEnterTrade("BUY MKT", isManual, 1)) return;
+            if (Position.MarketPosition == MarketPosition.Flat) { tradeSequence++; dailyTradeCount++; }
+            openDcaCount++;
+            lastAutoStrategyUsed = StrategyDisplay(autoStrategy == 2 ? bestAutoStrategy : autoStrategy);
+            EnterLong(contracts, " ");
+            activeEntrySignals.Add(" ");
+            openTradeDirection = 1;
+            lastEntryWallTime  = State == State.Realtime ? DateTime.Now : Time[0];
+            enteredThisBar = true;
+            // qty + avg recomputed in OnOrderUpdate.Filled (do NOT pre-increment)
+            Print(TAG + "ENTER LONG #" + openDcaCount + " qty=" + contracts);
+            UpdateDashboardStatus("LONG #" + openDcaCount, Brushes.LimeGreen);
+            if (enableDiagLog) WriteDiagRow("ENTRY_LONG", "manual=" + isManual + " bull=" + lastBullConfidence.ToString("F1"));
+        }
+
+        private void ExecuteShortEntry(bool isManual)
+        {
+            if (!CanEnterTrade("SELL MKT", isManual, -1)) return;
+            if (Position.MarketPosition == MarketPosition.Flat) { tradeSequence++; dailyTradeCount++; }
+            openDcaCount++;
+            lastAutoStrategyUsed = StrategyDisplay(autoStrategy == 2 ? bestAutoStrategy : autoStrategy);
+            EnterShort(contracts, " ");
+            activeEntrySignals.Add(" ");
+            openTradeDirection = -1;
+            lastEntryWallTime  = State == State.Realtime ? DateTime.Now : Time[0];
+            enteredThisBar = true;
+            Print(TAG + "ENTER SHORT #" + openDcaCount + " qty=" + contracts);
+            UpdateDashboardStatus("SHORT #" + openDcaCount, Brushes.OrangeRed);
+            if (enableDiagLog) WriteDiagRow("ENTRY_SHORT", "manual=" + isManual + " bear=" + lastBearConfidence.ToString("F1"));
+        }
+
+        private void ExecuteBuyAskEntry()
+        {
+            if (!CanEnterTrade("BUY ASK", true, 1)) return;
+            double lp = GetCurrentAsk(); if (lp <= 0) lp = Close[0] + TickSize;
+            if (Position.MarketPosition == MarketPosition.Flat) { tradeSequence++; dailyTradeCount++; }
+            openDcaCount++;
+            EnterLongLimit(contracts, lp, " ");
+            activeEntrySignals.Add(" ");
+            openTradeDirection = 1;
+            lastEntryWallTime = State == State.Realtime ? DateTime.Now : Time[0];
+            aggressiveLimitSubmitTime = lastEntryWallTime;
+            enteredThisBar = true;
+            Print(TAG + "BUY ASK @ " + lp.ToString("F2"));
+            UpdateDashboardStatus("BUY ASK @ " + lp.ToString("F2"), Brushes.LimeGreen);
+        }
+
+        private void ExecuteSellBidEntry()
+        {
+            if (!CanEnterTrade("SELL BID", true, -1)) return;
+            double lp = GetCurrentBid(); if (lp <= 0) lp = Close[0] - TickSize;
+            if (Position.MarketPosition == MarketPosition.Flat) { tradeSequence++; dailyTradeCount++; }
+            openDcaCount++;
+            EnterShortLimit(contracts, lp, " ");
+            activeEntrySignals.Add(" ");
+            openTradeDirection = -1;
+            lastEntryWallTime = State == State.Realtime ? DateTime.Now : Time[0];
+            aggressiveLimitSubmitTime = lastEntryWallTime;
+            enteredThisBar = true;
+            Print(TAG + "SELL BID @ " + lp.ToString("F2"));
+            UpdateDashboardStatus("SELL BID @ " + lp.ToString("F2"), Brushes.OrangeRed);
+        }
+
+        private void ExecuteLongLimitEntry()
+        {
+            if (!CanEnterTrade("BUY LMT", true, 1)) return;
+            double lp = GetCurrentBid(); if (lp <= 0) lp = Close[0] - TickSize;
+            if (Position.MarketPosition == MarketPosition.Flat) { tradeSequence++; dailyTradeCount++; }
+            openDcaCount++;
+            EnterLongLimit(contracts, lp, " ");
+            activeEntrySignals.Add(" ");
+            openTradeDirection = 1;
+            lastEntryWallTime = State == State.Realtime ? DateTime.Now : Time[0];
+            enteredThisBar = true;
+            Print(TAG + "BUY LMT @ " + lp.ToString("F2"));
+            UpdateDashboardStatus("BUY LMT @ " + lp.ToString("F2"), Brushes.LimeGreen);
+        }
+
+        private void ExecuteShortLimitEntry()
+        {
+            if (!CanEnterTrade("SELL LMT", true, -1)) return;
+            double lp = GetCurrentAsk(); if (lp <= 0) lp = Close[0] + TickSize;
+            if (Position.MarketPosition == MarketPosition.Flat) { tradeSequence++; dailyTradeCount++; }
+            openDcaCount++;
+            EnterShortLimit(contracts, lp, " ");
+            activeEntrySignals.Add(" ");
+            openTradeDirection = -1;
+            lastEntryWallTime = State == State.Realtime ? DateTime.Now : Time[0];
+            enteredThisBar = true;
+            Print(TAG + "SELL LMT @ " + lp.ToString("F2"));
+            UpdateDashboardStatus("SELL LMT @ " + lp.ToString("F2"), Brushes.OrangeRed);
+        }
+
+        private void ArmHiddenStops()
+        {
+            if (averageEntryPrice <= 0)
+            {
+                Print(TAG + "ArmHiddenStops skipped — avgEntry=0 (will arm on fill)");
+                return;
+            }
+            // -------- RESET to ORIGINAL config (never carry-over from previous trade) --------
+            // Manual nudges from prior trade are wiped here so each new trade starts clean.
+            if (originalsSnapshotted)
+            {
+                if (slPoints      != origSlPoints)      { slPoints      = origSlPoints;      Print(TAG + "SL reset to original " + slPoints + "pt"); }
+                if (tpPoints      != origTpPoints)      { tpPoints      = origTpPoints;      Print(TAG + "TP reset to original " + tpPoints + "pt"); }
+                if (jumpSlPercent != origJumpSlPercent) { jumpSlPercent = origJumpSlPercent; Print(TAG + "Jump% reset to original " + jumpSlPercent + "%"); }
+                if (ChartControl != null) ChartControl.Dispatcher.InvokeAsync(() => { UpdateAdjustLabels(); UpdateJumpLabel(); });
+            }
+            runnerModeActive = (openTradeDirection == 1 && htfBias > 0)
+                            || (openTradeDirection == -1 && htfBias < 0);
+            int effTp = runnerModeActive ? 500 : tpPoints;
+            double tickPt = NQ_TICKS_PER_POINT * TickSize;
+            double slOff = slPoints * tickPt;
+            double tpOff = effTp * tickPt;
+            breakevenLocked = false;
+            entryBar = CurrentBar;
+            // reset trail state on every arm — user nudges from prior trade are CLEARED
+            trailActive = false; trailPrice = 0; trailMaxProfitPts = 0; trailTierName = "";
+            manualTrailMode = false;
+            manualTrailEarlyStart = false;
+            manualTrailOffsetPoints = 0;
+            trapScore = 0; trapDetected = false; trapBarsInTrade = 0; trapEscapeBars = 0;
+            stopHuntSuspendBars = 0;
+
+            if (openTradeDirection == 1)
+            {
+                hiddenStopPrice = averageEntryPrice - slOff;
+                hiddenTargetPrice = averageEntryPrice + tpOff;
+            }
+            else if (openTradeDirection == -1)
+            {
+                hiddenStopPrice = averageEntryPrice + slOff;
+                hiddenTargetPrice = averageEntryPrice - tpOff;
+            }
+            originalSlPrice = hiddenStopPrice;
+            // Clamp TP to prevDay levels if relevant
+            double minTpDist = 8 * tickPt;
+            if (prevDayHigh > 0 && openTradeDirection == 1
+                && prevDayHigh > averageEntryPrice + minTpDist
+                && prevDayHigh < hiddenTargetPrice)
+                hiddenTargetPrice = prevDayHigh - TickSize;
+            if (prevDayLow > 0 && openTradeDirection == -1
+                && prevDayLow < averageEntryPrice - minTpDist
+                && prevDayLow > hiddenTargetPrice)
+                hiddenTargetPrice = prevDayLow + TickSize;
+            stopsArmed = true;
+            if (runnerModeActive) Print(TAG + "RUNNER mode armed dir=" + openTradeDirection);
+        }
+
+        // Non-destructive SL/TP resize: keeps trail, BE lock, trap state, and original SL reference intact.
+        // Called when user nudges SL or TP via dashboard +/- buttons.
+        private void ResizeHiddenStops()
+        {
+            if (averageEntryPrice <= 0 || openTradeDirection == 0) return;
+            double tickPt = NQ_TICKS_PER_POINT * TickSize;
+            double newSl, newTp;
+            if (openTradeDirection == 1)
+            {
+                newSl = averageEntryPrice - (slPoints * tickPt);
+                newTp = averageEntryPrice + ((runnerModeActive ? 500 : tpPoints) * tickPt);
+            }
+            else
+            {
+                newSl = averageEntryPrice + (slPoints * tickPt);
+                newTp = averageEntryPrice - ((runnerModeActive ? 500 : tpPoints) * tickPt);
+            }
+            // PrevDay clamp on TP
+            double minTpDist = 8 * tickPt;
+            if (prevDayHigh > 0 && openTradeDirection == 1
+                && prevDayHigh > averageEntryPrice + minTpDist && prevDayHigh < newTp)
+                newTp = prevDayHigh - TickSize;
+            if (prevDayLow > 0 && openTradeDirection == -1
+                && prevDayLow < averageEntryPrice - minTpDist && prevDayLow > newTp)
+                newTp = prevDayLow + TickSize;
+
+            // SL: if breakeven is locked OR trail has already moved SL favorable,
+            // never RELAX SL backwards (would expose more risk than user expects).
+            if (breakevenLocked)
+            {
+                if (openTradeDirection == 1 && newSl < hiddenStopPrice) newSl = hiddenStopPrice;
+                if (openTradeDirection == -1 && newSl > hiddenStopPrice) newSl = hiddenStopPrice;
+            }
+            hiddenStopPrice = newSl;
+            hiddenTargetPrice = newTp;
+            // Update originalSlPrice only if we LOOSENED (so trail backtrack respects new floor)
+            if (openTradeDirection == 1 && newSl < originalSlPrice) originalSlPrice = newSl;
+            else if (openTradeDirection == -1 && newSl > originalSlPrice) originalSlPrice = newSl;
+            Print(TAG + "RESIZE SL=" + hiddenStopPrice.ToString("F2") + " TP=" + hiddenTargetPrice.ToString("F2")
+                + " (slPt=" + slPoints + " tpPt=" + tpPoints + ")");
+        }
+
+        // Thread-safe trigger from WPF UI thread.
+        private void RequestSlTpResize() { pendingSlTpResize = true; if (ChartControl != null) ChartControl.Dispatcher.InvokeAsync(() => DrawChartAnnotations()); }
+
+        // -----------------------------------------------------------
+        //  MANUAL TRAIL CONTROL — invoked from dashboard buttons.
+        //  ActivateTrailManual : set manualTrailEarlyStart=true so MonitorAdaptiveTrail
+        //                        activates trail IMMEDIATELY on next tick using AGGRESSIVE
+        //                        distance (max(2pt, 0.5×ATR)). Auto-ratchet then continues.
+        //  NudgeTrailDistancePoints(±n) : adjust manualTrailOffsetPoints; auto-trail honors
+        //                        the offset on every subsequent ratchet, so user adjustment
+        //                        STICKS even as trail moves.
+        // -----------------------------------------------------------
+        private void ActivateTrailManual()
+        {
+            if (!stopsArmed || averageEntryPrice <= 0 || openTradeDirection == 0)
+            {
+                Print(TAG + "TRAIL manual-activate skipped (no live position)");
+                return;
+            }
+            // If trail already active, just lock it tighter NOW (re-anchor at aggressive distance).
+            // If not active, set the early-start flag — next tick of MonitorAdaptiveTrail will arm it.
+            manualTrailEarlyStart = true;
+            if (trailActive)
+            {
+                // Re-anchor immediately at aggressive distance.
+                double price = Close[0];
+                if (State == State.Realtime)
+                {
+                    double v = openTradeDirection == 1 ? GetCurrentBid(0) : GetCurrentAsk(0);
+                    if (v > 0) price = v;
+                }
+                double tickPt = NQ_TICKS_PER_POINT * TickSize;
+                double atrPts = indAtr[0] / tickPt;
+                double dist = Math.Max(2.0, atrPts * aggressiveTrailMaxAtrFactor) + manualTrailOffsetPoints;
+                if (dist < 1.0) dist = 1.0;
+                double newTrail = openTradeDirection == 1
+                    ? Math.Round((price - dist * tickPt) / TickSize) * TickSize
+                    : Math.Round((price + dist * tickPt) / TickSize) * TickSize;
+                // Safety: never beyond originalSL (no extra risk), never past current price (no self-stop).
+                if (originalSlPrice > 0)
+                {
+                    if (openTradeDirection == 1 && newTrail < originalSlPrice) newTrail = originalSlPrice;
+                    if (openTradeDirection == -1 && newTrail > originalSlPrice) newTrail = originalSlPrice;
+                }
+                if (openTradeDirection == 1 && newTrail >= price - TickSize) newTrail = price - TickSize;
+                if (openTradeDirection == -1 && newTrail <= price + TickSize) newTrail = price + TickSize;
+                // RATCHET-only: never relax during re-anchor (use the more favorable of old vs new)
+                if (openTradeDirection == 1)  trailPrice = Math.Max(trailPrice, newTrail);
+                else                          trailPrice = Math.Min(trailPrice, newTrail);
+                trailTierName = "Aggr";
+                Print(TAG + "TRAIL RE-ANCHOR (TRL NOW) @ " + trailPrice.ToString("F2") + " dist=" + dist.ToString("F1") + "pt");
+            }
+            else
+            {
+                Print(TAG + "TRAIL EARLY-START armed (TRL NOW) — will activate on next monitor tick");
+            }
+            UpdateDashboardStatus("TRL NOW armed (aggressive)", Brushes.Magenta);
+        }
+
+        private void NudgeTrailDistancePoints(int dPoints)
+        {
+            if (!stopsArmed || openTradeDirection == 0) { Print(TAG + "TRAIL nudge ignored (flat)"); return; }
+            // First nudge auto-arms trail (so user doesn't have to press TRL NOW separately).
+            if (!trailActive) { manualTrailEarlyStart = true; ActivateTrailManual(); }
+            // Add to the persistent offset — auto-ratchet honors this on every pass.
+            manualTrailOffsetPoints += dPoints;
+            // Apply the offset IMMEDIATELY by recomputing trail (don't wait for next monitor tick).
+            if (trailActive)
+            {
+                double tickPt = NQ_TICKS_PER_POINT * TickSize;
+                double price = Close[0];
+                if (State == State.Realtime)
+                {
+                    double v = openTradeDirection == 1 ? GetCurrentBid(0) : GetCurrentAsk(0);
+                    if (v > 0) price = v;
+                }
+                double dist = Math.Max(1.0, GetTrailDistance() + manualTrailOffsetPoints);
+                double newTrail = openTradeDirection == 1
+                    ? Math.Round((price - dist * tickPt) / TickSize) * TickSize
+                    : Math.Round((price + dist * tickPt) / TickSize) * TickSize;
+                // Safety clamps:
+                if (openTradeDirection == 1 && newTrail >= price - TickSize) newTrail = price - TickSize;
+                if (openTradeDirection == -1 && newTrail <= price + TickSize) newTrail = price + TickSize;
+                if (originalSlPrice > 0)
+                {
+                    if (openTradeDirection == 1 && newTrail < originalSlPrice) newTrail = originalSlPrice;
+                    if (openTradeDirection == -1 && newTrail > originalSlPrice) newTrail = originalSlPrice;
+                }
+                // Tightening (−): ALWAYS move trail to the new tighter price (locks profit immediately).
+                // Loosening (+): only allowed if it doesn't move trail BACK against current trail (ratchet-safe).
+                double oldTrail = trailPrice;
+                if (dPoints < 0)
+                {
+                    // Tighten: take the more favorable of new vs current
+                    if (openTradeDirection == 1)  trailPrice = Math.Max(trailPrice, newTrail);
+                    else                          trailPrice = Math.Min(trailPrice, newTrail);
+                }
+                else
+                {
+                    // Loosen: only if not yet ratcheted past this point
+                    if (openTradeDirection == 1  && newTrail < trailPrice) trailPrice = newTrail;
+                    if (openTradeDirection == -1 && newTrail > trailPrice) trailPrice = newTrail;
+                }
+                Print(TAG + "TRAIL NUDGE " + (dPoints > 0 ? "+" : "") + dPoints + "pt  offset=" + manualTrailOffsetPoints.ToString("F1") + "pt  "
+                    + oldTrail.ToString("F2") + " -> " + trailPrice.ToString("F2"));
+            }
+        }
+
+        private void RequestTrailActivate() { pendingTrailActivate = true; }
+        private void RequestTrailNudge(int dPoints) { pendingTrailNudgePoints += dPoints; }
+
+        private void ExecuteFlatten()
+        {
+            CancelPendingOrders();
+            if (Position.MarketPosition == MarketPosition.Flat)
+            {
+                ResetPositionStateInternal(false);
+                UpdateDashboardStatus("Already flat — state reset", Brushes.CornflowerBlue);
+                return;
+            }
+            if (State == State.Realtime)
+            { try { Account.Flatten(new[] { Instrument }); } catch { ManagedExitAll(); } }
+            else ManagedExitAll();
+            stopsArmed = false; pendingExit = true;
+        }
+
+        private void ManagedExitAll()
+        {
+            if (Position.MarketPosition == MarketPosition.Long) ExitLong(" ", " ");
+            else if (Position.MarketPosition == MarketPosition.Short) ExitShort(" ", " ");
+        }
+
+        private void ExecuteCloseTrade()
+        {
+            bool hadPending = CancelPendingOrders();
+            if (Position.MarketPosition == MarketPosition.Flat)
+            {
+                if (hadPending) { ResetPositionStateInternal(false); UpdateDashboardStatus("Cancelled pending", Brushes.Yellow); }
+                else UpdateDashboardStatus("Already flat", Brushes.CornflowerBlue);
+                return;
+            }
+            ManagedExitAll();
+            stopsArmed = false; pendingExit = true;
+            UpdateDashboardStatus("Closing trade...", Brushes.Yellow);
+        }
+
+        private void ExecuteCloseOne()
+        {
+            if (Position.MarketPosition == MarketPosition.Flat) { UpdateDashboardStatus("Already flat", Brushes.CornflowerBlue); return; }
+            if (Position.Quantity <= 1) { ExecuteCloseTrade(); return; }
+            CancelPendingOrders();
+            string sig = activeEntrySignals.Count > 0 ? activeEntrySignals[activeEntrySignals.Count - 1] : "";
+            if (Position.MarketPosition == MarketPosition.Long) ExitLong(1, "", sig);
+            else ExitShort(1, "", sig);
+            if (activeEntrySignals.Count > 0) activeEntrySignals.RemoveAt(activeEntrySignals.Count - 1);
+            openDcaCount = Math.Max(0, openDcaCount - 1);
+            totalContracts = Math.Max(0, totalContracts - 1);
+            ArmHiddenStops();
+            UpdateDashboardStatus("Closed 1 contract", Brushes.Yellow);
+        }
+
+        private void ExecutePartialClose(int qty)
+        {
+            if (Position.MarketPosition == MarketPosition.Flat) return;
+            int posQty = Position.Quantity;
+            int closeQty = Math.Min(qty, posQty);
+            if (closeQty >= posQty) { ExecuteCloseTrade(); return; }
+            CancelPendingOrders();
+            string sig = activeEntrySignals.Count > 0 ? activeEntrySignals[activeEntrySignals.Count - 1] : "";
+            if (Position.MarketPosition == MarketPosition.Long) ExitLong(closeQty, "", sig);
+            else ExitShort(closeQty, "", sig);
+            for (int i = 0; i < closeQty && activeEntrySignals.Count > 0; i++)
+                activeEntrySignals.RemoveAt(activeEntrySignals.Count - 1);
+            totalContracts = Math.Max(0, totalContracts - closeQty);
+            openDcaCount = Math.Max(1, (int)Math.Ceiling(totalContracts / Math.Max(1.0, contracts)));
+            ArmHiddenStops();
+            UpdateDashboardStatus("Closed " + closeQty + " contract(s)", Brushes.Yellow);
+        }
+
+        private void ExecuteJumpSL()
+        {
+            if (!stopsArmed || Position.MarketPosition == MarketPosition.Flat)
+            { UpdateDashboardStatus("No SL to jump", Brushes.Orange); return; }
+            // Use bid/ask in realtime for FAST, accurate SL placement (was using stale Close[0]).
+            double price = Close[0];
+            if (State == State.Realtime)
+            {
+                double v = openTradeDirection == 1 ? GetCurrentBid(0) : GetCurrentAsk(0);
+                if (v > 0) price = v;
+            }
+            double pct = jumpSlPercent / 100.0;
+            double tickPt = NQ_TICKS_PER_POINT * TickSize;
+            if (openTradeDirection == 1)
+            {
+                double gap = price - hiddenStopPrice;
+                if (gap <= 1.0 * tickPt) { UpdateDashboardStatus("SL at minimum", Brushes.Orange); return; }
+                double newSl = hiddenStopPrice + gap * pct;
+                double minSl = price - 1.0 * tickPt;
+                if (newSl > minSl) newSl = minSl;
+                hiddenStopPrice = Math.Round(newSl / TickSize) * TickSize;
+                slPoints = Math.Max(1, (int)Math.Round((price - hiddenStopPrice) / tickPt));
+            }
+            else if (openTradeDirection == -1)
+            {
+                double gap = hiddenStopPrice - price;
+                if (gap <= 1.0 * tickPt) { UpdateDashboardStatus("SL at minimum", Brushes.Orange); return; }
+                double newSl = hiddenStopPrice - gap * pct;
+                double maxSl = price + 1.0 * tickPt;
+                if (newSl < maxSl) newSl = maxSl;
+                hiddenStopPrice = Math.Round(newSl / TickSize) * TickSize;
+                slPoints = Math.Max(1, (int)Math.Round((hiddenStopPrice - price) / tickPt));
+            }
+            // Treat manual SL move as a BE-equivalent lock so auto-BE doesn't undo it.
+            if (slPoints > 0) breakevenLocked = true;
+            // Force-redraw the chart annotations immediately so user sees the new line on next paint.
+            if (ChartControl != null) ChartControl.Dispatcher.InvokeAsync(() => UpdateAdjustLabels());
+            DrawChartAnnotations();
+            Print(TAG + "JUMP SL -> " + hiddenStopPrice.ToString("F2") + " (" + slPoints + "pt) price=" + price.ToString("F2"));
+            UpdateDashboardStatus("SL jumped to " + hiddenStopPrice.ToString("F2"), Brushes.Yellow);
+        }
+
+        private void ExecuteEmergencyKill()
+        {
+            emergencyKillActive = true;
+            dailyLimitHit = true;
+            CancelPendingOrders();
+            if (Position.MarketPosition != MarketPosition.Flat)
+            {
+                if (State == State.Realtime)
+                    try { Account.Flatten(new[] { Instrument }); } catch { ManagedExitAll(); }
+                else ManagedExitAll();
+            }
+            stopsArmed = false; pendingExit = true;
+            UpdateDashboardStatus("EMERGENCY KILL — halted", Brushes.OrangeRed);
+        }
+
+        private bool CancelPendingOrders()
+        {
+            bool any = false;
+            try
+            {
+                var w = new List<Order>();
+                foreach (Order o in Account.Orders)
+                    if (o.Instrument == Instrument
+                        && (o.OrderState == OrderState.Working
+                         || o.OrderState == OrderState.Accepted
+                         || o.OrderState == OrderState.Submitted))
+                        w.Add(o);
+                if (w.Count > 0) { Account.Cancel(w.ToArray()); any = true; }
+            }
+            catch (Exception ex) { Print(TAG + "Cancel: " + ex.Message); }
+            return any;
+        }
+
+        private void ResetPositionStateInternal(bool fullInit)
+        {
+            if (!fullInit && Position.MarketPosition != MarketPosition.Flat)
+            {
+                Print(TAG + "ResetPositionState blocked — Position not flat");
+                return;
+            }
+            stopsArmed = false; pendingExit = false; pendingExitTicks = 0;
+            flatSyncGraceTicks = 0; openTradeDirection = 0;
+            openDcaCount = 0; totalContracts = 0; averageEntryPrice = 0;
+            hiddenStopPrice = 0; hiddenTargetPrice = 0; originalSlPrice = 0;
+            aggressiveLimitSubmitTime = DateTime.MinValue;
+            activeEntrySignals.Clear();
+            trailPrice = 0; trailActive = false; trailMaxProfitPts = 0; trailTierName = "";
+            trapScore = 0; trapDetected = false; trapBarsInTrade = 0; trapEscapeBars = 0;
+            stopHuntSuspendBars = 0;
+            breakevenLocked = false; runnerModeActive = false;
+            backtrackUsedBar = -1;
+            lastAutoStrategyUsed = "";
+            lastBullConfidence = 0; lastBearConfidence = 0;
+            rawBullConfidence = 0; rawBearConfidence = 0;
+            if (ChartControl != null) ChartControl.Dispatcher.InvokeAsync(() => UpdateAdjustLabels());
+            RemoveDrawObject("hiddenSL"); RemoveDrawObject("hiddenTP");
+            RemoveDrawObject("avgEntryLine"); RemoveDrawObject("slLabel"); RemoveDrawObject("tpLabel");
+            RemoveDrawObject("adaptiveTrail"); RemoveDrawObject("trailLabel");
+        }
+        #endregion
+
+        // ===========================================================
+        //  ORDER UPDATES — single source of truth for entry pricing
+        // ===========================================================
+        #region Order/Position/Execution updates
+        protected override void OnOrderUpdate(Order order, double limitPrice, double stopPrice,
+            int quantity, int filled, double averageFillPrice, OrderState orderState,
+            DateTime time, ErrorCode error, string comment)
+        {
+            if (order == null) return;
+            try
+            {
+                if (orderState == OrderState.Filled)
+                {
+                    double fp = averageFillPrice > 0 ? averageFillPrice : order.AverageFillPrice;
+                    int q   = order.Filled > 0 ? order.Filled : quantity;
+                    if (order.IsLong && openTradeDirection == 1)
+                    {
+                        // recompute strategy avg from actual fills
+                        double prevTotal = totalContracts;
+                        double newQty = prevTotal + q;
+                        averageEntryPrice = prevTotal > 0
+                            ? (averageEntryPrice * prevTotal + fp * q) / newQty
+                            : fp;
+                        totalContracts = newQty;
+                        ArmHiddenStops();
+                        aggressiveLimitSubmitTime = DateTime.MinValue;
+                        Print(TAG + "LONG fill q=" + q + " @ " + fp.ToString("F2") + " avg=" + averageEntryPrice.ToString("F2"));
+                    }
+                    else if (order.IsShort && openTradeDirection == -1)
+                    {
+                        double prevTotal = totalContracts;
+                        double newQty = prevTotal + q;
+                        averageEntryPrice = prevTotal > 0
+                            ? (averageEntryPrice * prevTotal + fp * q) / newQty
+                            : fp;
+                        totalContracts = newQty;
+                        ArmHiddenStops();
+                        aggressiveLimitSubmitTime = DateTime.MinValue;
+                        Print(TAG + "SHORT fill q=" + q + " @ " + fp.ToString("F2") + " avg=" + averageEntryPrice.ToString("F2"));
+                    }
+                }
+                else if (orderState == OrderState.Cancelled || orderState == OrderState.Rejected)
+                {
+                    if (aggressiveLimitSubmitTime != DateTime.MinValue)
+                    {
+                        aggressiveLimitSubmitTime = DateTime.MinValue;
+                        if (Position.MarketPosition == MarketPosition.Flat && openTradeDirection != 0)
+                        {
+                            Print(TAG + "Order " + orderState + " — reset");
+                            ResetPositionStateInternal(false);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex) { Print(TAG + "OnOrderUpdate EX: " + ex.Message); }
+        }
+
+        protected override void OnPositionUpdate(Position position, double averagePrice,
+            int quantity, MarketPosition marketPosition)
+        {
+            try
+            {
+                if (marketPosition == MarketPosition.Flat) pendingPositionFlat = true;
+            }
+            catch (Exception ex) { Print(TAG + "OnPositionUpdate EX: " + ex.Message); }
+        }
+
+        protected override void OnExecutionUpdate(Execution execution, string executionId,
+            double price, int quantity, MarketPosition marketPosition,
+            string orderId, DateTime time)
+        {
+            if (execution.Order == null) return;
+            try
+            {
+                if (SystemPerformance?.AllTrades != null)
+                {
+                    int total = SystemPerformance.AllTrades.Count;
+                    for (int i = processedTradeCount; i < total; i++)
+                    {
+                        Trade t = SystemPerformance.AllTrades[i];
+                        if (t.Entry.Time.Date == sessionDate)
+                            dailyRealizedPnL += t.ProfitCurrency;
+                    }
+                    processedTradeCount = total;
+                    if (total > 0)
+                    {
+                        Trade last = SystemPerformance.AllTrades[total - 1];
+                        if (last.Exit.Time >= time.AddSeconds(-2))
+                        {
+                            lastTradeExitBar = CurrentBar;
+                            if (last.ProfitCurrency < 0)
+                            {
+                                consecutiveLosses++;
+                                lastLossDirection = last.Entry.MarketPosition == MarketPosition.Long ? 1 : -1;
+                                lastLossBarNumber = CurrentBar;
+                                if (enableDiagLog) WriteDiagRow("EXIT_LOSS", "pnl=" + last.ProfitCurrency.ToString("F2") + " consec=" + consecutiveLosses);
+                            }
+                            else
+                            {
+                                consecutiveLosses = 0;
+                                lastLossDirection = 0;
+                                if (enableDiagLog) WriteDiagRow("EXIT_WIN", "pnl=" + last.ProfitCurrency.ToString("F2"));
+                            }
+                        }
+                    }
+                }
+                if (dailyRealizedPnL <= -maxDailyLossDollars && !dailyLimitHit)
+                { dailyLimitHit = true; ExecuteFlatten(); Print(TAG + "DAILY LOSS LIMIT " + dailyRealizedPnL.ToString("C0")); }
+                if (dailyRealizedPnL >= maxDailyProfitDollars && !dailyProfitHit)
+                { dailyProfitHit = true; ExecuteFlatten(); Print(TAG + "DAILY PROFIT TARGET " + dailyRealizedPnL.ToString("C0")); }
+            }
+            catch (Exception ex) { Print(TAG + "OnExecutionUpdate EX: " + ex.Message); }
+        }
+
+        // ----- Order-flow tape: live only -----
+        protected override void OnMarketData(MarketDataEventArgs e)
+        {
+            if (!orderFlowFilterEnabled) return;
+            if (State != State.Realtime) return;
+            if (e.MarketDataType != MarketDataType.Last) return;
+            try
+            {
+                if (tapeWindowStart == DateTime.MinValue || (DateTime.Now - tapeWindowStart).TotalSeconds > 30)
+                {
+                    tapeWindowStart = DateTime.Now;
+                    tapeBidVol = tapeAskVol = 0;
+                }
+                double trade = e.Price;
+                if (trade >= e.Ask) tapeAskVol += e.Volume;            // aggressor buys
+                else if (trade <= e.Bid) tapeBidVol += e.Volume;        // aggressor sells
+                double tot = tapeBidVol + tapeAskVol;
+                if (tot > 0) cachedTapeDelta = (tapeAskVol - tapeBidVol) / tot;
+            }
+            catch { }
+        }
+        #endregion
+
+        // ===========================================================
+        //  SIGNAL CALCULATION + 12 FILTERS
+        // ===========================================================
+        #region Signals
+        private void CalculateSignals()
+        {
+            if (CurrentBar < emaPeriodSlow + 5) return;
+            int currDom = lastBullConfidence > lastBearConfidence ? 1
+                        : lastBearConfidence > lastBullConfidence ? -1 : 0;
+
+            lastBullConfidence = 0; lastBearConfidence = 0;
+
+            if (autoStrategy == 2)
+            {
+                double[] bull = new double[2], bear = new double[2];
+                for (int s = 0; s < 2; s++)
+                {
+                    lastBullConfidence = 0; lastBearConfidence = 0;
+                    if (s == 0) CalcMomentumVwap();
+                    else CalcKeyLevelBreakout();
+                    ApplySmartFilters();
+                    bull[s] = lastBullConfidence; bear[s] = lastBearConfidence;
+                }
+                int bestIdx = 0; double bestTot = 0;
+                for (int s = 0; s < 2; s++)
+                {
+                    double t = Math.Max(bull[s], bear[s]);
+                    if (t > bestTot) { bestTot = t; bestIdx = s; }
+                    strategyScores[s] = t;
+                }
+                bestAutoStrategy = bestIdx;
+                lastBullConfidence = bull[bestIdx];
+                lastBearConfidence = bear[bestIdx];
+                rawBullConfidence  = lastBullConfidence;
+                rawBearConfidence  = lastBearConfidence;
+            }
+            else
+            {
+                if (autoStrategy == 0) CalcMomentumVwap();
+                else CalcKeyLevelBreakout();
+                rawBullConfidence = lastBullConfidence;
+                rawBearConfidence = lastBearConfidence;
+                ApplySmartFilters();
+            }
+
+            int newDom = lastBullConfidence > lastBearConfidence ? 1
+                       : lastBearConfidence > lastBullConfidence ? -1 : 0;
+            confidenceFlip = (prevDominantDir != 0 && newDom != 0 && newDom != prevDominantDir);
+            prevDominantDir = newDom;
+
+            if (enableDiagLog) WriteDiagRow("SIGNAL");
+        }
+
+        // Strategy 0: Momentum + VWAP
+        private void CalcMomentumVwap()
+        {
+            if (CurrentBar < emaPeriodSlow + 5) return;
+            int ct = ToTime(Time[0]);
+            if (ct >= 93000 && ct < 94500) return;     // skip first 15 min
+            double emaF = indEmaFast[0], emaS = indEmaSlow[0], rsi = indRsi[0];
+            bool emaFastUp   = CurrentBar > 1 && indEmaFast[0] > indEmaFast[1];
+            bool emaFastDown = CurrentBar > 1 && indEmaFast[0] < indEmaFast[1];
+            if (emaF > emaS && emaFastUp)   lastBullConfidence += 30;
+            if (emaF < emaS && emaFastDown) lastBearConfidence += 30;
+            bool vwMature = ct >= 94500;
+            if (CrossAbove(Close, vwapValue, 1)) lastBullConfidence += 35;
+            else if (Close[0] > vwapValue && vwMature) lastBullConfidence += 20;
+            if (CrossBelow(Close, vwapValue, 1)) lastBearConfidence += 35;
+            else if (Close[0] < vwapValue && vwMature) lastBearConfidence += 20;
+            if (rsi > 55 && CurrentBar > 2 && indRsi[0] > indRsi[2]) lastBullConfidence += 20;
+            if (rsi < 45 && CurrentBar > 2 && indRsi[0] < indRsi[2]) lastBearConfidence += 20;
+            if (Close[0] > High[1]) lastBullConfidence += 15;
+            if (Close[0] < Low[1]) lastBearConfidence += 15;
+            if (emaF < emaS) lastBullConfidence = Math.Max(0, lastBullConfidence - 20);
+            if (emaF > emaS) lastBearConfidence = Math.Max(0, lastBearConfidence - 20);
+        }
+
+        // Strategy 1: Key Level Breakout
+        private void CalcKeyLevelBreakout()
+        {
+            if (CurrentBar < 25) return;
+            int ct = ToTime(Time[0]);
+            if ((ct >= 93000 && ct < 93500) || (ct >= 120000 && ct < 133000)) return;
+            double hi20 = MAX(High, 20)[1];
+            double lo20 = MIN(Low, 20)[1];
+            double atr = indAtr[0];
+            if (Close[0] > hi20 && CrossAbove(Close, hi20, 1) && Close[0] > Open[0]) lastBullConfidence += 50;
+            else if (CrossAbove(Close, hi20, 1)) lastBullConfidence += 25;
+            else if (Close[0] > hi20) lastBullConfidence += 25;
+            if (atr > 0 && (Close[0] - hi20) > 0.15 * atr) lastBullConfidence += 30;
+            if (indEmaFast[0] > indEmaSlow[0]) lastBullConfidence += 20;
+            if (Close[0] < lo20 && CrossBelow(Close, lo20, 1) && Close[0] < Open[0]) lastBearConfidence += 50;
+            else if (CrossBelow(Close, lo20, 1)) lastBearConfidence += 25;
+            else if (Close[0] < lo20) lastBearConfidence += 25;
+            if (atr > 0 && (lo20 - Close[0]) > 0.15 * atr) lastBearConfidence += 30;
+            if (indEmaFast[0] < indEmaSlow[0]) lastBearConfidence += 20;
+        }
+
+        // ----- 12 filters -----
+        private void ApplySmartFilters()
+        {
+            if (CurrentBar < emaPeriodSlow + 5) return;
+            double atr = indAtr[0];
+            double rawB = lastBullConfidence, rawS = lastBearConfidence;
+
+            // F1 Volume Confirmation (uses prior-bar volume)
+            double avgVol = GetCachedAvgVolume();
+            double vr = (avgVol > 0 && CurrentBar > 1) ? Volume[1] / avgVol : 1;
+            if (vr < 0.5) { lastBullConfidence *= 0.7; lastBearConfidence *= 0.7; }
+            else if (vr > 2.0) { lastBullConfidence *= 1.15; lastBearConfidence *= 1.15; }
+
+            // F2 Bull/Bear Conflict
+            double conflict = Math.Min(lastBullConfidence, lastBearConfidence);
+            double dominant = Math.Max(lastBullConfidence, lastBearConfidence);
+            if (dominant > 0 && conflict / dominant > 0.80)
+            { lastBullConfidence *= 0.7; lastBearConfidence *= 0.7; }
+
+            // F3 HTF Bias composite
+            if (htfBias > 0)       { lastBearConfidence *= 0.50; lastBullConfidence *= 1.10; }
+            else if (htfBias < 0)  { lastBullConfidence *= 0.50; lastBearConfidence *= 1.10; }
+            else if (sessionConfirmedBias != 0)
+            {
+                if (sessionConfirmedBias > 0) { lastBearConfidence *= 0.65; lastBullConfidence *= 1.05; }
+                else                          { lastBullConfidence *= 0.65; lastBearConfidence *= 1.05; }
+            }
+
+            // F4 VWAP slope
+            if (vwapValue > 0 && prevBarVwap > 0 && atr > 0)
+            {
+                double slope = vwapValue - prevBarVwap;
+                double thr = atr * 0.05;
+                if (slope > thr) { lastBullConfidence += 10; lastBearConfidence -= 5; }
+                else if (slope < -thr) { lastBearConfidence += 10; lastBullConfidence -= 5; }
+            }
+
+            // F5 5-bar slope direction
+            if (CurrentBar >= 6 && atr > 0)
+            {
+                double slope5 = (Close[0] - Close[5]) / atr;
+                if (slope5 < -0.4) lastBullConfidence *= Math.Max(0.5, 1.0 - (Math.Abs(slope5) - 0.4) * 0.3);
+                else if (slope5 > 0.4) lastBearConfidence *= Math.Max(0.5, 1.0 - (slope5 - 0.4) * 0.3);
+            }
+
+            // F6 EMA cross structure (always-on penalty)
+            if (indEmaFast[0] < indEmaSlow[0]) lastBullConfidence *= 0.65;
+            if (indEmaFast[0] > indEmaSlow[0]) lastBearConfidence *= 0.65;
+
+            // F7 RSI/Price divergence
+            if (CurrentBar >= 5 && atr > 0)
+            {
+                double r0 = indRsi[0], r4 = indRsi[4];
+                if (r0 < r4 - 5 && Close[0] > Close[4]) lastBearConfidence += 10;
+                if (r0 > r4 + 5 && Close[0] < Close[4]) lastBullConfidence += 10;
+            }
+
+            // Penalty floor — never < 50% of raw
+            lastBullConfidence = Math.Max(lastBullConfidence, rawB * 0.50);
+            lastBearConfidence = Math.Max(lastBearConfidence, rawS * 0.50);
+
+            // F8 Confidence flip bonus
+            if (confidenceFlip)
+            {
+                if (lastBullConfidence > lastBearConfidence) lastBullConfidence += 15;
+                else if (lastBearConfidence > lastBullConfidence) lastBearConfidence += 15;
+            }
+
+            // F9 EMA cross momentum boost
+            if (emaCrossBarsAgo <= 3)
+            {
+                double cb = emaCrossBarsAgo == 0 ? 25.0 : (emaCrossBarsAgo <= 1 ? 20.0 : 15.0);
+                if (emaCrossDir == 1) lastBullConfidence += cb;
+                if (emaCrossDir == -1) lastBearConfidence += cb;
+            }
+
+            // F10 Order-flow tape (live only — neutral elsewhere)
+            if (orderFlowFilterEnabled)
+            {
+                double td = cachedTapeDelta;
+                if (td > 0.25) { lastBullConfidence += 10; lastBearConfidence -= 5; }
+                else if (td < -0.25) { lastBearConfidence += 10; lastBullConfidence -= 5; }
+            }
+
+            // F11 Liquidity void (handled at entry-time also; here we soften confidence)
+            if (voidBarsRemaining > 0)
+            { lastBullConfidence *= 0.7; lastBearConfidence *= 0.7; }
+
+            // F12 Open-type alignment boost
+            if (openTypeSet)
+            {
+                if (openType == 1) lastBullConfidence += 8;
+                else if (openType == -1) lastBearConfidence += 8;
+            }
+
+            lastBullConfidence = Math.Max(0, Math.Min(120, lastBullConfidence));
+            lastBearConfidence = Math.Max(0, Math.Min(120, lastBearConfidence));
+        }
+
+        private void UpdateHtfBias()
+        {
+            int votes = 0;
+            if (indEma5mFast != null && indEma5mSlow != null
+                && BarsArray.Length > 1 && BarsArray[1].Count > 25)
+            {
+                if (indEma5mFast[0] > indEma5mSlow[0]) votes++;
+                else if (indEma5mFast[0] < indEma5mSlow[0]) votes--;
+            }
+            if (currDayOpen > 0 && indAtr != null && indAtr[0] > 0)
+            {
+                double d = Close[0] - currDayOpen;
+                double th = indAtr[0] * 0.3;
+                if (d > th) { sessionOpenBias = 1; votes++; }
+                else if (d < -th) { sessionOpenBias = -1; votes--; }
+                else sessionOpenBias = 0;
+            }
+            // Legacy 45-EMA
+            if (indEmaHtf != null && CurrentBar >= htfEmaPeriod + 5 && indAtr != null && indAtr[0] > 0)
+            {
+                double dist = (Close[0] - indEmaHtf[0]) / indAtr[0];
+                if (dist > 1.5) votes++;
+                else if (dist < -1.5) votes--;
+            }
+            htfBias = votes >= 2 ? 1 : (votes <= -2 ? -1 : 0);
+            if (htfBias < 0) { htfBiasConsecBear++; htfBiasConsecBull = 0; }
+            else if (htfBias > 0) { htfBiasConsecBull++; htfBiasConsecBear = 0; }
+            else
+            {
+                if (htfBiasConsecBear > 0) htfBiasConsecBear--;
+                if (htfBiasConsecBull > 0) htfBiasConsecBull--;
+            }
+            if (htfBiasConsecBear >= 6) sessionConfirmedBias = -1;
+            else if (htfBiasConsecBull >= 6) sessionConfirmedBias = 1;
+            else if (sessionConfirmedBias == -1 && htfBiasConsecBull >= 12) sessionConfirmedBias = 0;
+            else if (sessionConfirmedBias == 1  && htfBiasConsecBear >= 12) sessionConfirmedBias = 0;
+        }
+
+        private void TrackEmaCross()
+        {
+            if (CurrentBar < 2 || indEmaFast == null || indEmaSlow == null) return;
+            bool wasBull = indEmaFast[1] >= indEmaSlow[1];
+            bool nowBull = indEmaFast[0] >= indEmaSlow[0];
+            if (nowBull && !wasBull) { emaCrossDir = 1; emaCrossBarsAgo = 0; }
+            else if (!nowBull && wasBull) { emaCrossDir = -1; emaCrossBarsAgo = 0; }
+            else emaCrossBarsAgo++;
+        }
+
+        // Open-type classification (first 30 min RTH)
+        private void UpdateOpenTypeClassification()
+        {
+            int ct = ToTime(Time[0]);
+            if (ct < 93000 || ct >= 100000 || openTypeSet) return;
+            // After first 30 min, classify
+            if (ct >= 95900 && currDayOpen > 0 && indAtr != null && indAtr[0] > 0)
+            {
+                double moveFromOpen = Close[0] - currDayOpen;
+                double atr30 = indAtr[0];
+                if (moveFromOpen > atr30 * 1.5) openType = 1;        // Open-Drive bull
+                else if (moveFromOpen < -atr30 * 1.5) openType = -1; // Open-Drive bear
+                else openType = 0;
+                openTypeSet = true;
+            }
+        }
+
+        // Liquidity void: 3 consecutive bars range > 2xATR with widening volume
+        private void UpdateLiquidityVoid()
+        {
+            if (voidBarsRemaining > 0) voidBarsRemaining--;
+            if (CurrentBar < 4 || indAtr == null || indAtr[0] <= 0) return;
+            double atr = indAtr[0];
+            int hits = 0;
+            for (int i = 0; i < 3; i++) if ((High[i] - Low[i]) > 2.0 * atr) hits++;
+            if (hits >= 3) voidBarsRemaining = 2;
+        }
+        #endregion
+
+        // ===========================================================
+        //  MANUAL TRADE-SIGNAL INDICATOR
+        // ===========================================================
+        #region Manual signal
+        // Combines confidence + HTF + tape + EMA + flip into a single
+        // explicit BUY / SELL / WAIT recommendation. Driven once per bar.
+        private void UpdateManualSignal()
+        {
+            int level = 0;
+            string r = "";
+            double dom = Math.Max(lastBullConfidence, lastBearConfidence);
+            int dir = lastBullConfidence > lastBearConfidence ? 1 : (lastBearConfidence > lastBullConfidence ? -1 : 0);
+            bool meetsConf = dom >= minSignalConfidence;
+            bool htfOk = (dir == 1 && htfBias >= 0) || (dir == -1 && htfBias <= 0);
+            bool emaOk = (dir == 1 && indEmaFast[0] > indEmaSlow[0]) || (dir == -1 && indEmaFast[0] < indEmaSlow[0]);
+            bool tapeOk = !orderFlowFilterEnabled || (dir == 1 && cachedTapeDelta >= -0.1)
+                                                 || (dir == -1 && cachedTapeDelta <= 0.1);
+            bool noVoid = voidBarsRemaining == 0;
+            bool freshCross = emaCrossBarsAgo <= 3 && emaCrossDir == dir;
+
+            if (dir != 0 && meetsConf && htfOk && emaOk && tapeOk && noVoid)
+            {
+                int conflu = (htfOk?1:0) + (emaOk?1:0) + (tapeOk?1:0) + (freshCross?1:0) + (confidenceFlip && prevDominantDir == dir ? 1 : 0);
+                level = (dom >= minSignalConfidence + 15 && conflu >= 4) ? (dir * 2) : dir;
+                r = (level == 2 ? "STRONG BUY" : level == -2 ? "STRONG SELL" : level == 1 ? "BUY" : "SELL")
+                    + " conf=" + dom.ToString("F0") + " htf=" + htfBias + " tape=" + cachedTapeDelta.ToString("F2");
+            }
+            else
+            {
+                level = 0;
+                r = "WAIT — ";
+                if (!meetsConf) r += "low conf ";
+                if (!htfOk) r += "htf-against ";
+                if (!emaOk) r += "ema-against ";
+                if (!tapeOk) r += "tape-against ";
+                if (!noVoid) r += "liq-void ";
+            }
+            manualSignalLevel = level;
+            manualSignalReason = r;
+        }
+        #endregion
+
+        // ===========================================================
+        //  VWAP / VOLUME PROFILE
+        // ===========================================================
+        #region VWAP & VP
+        private void ResetVwap()
+        {
+            vwapCumTPV = vwapCumVol = vwapValue = 0;
+            prevBarVwap = currBarTPV = currBarVol = 0;
+        }
+        private void UpdateVwap()
+        {
+            double tp = (High[0] + Low[0] + Close[0]) / 3.0;
+            double v  = Volume[0];
+            if (IsFirstTickOfBar && CurrentBar > 0)
+            {
+                vwapCumTPV += currBarTPV; vwapCumVol += currBarVol;
+                currBarTPV = tp * v; currBarVol = v;
+            }
+            else
+            {
+                currBarTPV = tp * v; currBarVol = v;
+            }
+            double tt = vwapCumTPV + currBarTPV;
+            double tv = vwapCumVol + currBarVol;
+            prevBarVwap = vwapValue;
+            vwapValue = tv > 0 ? tt / tv : Close[0];
+        }
+        private void UpdateVolumeProfile()
+        {
+            if (volumeAtPrice == null) return;
+            double tp = Math.Round(((High[0] + Low[0] + Close[0]) / 3.0) / TickSize) * TickSize;
+            double v = Volume[0];
+            if (volumeAtPrice.ContainsKey(tp)) volumeAtPrice[tp] += v;
+            else volumeAtPrice[tp] = v;
+        }
+        private void RecalcVolumeProfileLevels()
+        {
+            if (volumeAtPrice == null || volumeAtPrice.Count == 0) return;
+            double maxVol = 0; pocLevel = 0;
+            foreach (var kv in volumeAtPrice) if (kv.Value > maxVol) { maxVol = kv.Value; pocLevel = kv.Key; }
+            double total = 0;
+            foreach (var kv in volumeAtPrice) total += kv.Value;
+            double target = total * 0.70;
+            var sorted = new List<double>(volumeAtPrice.Keys);
+            int pi = sorted.BinarySearch(pocLevel);
+            if (pi < 0) { vahLevel = pocLevel; valLevel = pocLevel; return; }
+            double area = volumeAtPrice[pocLevel];
+            int lo = pi, hi = pi;
+            while (area < target && (lo > 0 || hi < sorted.Count - 1))
+            {
+                double vb = lo > 0 ? volumeAtPrice[sorted[lo - 1]] : 0;
+                double va = hi < sorted.Count - 1 ? volumeAtPrice[sorted[hi + 1]] : 0;
+                if (va >= vb && hi < sorted.Count - 1) { hi++; area += volumeAtPrice[sorted[hi]]; }
+                else if (lo > 0) { lo--; area += volumeAtPrice[sorted[lo]]; }
+                else { hi++; area += volumeAtPrice[sorted[hi]]; }
+            }
+            valLevel = sorted[lo]; vahLevel = sorted[hi];
+        }
+        private double GetCachedAvgVolume()
+        {
+            if (cachedAvgVolumeBar == CurrentBar) return cachedAvgVolume;
+            cachedAvgVolumeBar = CurrentBar;
+            double sum = 0; int lb = Math.Min(20, CurrentBar);
+            for (int i = 1; i <= lb; i++) sum += Volume[i];
+            cachedAvgVolume = lb > 0 ? sum / lb : 1;
+            return cachedAvgVolume;
+        }
+        #endregion
+
+        // ===========================================================
+        //  DAILY RESET / CHART
+        // ===========================================================
+        #region Daily reset & chart
+        private void ResetDailyTracking()
+        {
+            if (currDayHigh > 0)
+            {
+                prevDayHigh  = currDayHigh;
+                prevDayLow   = currDayLow;
+                prevDayClose = Close[1] > 0 ? Close[1] : Close[0];
+                prevDayOpen  = currDayOpen;
+                Print(TAG + "PrevDay H=" + prevDayHigh.ToString("F2") + " L=" + prevDayLow.ToString("F2"));
+            }
+            currDayHigh = High[0]; currDayLow = Low[0]; currDayOpen = Open[0];
+            sessionDate = Time[0].Date;
+            ResetSessionFlags();
+            if (volumeAtPrice != null) volumeAtPrice.Clear();
+            pocLevel = vahLevel = valLevel = 0;
+            Print(TAG + "Session reset " + sessionDate.ToShortDateString());
+        }
+
+        private void DrawChartAnnotations()
+        {
+            if (!stopsArmed || averageEntryPrice == 0) return;
+            Draw.HorizontalLine(this, "hiddenSL", false, hiddenStopPrice, Brushes.OrangeRed, DashStyleHelper.DashDotDot, 2);
+            Draw.HorizontalLine(this, "hiddenTP", false, hiddenTargetPrice, Brushes.LimeGreen, DashStyleHelper.DashDotDot, 2);
+            Draw.HorizontalLine(this, "avgEntryLine", false, averageEntryPrice, Brushes.DodgerBlue, DashStyleHelper.Dot, 1);
+            int slTk = slPoints * 4;
+            int tpTk = tpPoints * 4;
+            double slDol = slPoints * NQ_DOLLARS_PER_POINT * totalContracts;
+            double tpDol = tpPoints * NQ_DOLLARS_PER_POINT * totalContracts;
+            Draw.Text(this, "slLabel",
+                "SL " + hiddenStopPrice.ToString("F2") + "  (" + slPoints + "pt | " + slTk + "tk | " + slDol.ToString("C0") + ")",
+                0, hiddenStopPrice + (openTradeDirection == 1 ? -2 * TickSize : 2 * TickSize), Brushes.OrangeRed);
+            Draw.Text(this, "tpLabel",
+                "TP " + hiddenTargetPrice.ToString("F2") + "  (" + tpPoints + "pt | " + tpTk + "tk | " + tpDol.ToString("C0") + ")",
+                0, hiddenTargetPrice + (openTradeDirection == 1 ? 2 * TickSize : -2 * TickSize), Brushes.LimeGreen);
+            if (trailEnabled && trailActive && trailPrice > 0)
+            {
+                Draw.HorizontalLine(this, "adaptiveTrail", false, trailPrice, Brushes.Magenta, DashStyleHelper.DashDot, 2);
+                double td = openTradeDirection == 1
+                    ? (Close[0] - trailPrice) / (TickSize * NQ_TICKS_PER_POINT)
+                    : (trailPrice - Close[0]) / (TickSize * NQ_TICKS_PER_POINT);
+                Draw.Text(this, "trailLabel",
+                    "Trail " + trailPrice.ToString("F2") + "  (" + td.ToString("F1") + "pt " + trailTierName + ")",
+                    0, trailPrice + (openTradeDirection == 1 ? -6 * TickSize : 6 * TickSize), Brushes.Magenta);
+            }
+            else
+            {
+                RemoveDrawObject("adaptiveTrail"); RemoveDrawObject("trailLabel");
+            }
+        }
+
+        private void DrawSessionLevels()
+        {
+            if (showVwap && vwapValue > 0)
+                Draw.HorizontalLine(this, "vwapLine", false, vwapValue, Brushes.Yellow, DashStyleHelper.Solid, 1);
+            if (prevDayHigh > 0) Draw.HorizontalLine(this, "pdH", false, prevDayHigh, Brushes.Cyan,    DashStyleHelper.Dash, 1);
+            if (prevDayLow  > 0) Draw.HorizontalLine(this, "pdL", false, prevDayLow,  Brushes.Cyan,    DashStyleHelper.Dash, 1);
+            if (pocLevel    > 0) Draw.HorizontalLine(this, "vpPOC", false, pocLevel, Brushes.Gold,     DashStyleHelper.Solid, 2);
+            if (vahLevel    > 0) Draw.HorizontalLine(this, "vpVAH", false, vahLevel, Brushes.DodgerBlue, DashStyleHelper.Dash, 1);
+            if (valLevel    > 0) Draw.HorizontalLine(this, "vpVAL", false, valLevel, Brushes.DodgerBlue, DashStyleHelper.Dash, 1);
+        }
+        #endregion
+
+        // ===========================================================
+        //  UTILITIES
+        // ===========================================================
+        #region Utilities
+        private double Clamp01(double v) { return Math.Max(0.0, Math.Min(1.0, v)); }
+        private double LerpD(double a, double b, double t) { return a + (b - a) * t; }
+        private double GetCurrentBid() { return GetCurrentBid(0); }
+        private double GetCurrentAsk() { return GetCurrentAsk(0); }
+        private bool CrossAbove(ISeries<double> series, double level, int lookback)
+        {
+            if (CurrentBar < lookback) return false;
+            return series[0] > level && series[lookback] <= level;
+        }
+        private bool CrossBelow(ISeries<double> series, double level, int lookback)
+        {
+            if (CurrentBar < lookback) return false;
+            return series[0] < level && series[lookback] >= level;
+        }
+        private string StrategyDisplay(int idx)
+        {
+            if (idx == 0) return "Momentum+VWAP";
+            if (idx == 1) return "Key Lvl Breakout";
+            return "Auto";
+        }
+        private string FormatTime(int hhmmss)
+        {
+            int h = hhmmss / 10000;
+            int m = (hhmmss / 100) % 100;
+            int ap = h >= 12 ? 1 : 0;
+            int h12 = h > 12 ? h - 12 : (h == 0 ? 12 : h);
+            return h12 + ":" + m.ToString("D2") + (ap == 1 ? " PM" : " AM");
+        }
+        #endregion
+
+        // ===========================================================
+        //  DASHBOARD — redesigned
+        // ===========================================================
+        #region Dashboard
+        private void BuildDashboard()
+        {
+            if (ChartControl == null || dashboardAttached) return;
+            dashboardAttached = true;
+            dashBuildRetryCount++;
+            ChartControl.Dispatcher.InvokeAsync(() =>
+            {
+                try
+                {
+                    if (!dashboardAttached) return;
+
+                    dashboardPanel = new Grid();
+                    dashTranslate  = new TranslateTransform(0, 0);
+                    dashboardPanel.RenderTransform = dashTranslate;
+
+                    dashOuterBorder = new Border
+                    {
+                        Background = new SolidColorBrush(Color.FromArgb(240, 18, 20, 28)),
+                        CornerRadius = new CornerRadius(6),
+                        BorderBrush = new SolidColorBrush(Color.FromRgb(55, 60, 75)),
+                        BorderThickness = new Thickness(1),
+                        Width = dashWidth
+                    };
+                    var border = dashOuterBorder;
+                    var outer = new StackPanel();
+
+                    // Title bar (drag)
+                    dashTitleBar = new Border
+                    {
+                        Background = new SolidColorBrush(Color.FromRgb(30, 35, 48)),
+                        CornerRadius = new CornerRadius(5, 5, 0, 0),
+                        Padding = new Thickness(10, 6, 10, 6),
+                        Cursor = Cursors.SizeAll
+                    };
+                    dashTitleBar.Child = new TextBlock
+                    {
+                        Text = "≡  NQ  Mm-ATM v5",
+                        Foreground = Brushes.White, FontSize = 13, FontWeight = FontWeights.Bold,
+                        HorizontalAlignment = HorizontalAlignment.Center
+                    };
+                    dashTitleBar.MouseLeftButtonDown += (s, e) =>
+                    { dashDragging = true; dashDragStart = e.GetPosition(ChartControl); dashTitleBar.CaptureMouse(); };
+                    dashTitleBar.MouseLeftButtonUp += (s, e) =>
+                    { dashDragging = false; dashTitleBar.ReleaseMouseCapture(); };
+                    dashTitleBar.MouseMove += (s, e) =>
+                    {
+                        if (!dashDragging) return;
+                        var p = e.GetPosition(ChartControl);
+                        dashTranslate.X += (p.X - dashDragStart.X);
+                        dashTranslate.Y += (p.Y - dashDragStart.Y);
+                        dashDragStart = p;
+                    };
+                    outer.Children.Add(dashTitleBar);
+
+                    var stack = new StackPanel { Margin = new Thickness(10, 6, 10, 8) };
+
+                    // BIG SIGNAL
+                    lblSignal = new TextBlock
+                    {
+                        Text = "WAIT", Foreground = Brushes.Gray,
+                        FontSize = 22, FontWeight = FontWeights.Bold,
+                        HorizontalAlignment = HorizontalAlignment.Center,
+                        Margin = new Thickness(0, 4, 0, 0)
+                    };
+                    lblSignalReason = new TextBlock
+                    {
+                        Text = "—", Foreground = Brushes.Gray,
+                        FontSize = 10,
+                        HorizontalAlignment = HorizontalAlignment.Center,
+                        TextWrapping = TextWrapping.Wrap,
+                        Margin = new Thickness(0, 0, 0, 4)
+                    };
+                    stack.Children.Add(lblSignal);
+                    stack.Children.Add(lblSignalReason);
+                    stack.Children.Add(MakeSep());
+
+                    // Mode + Hours
+                    var modeRow = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center };
+                    btnModeManual = MakeToggle("MANUAL", !autoMode, (s, e) => { autoMode = false; UpdateModeButtons(); });
+                    btnModeAuto   = MakeToggle("AUTO",    autoMode, (s, e) => { autoMode = true;  UpdateModeButtons(); });
+                    btnHoursToggle = MakeToggle(tradingHoursEnabled ? "HRS ON" : "HRS OFF", tradingHoursEnabled,
+                        (s, e) => { tradingHoursEnabled = !tradingHoursEnabled;
+                                    btnHoursToggle.Content = tradingHoursEnabled ? "HRS ON" : "HRS OFF";
+                                    btnHoursToggle.Background = tradingHoursEnabled ? Brushes.DarkSlateGray : Brushes.DarkRed; });
+                    modeRow.Children.Add(btnModeManual);
+                    modeRow.Children.Add(btnModeAuto);
+                    modeRow.Children.Add(btnHoursToggle);
+                    stack.Children.Add(modeRow);
+
+                    // Strategy selector
+                    var stratRow = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 4, 0, 0) };
+                    btnStratPrev = MakeSmallBtn("◄", (s, e) => { autoStrategy = (autoStrategy + 2) % 3; UpdateStratLabel(); });
+                    lblStratName = new TextBlock { Text = StrategyDisplay(autoStrategy), Width = 150, TextAlignment = TextAlignment.Center,
+                        Foreground = Brushes.White, FontSize = 11, FontWeight = FontWeights.SemiBold };
+                    btnStratNext = MakeSmallBtn("►", (s, e) => { autoStrategy = (autoStrategy + 1) % 3; UpdateStratLabel(); });
+                    stratRow.Children.Add(btnStratPrev);
+                    stratRow.Children.Add(lblStratName);
+                    stratRow.Children.Add(btnStratNext);
+                    stack.Children.Add(stratRow);
+
+                    lblActiveStrategy = MakeLabel("Active: —", Brushes.Cyan, 10, FontWeights.Normal, HorizontalAlignment.Center);
+                    stack.Children.Add(lblActiveStrategy);
+
+                    stack.Children.Add(MakeSep());
+
+                    // Confidence
+                    lblConfBull = MakeLabel("Bull: 0%", Brushes.LimeGreen, 12, FontWeights.SemiBold, HorizontalAlignment.Left);
+                    lblConfBear = MakeLabel("Bear: 0%", Brushes.OrangeRed, 12, FontWeights.SemiBold, HorizontalAlignment.Left);
+                    stack.Children.Add(lblConfBull);
+                    stack.Children.Add(lblConfBear);
+                    lblTapeDelta = MakeLabel("Tape Δ: —", Brushes.Gray, 10, FontWeights.Normal, HorizontalAlignment.Left);
+                    stack.Children.Add(lblTapeDelta);
+
+                    stack.Children.Add(MakeSep());
+
+                    // Status
+                    lblStatus = MakeLabel("Flat", Brushes.CornflowerBlue, 11, FontWeights.SemiBold, HorizontalAlignment.Left);
+                    stack.Children.Add(lblStatus);
+                    lblPosition = MakeLabel("Pos: 0/" + maxContracts, Brushes.White, 10, FontWeights.Normal, HorizontalAlignment.Left);
+                    stack.Children.Add(lblPosition);
+                    lblHiddenSL = MakeLabel("SL: —", Brushes.OrangeRed, 10, FontWeights.Normal, HorizontalAlignment.Left);
+                    lblHiddenTP = MakeLabel("TP: —", Brushes.LimeGreen, 10, FontWeights.Normal, HorizontalAlignment.Left);
+                    lblTrailInfo = MakeLabel("Trail: —", Brushes.Magenta, 10, FontWeights.Normal, HorizontalAlignment.Left);
+                    lblTrapInfo  = MakeLabel("Trap: —", Brushes.Orange, 10, FontWeights.Normal, HorizontalAlignment.Left);
+                    stack.Children.Add(lblHiddenSL);
+                    stack.Children.Add(lblHiddenTP);
+                    stack.Children.Add(lblTrailInfo);
+                    stack.Children.Add(lblTrapInfo);
+
+                    stack.Children.Add(MakeSep());
+
+                    // PnL
+                    lblUnrealized = MakeLabel("Unrealized: $0", Brushes.LimeGreen, 11, FontWeights.SemiBold, HorizontalAlignment.Left);
+                    lblPnL        = MakeLabel("Daily P&L: $0", Brushes.LimeGreen, 11, FontWeights.SemiBold, HorizontalAlignment.Left);
+                    lblAccountPnL = MakeLabel("Account P&L: —", Brushes.Gray, 10, FontWeights.Normal, HorizontalAlignment.Left);
+                    lblAccountBal = MakeLabel("Balance: —", Brushes.Gray, 10, FontWeights.Normal, HorizontalAlignment.Left);
+                    stack.Children.Add(lblUnrealized);
+                    stack.Children.Add(lblPnL);
+                    stack.Children.Add(lblAccountPnL);
+                    stack.Children.Add(lblAccountBal);
+
+                    stack.Children.Add(MakeSep());
+
+                    // VWAP / hours
+                    lblVwapVal    = MakeLabel("VWAP: —", Brushes.Yellow, 10, FontWeights.Normal, HorizontalAlignment.Left);
+                    lblTradeHours = MakeLabel("Hours: —", Brushes.Gray, 10, FontWeights.Normal, HorizontalAlignment.Left);
+                    stack.Children.Add(lblVwapVal);
+                    stack.Children.Add(lblTradeHours);
+
+                    stack.Children.Add(MakeSep());
+
+                    // Quick action buttons row 1: BUY/SELL MKT
+                    var row1 = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 2, 0, 2) };
+                    btnBuyMkt  = MakeBtn("BUY MKT",  Brushes.LimeGreen, (s, e) => pendingLong  = true);
+                    btnSellMkt = MakeBtn("SELL MKT", Brushes.OrangeRed, (s, e) => pendingShort = true);
+                    row1.Children.Add(btnBuyMkt);
+                    row1.Children.Add(btnSellMkt);
+                    stack.Children.Add(row1);
+
+                    var row2 = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 2, 0, 2) };
+                    btnBuyAsk  = MakeBtn("BUY ASK",  Brushes.SeaGreen,    (s, e) => pendingBuyAsk  = true);
+                    btnSellBid = MakeBtn("SELL BID", Brushes.IndianRed,   (s, e) => pendingSellBid = true);
+                    row2.Children.Add(btnBuyAsk);
+                    row2.Children.Add(btnSellBid);
+                    stack.Children.Add(row2);
+
+                    var row3 = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 2, 0, 2) };
+                    btnBuyLmt  = MakeBtn("BUY LMT",  Brushes.DarkSeaGreen, (s, e) => pendingLongLimit  = true);
+                    btnSellLmt = MakeBtn("SELL LMT", Brushes.RosyBrown,    (s, e) => pendingShortLimit = true);
+                    row3.Children.Add(btnBuyLmt);
+                    row3.Children.Add(btnSellLmt);
+                    stack.Children.Add(row3);
+
+                    // CLOSE / FLATTEN row — directly under BUY/SELL block for fast access
+                    var rowClose = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 2, 0, 2) };
+                    btnCloseTrade = MakeBtn("CLOSE",   Brushes.Goldenrod, (s, e) => pendingCloseTrade = true);
+                    btnFlatten    = MakeBtn("FLATTEN", Brushes.OrangeRed, (s, e) => pendingFlatten = true);
+                    rowClose.Children.Add(btnCloseTrade);
+                    rowClose.Children.Add(btnFlatten);
+                    stack.Children.Add(rowClose);
+
+                    // CLOSE 1 / KILL row
+                    var rowKill = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 2, 0, 2) };
+                    btnCloseOne = MakeBtn("CLOSE 1", Brushes.DarkGoldenrod, (s, e) => pendingCloseOne = true);
+                    btnKill     = MakeBtn("KILL",    Brushes.DarkRed,        (s, e) => pendingEmergencyKill = true);
+                    rowKill.Children.Add(btnCloseOne);
+                    rowKill.Children.Add(btnKill);
+                    stack.Children.Add(rowKill);
+
+                    stack.Children.Add(MakeSep());
+
+                    // Adjust rows — symmetric +/-; SL/TP nudge does NOT reset trail/BE
+                    stack.Children.Add(MakeAdjustRow("Qty:", contracts.ToString(),
+                        (s, e) => { int nv = contracts - 1; contracts = Math.Max(1, nv); UpdateAdjustLabels(); },
+                        (s, e) => { int nv = contracts + 1; contracts = Math.Min(maxContracts, nv); UpdateAdjustLabels(); },
+                        out lblQtyVal));
+                    stack.Children.Add(MakeAdjustRow("SL:", slPoints + "pt | $" + (slPoints * 20),
+                        (s, e) => { int nv = slPoints - slTpAdjustStep; slPoints = Math.Max(1, nv); UpdateAdjustLabels(); RequestSlTpResize(); },
+                        (s, e) => { int nv = slPoints + slTpAdjustStep; slPoints = Math.Min(500, nv); UpdateAdjustLabels(); RequestSlTpResize(); },
+                        out lblSlVal));
+                    stack.Children.Add(MakeAdjustRow("TP:", tpPoints + "pt | $" + (tpPoints * 20),
+                        (s, e) => { int nv = tpPoints - slTpAdjustStep; tpPoints = Math.Max(1, nv); UpdateAdjustLabels(); RequestSlTpResize(); },
+                        (s, e) => { int nv = tpPoints + slTpAdjustStep; tpPoints = Math.Min(500, nv); UpdateAdjustLabels(); RequestSlTpResize(); },
+                        out lblTpVal));
+                    stack.Children.Add(MakeAdjustRow("Jump%:", jumpSlPercent + "%",
+                        (s, e) => { int nv = jumpSlPercent - 5; jumpSlPercent = Math.Max(10, nv); UpdateJumpLabel(); },
+                        (s, e) => { int nv = jumpSlPercent + 5; jumpSlPercent = Math.Min(95, nv); UpdateJumpLabel(); },
+                        out lblJumpPct));
+
+                    // Trail distance manual nudge — − tightens (locks more profit), + loosens (gives room)
+                    // Step is in POINTS (1 pt = 4 ticks = $20 on NQ). Activates manual mode.
+                    stack.Children.Add(MakeAdjustRow("Trail ±pt:", "—",
+                        (s, e) => { RequestTrailNudge(-(int)trailNudgeStepPoints); },
+                        (s, e) => { RequestTrailNudge(+(int)trailNudgeStepPoints); },
+                        out lblTrailDistVal));
+
+                    stack.Children.Add(MakeSep());
+
+                    // Bottom action row 1: TRL NOW + JUMP SL (the two FAST profit-protection actions)
+                    var rowTrailJump = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 2, 0, 2) };
+                    btnTrailNow = MakeBtn("TRL NOW", Brushes.Magenta,    (s, e) => RequestTrailActivate());
+                    btnJumpSL   = MakeBtn("JUMP SL", Brushes.DodgerBlue, (s, e) => pendingJumpSL = true);
+                    btnTrailNow.ToolTip = "Activate the hidden trail RIGHT NOW with aggressive distance (max 2pt or 0.5×ATR). Auto-ratchet continues afterward; nudges via Trail ±pt persist.";
+                    btnJumpSL.ToolTip   = "Move SL closer to current price by Jump% of the current SL gap. Uses live bid/ask.";
+                    rowTrailJump.Children.Add(btnTrailNow);
+                    rowTrailJump.Children.Add(btnJumpSL);
+                    stack.Children.Add(rowTrailJump);
+
+                    // Bottom action row 2: TRL ON / TRP ON / BE ON master toggles
+                    var rowToggles = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 2, 0, 2) };
+                    btnTrailToggle = MakeToggle(trailEnabled ? "TRL ON" : "TRL OFF", trailEnabled, (s, e) =>
+                    { trailEnabled = !trailEnabled;
+                      btnTrailToggle.Content = trailEnabled ? "TRL ON" : "TRL OFF";
+                      btnTrailToggle.Background = trailEnabled ? Brushes.DarkSlateGray : Brushes.DarkRed; });
+                    btnTrapToggle = MakeToggle(enableTrapDetector ? "TRP ON" : "TRP OFF", enableTrapDetector, (s, e) =>
+                    { enableTrapDetector = !enableTrapDetector;
+                      btnTrapToggle.Content = enableTrapDetector ? "TRP ON" : "TRP OFF";
+                      btnTrapToggle.Background = enableTrapDetector ? Brushes.DarkSlateGray : Brushes.DarkRed; });
+                    btnTrapToggle.ToolTip = "Trap Detector — watches for MM stop-hunt patterns (sudden adverse spike + reversal). When ON, may tighten trail or skip entries against suspected trap moves.";
+                    btnBeToggle = MakeToggle(breakevenEnabled ? "BE ON" : "BE OFF", breakevenEnabled, (s, e) =>
+                    { breakevenEnabled = !breakevenEnabled;
+                      btnBeToggle.Content = breakevenEnabled ? "BE ON" : "BE OFF";
+                      btnBeToggle.Background = breakevenEnabled ? Brushes.DarkSlateGray : Brushes.DarkRed; });
+                    btnBeToggle.ToolTip = "Smart Break-Even — trigger = max(BE-pts, 0.5×ATR, 0.4×TP). First lock at entry+2tk, then ratchets +2tk per 5pt of further profit.";
+                    rowToggles.Children.Add(btnTrailToggle);
+                    rowToggles.Children.Add(btnTrapToggle);
+                    rowToggles.Children.Add(btnBeToggle);
+                    stack.Children.Add(rowToggles);
+
+                    dashScroller = new ScrollViewer { Content = stack, MaxHeight = dashHeight, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled };
+                    outer.Children.Add(dashScroller);
+
+                    // Bottom-right resize grip — drag to enlarge dashboard.
+                    var gripRow = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 0, 6, 4) };
+                    var grip = new TextBlock
+                    {
+                        Text = "↙ resize ↘",
+                        Foreground = new SolidColorBrush(Color.FromRgb(140, 150, 170)),
+                        FontSize = 9,
+                        Cursor = Cursors.SizeNWSE,
+                        Padding = new Thickness(8, 2, 4, 2)
+                    };
+                    grip.MouseLeftButtonDown += (s, e) =>
+                    {
+                        dashResizing = true;
+                        dashResizeStart = e.GetPosition(ChartControl);
+                        dashResizeStartW = dashOuterBorder.Width;
+                        dashResizeStartH = dashScroller.MaxHeight;
+                        grip.CaptureMouse();
+                        e.Handled = true;
+                    };
+                    grip.MouseLeftButtonUp += (s, e) => { dashResizing = false; grip.ReleaseMouseCapture(); e.Handled = true; };
+                    grip.MouseMove += (s, e) =>
+                    {
+                        if (!dashResizing) return;
+                        var p = e.GetPosition(ChartControl);
+                        double nw = Math.Max(280, Math.Min(700, dashResizeStartW + (p.X - dashResizeStart.X)));
+                        double nh = Math.Max(400, Math.Min(1400, dashResizeStartH + (p.Y - dashResizeStart.Y)));
+                        dashOuterBorder.Width = nw;
+                        dashScroller.MaxHeight = nh;
+                        dashWidth = nw;
+                        dashHeight = nh;
+                    };
+                    gripRow.Children.Add(grip);
+                    outer.Children.Add(gripRow);
+                    border.Child = outer;
+                    dashboardPanel.Children.Add(border);
+
+                    dashboardPanel.HorizontalAlignment = HorizontalAlignment.Right;
+                    dashboardPanel.VerticalAlignment   = VerticalAlignment.Top;
+                    dashboardPanel.Margin = new Thickness(0, 60, 16, 0);
+
+                    if (ChartControl.Parent is Grid g)
+                    {
+                        g.Children.Add(dashboardPanel);
+                        dashboardHostPanel = g;
+                    }
+
+                    UpdateModeButtons();
+                    UpdateAdjustLabels();
+                    UpdateJumpLabel();
+                }
+                catch (Exception ex)
+                {
+                    Print(TAG + "BuildDashboard EX: " + ex.Message);
+                    dashboardAttached = false;
+                }
+            });
+        }
+
+        private void UpdateDashboard()
+        {
+            if (ChartControl == null || lblPnL == null) return;
+
+            // Snapshot data on data thread
+            double snapClose = Close[0];
+            MarketPosition mp = Position.MarketPosition;
+            int posQty = Position.Quantity;
+            double posAvg = Position.AveragePrice;
+            int snapTime = ToTime(Time[0]);
+            double snapUnreal = 0;
+            if (mp != MarketPosition.Flat && averageEntryPrice > 0)
+            {
+                double pd = mp == MarketPosition.Long
+                    ? snapClose - averageEntryPrice
+                    : averageEntryPrice - snapClose;
+                double q = Math.Max(totalContracts, posQty);
+                snapUnreal = pd * NQ_DOLLARS_PER_POINT * q;
+            }
+            int snapTradeDir = openTradeDirection;
+            bool snapStopsArmed = stopsArmed;
+            bool snapPendingExit = pendingExit;
+            double snapHiddenSL = hiddenStopPrice;
+            double snapHiddenTP = hiddenTargetPrice;
+            int snapSlPts = slPoints, snapTpPts = tpPoints;
+            double snapTotalContracts = totalContracts;
+            double snapTrailPrice = trailPrice;
+            bool snapTrailActive = trailActive;
+            string snapTrailTier = trailTierName;
+            double snapTrapScore = trapScore;
+            bool snapTrapDetect = trapDetected;
+            int snapTrapBars = trapBarsInTrade;
+            double snapBull = lastBullConfidence, snapBear = lastBearConfidence;
+            double snapDailyPnL = dailyRealizedPnL;
+            int snapDailyTrades = dailyTradeCount;
+            bool snapDailyLimit = dailyLimitHit, snapProfitHit = dailyProfitHit;
+            bool snapEmergKill = emergencyKillActive, snapFlattenDone = flattenFired;
+            double snapVwap = vwapValue;
+            double snapTape = cachedTapeDelta;
+            int snapSignal = manualSignalLevel;
+            string snapSignalReason = manualSignalReason;
+            string snapLastStrat = lastAutoStrategyUsed;
+
+            double snapAcctRealized = 0, snapAcctUnreal = 0, snapAcctBal = 0;
+            bool snapAcctOk = false;
+            try
+            {
+                snapAcctRealized = Account.Get(AccountItem.RealizedProfitLoss, Currency.UsDollar);
+                snapAcctUnreal   = Account.Get(AccountItem.UnrealizedProfitLoss, Currency.UsDollar);
+                snapAcctBal      = Account.Get(AccountItem.CashValue, Currency.UsDollar);
+                snapAcctOk = true;
+            }
+            catch { }
+
+            ChartControl.Dispatcher.InvokeAsync(() =>
+            {
+                try
+                {
+                    if (lblSignal != null)
+                    {
+                        switch (snapSignal)
+                        {
+                            case 2:  lblSignal.Text = "▲ STRONG BUY";  lblSignal.Foreground = Brushes.LimeGreen; break;
+                            case 1:  lblSignal.Text = "↑ BUY";          lblSignal.Foreground = Brushes.Lime; break;
+                            case 0:  lblSignal.Text = "● WAIT";         lblSignal.Foreground = Brushes.Gray; break;
+                            case -1: lblSignal.Text = "↓ SELL";         lblSignal.Foreground = Brushes.OrangeRed; break;
+                            case -2: lblSignal.Text = "▼ STRONG SELL"; lblSignal.Foreground = Brushes.Red; break;
+                        }
+                    }
+                    if (lblSignalReason != null) lblSignalReason.Text = snapSignalReason;
+
+                    if (lblConfBull != null)
+                    {
+                        lblConfBull.Text = "Bull: " + snapBull.ToString("F0") + "%";
+                        lblConfBull.Opacity = snapBull >= minSignalConfidence ? 1.0 : Math.Max(0.35, snapBull / Math.Max(1.0, minSignalConfidence));
+                    }
+                    if (lblConfBear != null)
+                    {
+                        lblConfBear.Text = "Bear: " + snapBear.ToString("F0") + "%";
+                        lblConfBear.Opacity = snapBear >= minSignalConfidence ? 1.0 : Math.Max(0.35, snapBear / Math.Max(1.0, minSignalConfidence));
+                    }
+                    if (lblTapeDelta != null)
+                    {
+                        if (orderFlowFilterEnabled && State == State.Realtime)
+                        {
+                            string arrow = snapTape > 0.15 ? "▲ buyers" : (snapTape < -0.15 ? "▼ sellers" : "● balanced");
+                            lblTapeDelta.Text = "Tape Δ: " + snapTape.ToString("F2") + "  " + arrow;
+                            lblTapeDelta.Foreground = snapTape > 0.15 ? Brushes.LimeGreen : (snapTape < -0.15 ? Brushes.OrangeRed : Brushes.Gray);
+                        }
+                        else lblTapeDelta.Text = "Tape Δ: off";
+                    }
+
+                    // Status
+                    if (snapPendingExit) { lblStatus.Text = "● CLOSING..."; lblStatus.Foreground = Brushes.Yellow; }
+                    else if (snapDailyLimit) { lblStatus.Text = "■ DAILY LOSS HALT"; lblStatus.Foreground = Brushes.OrangeRed; }
+                    else if (snapProfitHit)  { lblStatus.Text = "■ PROFIT TARGET HIT"; lblStatus.Foreground = Brushes.Gold; }
+                    else if (snapEmergKill)  { lblStatus.Text = "⚠ EMERGENCY KILL"; lblStatus.Foreground = Brushes.OrangeRed; }
+                    else if (mp != MarketPosition.Flat)
+                    {
+                        string dir = mp == MarketPosition.Long ? "LONG" : "SHORT";
+                        lblStatus.Text = "● " + dir + " ×" + posQty;
+                        lblStatus.Foreground = mp == MarketPosition.Long ? Brushes.LimeGreen : Brushes.OrangeRed;
+                    }
+                    else if (snapFlattenDone) { lblStatus.Text = "■ EOD flatten — done"; lblStatus.Foreground = Brushes.Orange; }
+                    else if (autoMode) { lblStatus.Text = "● Flat — AUTO scanning"; lblStatus.Foreground = Brushes.CornflowerBlue; }
+                    else { lblStatus.Text = "● Flat — manual"; lblStatus.Foreground = Brushes.CornflowerBlue; }
+
+                    if (mp != MarketPosition.Flat)
+                    {
+                        int dq = (int)Math.Max(snapTotalContracts, posQty);
+                        lblPosition.Text = "Pos: " + dq + "/" + maxContracts + "  Avg: "
+                            + (averageEntryPrice > 0 ? averageEntryPrice.ToString("F2") : posAvg.ToString("F2"));
+                        // R-multiple
+                        double rMult = 0;
+                        if (snapStopsArmed && snapHiddenSL > 0 && averageEntryPrice > 0 && snapTradeDir != 0)
+                        {
+                            double slDist = Math.Abs(averageEntryPrice - (snapTradeDir == 1 ? averageEntryPrice - snapSlPts : averageEntryPrice + snapSlPts));
+                            // simpler: compute in points using current
+                            double profitPts = snapTradeDir == 1 ? (snapClose - averageEntryPrice) : (averageEntryPrice - snapClose);
+                            profitPts /= (TickSize * NQ_TICKS_PER_POINT);
+                            if (snapSlPts > 0) rMult = profitPts / snapSlPts;
+                        }
+                        lblHiddenSL.Text = snapHiddenSL > 0
+                            ? "SL: " + snapHiddenSL.ToString("F2") + "  (" + snapSlPts + "pt | $" + (snapSlPts * NQ_DOLLARS_PER_POINT * Math.Max(snapTotalContracts, posQty)).ToString("F0") + ")"
+                            : "SL: — (not armed)";
+                        lblHiddenTP.Text = snapHiddenTP > 0
+                            ? "TP: " + snapHiddenTP.ToString("F2") + "  (" + snapTpPts + "pt | $" + (snapTpPts * NQ_DOLLARS_PER_POINT * Math.Max(snapTotalContracts, posQty)).ToString("F0") + ")  R=" + rMult.ToString("F2")
+                            : "TP: — (not armed)";
+                        if (trailEnabled && snapTrailActive)
+                        {
+                            double td = snapTradeDir == 1
+                                ? (snapClose - snapTrailPrice) / (TickSize * NQ_TICKS_PER_POINT)
+                                : (snapTrailPrice - snapClose) / (TickSize * NQ_TICKS_PER_POINT);
+                            lblTrailInfo.Text = "Trail: " + snapTrailPrice.ToString("F2") + " (" + td.ToString("F1") + "pt " + snapTrailTier + ")";
+                            lblTrailInfo.Foreground = snapTrailTier == "T3-Runner" ? Brushes.Gold
+                                                    : snapTrailTier == "T2-Strong" ? Brushes.Cyan
+                                                    : snapTrailTier == "T1-BE" ? Brushes.Yellow : Brushes.Magenta;
+                        }
+                        else if (trailEnabled)
+                        {
+                            double pp = 0;
+                            if (snapTradeDir == 1) pp = (snapClose - averageEntryPrice) / (TickSize * NQ_TICKS_PER_POINT);
+                            else if (snapTradeDir == -1) pp = (averageEntryPrice - snapClose) / (TickSize * NQ_TICKS_PER_POINT);
+                            lblTrailInfo.Text = "Trail: waiting (" + pp.ToString("F1") + "/" + trailActivationPoints + "pt)";
+                            lblTrailInfo.Foreground = Brushes.Gray;
+                        }
+                        else { lblTrailInfo.Text = "Trail: OFF"; lblTrailInfo.Foreground = Brushes.Gray; }
+                        if (enableTrapDetector)
+                        {
+                            lblTrapInfo.Text = (snapTrapDetect ? "Trap: DETECTED " : "Trap: ") + snapTrapScore.ToString("F0") + "% bars=" + snapTrapBars;
+                            lblTrapInfo.Foreground = snapTrapDetect ? Brushes.OrangeRed : Brushes.Orange;
+                        }
+                        else { lblTrapInfo.Text = "Trap: OFF"; lblTrapInfo.Foreground = Brushes.Gray; }
+                    }
+                    else
+                    {
+                        lblPosition.Text = "Pos: 0/" + maxContracts;
+                        lblHiddenSL.Text = "SL: —";
+                        lblHiddenTP.Text = "TP: —";
+                        lblTrailInfo.Text = trailEnabled ? "Trail: —" : "Trail: OFF";
+                        lblTrapInfo.Text  = enableTrapDetector ? "Trap: —" : "Trap: OFF";
+                    }
+
+                    lblUnrealized.Text = "Unrealized: " + snapUnreal.ToString("C2");
+                    lblUnrealized.Foreground = snapUnreal >= 0 ? Brushes.LimeGreen : Brushes.OrangeRed;
+                    double dailyTotal = snapDailyPnL + snapUnreal;
+                    string tc = maxTradesPerDay > 0 ? "  [" + snapDailyTrades + "/" + maxTradesPerDay + "]" : "  [" + snapDailyTrades + "]";
+                    lblPnL.Text = "Daily P&L: " + dailyTotal.ToString("C2") + tc;
+                    lblPnL.Foreground = dailyTotal >= 0 ? Brushes.LimeGreen : Brushes.OrangeRed;
+                    if (snapAcctOk)
+                    {
+                        double at = snapAcctRealized + snapAcctUnreal;
+                        lblAccountPnL.Text = "Account P&L: " + at.ToString("C2") + " (R " + snapAcctRealized.ToString("C2") + " / U " + snapAcctUnreal.ToString("C2") + ")";
+                        lblAccountPnL.Foreground = at >= 0 ? Brushes.LimeGreen : Brushes.OrangeRed;
+                        lblAccountBal.Text = "Balance: " + snapAcctBal.ToString("C2");
+                    }
+                    else { lblAccountPnL.Text = "Account P&L: N/A"; lblAccountBal.Text = "Balance: N/A"; }
+
+                    lblVwapVal.Text = "VWAP: " + (snapVwap > 0 ? snapVwap.ToString("F2") : "—");
+                    bool inHr = !tradingHoursEnabled || (snapTime >= tradingStartTime && snapTime < flattenTime);
+                    lblTradeHours.Text = "Hours: " + (inHr ? "● open " : "○ closed ") + FormatTime(tradingStartTime) + "–" + FormatTime(flattenTime);
+                    lblTradeHours.Foreground = inHr ? Brushes.LimeGreen : Brushes.Gray;
+
+                    if (lblActiveStrategy != null)
+                    {
+                        string at = "Active: " + (string.IsNullOrEmpty(snapLastStrat) ? "—" : snapLastStrat);
+                        if (autoStrategy == 2 && strategyScores != null)
+                            at += "  [M+V=" + strategyScores[0].ToString("F0") + " KLB=" + strategyScores[1].ToString("F0") + "]";
+                        lblActiveStrategy.Text = at;
+                    }
+
+                    bool tradeFrozen = mp != MarketPosition.Flat;
+                    if (btnStratPrev != null) btnStratPrev.IsEnabled = !tradeFrozen;
+                    if (btnStratNext != null) btnStratNext.IsEnabled = !tradeFrozen;
+
+                    // Refresh adjust labels (keeps Trail \u00b1tk distance live)
+                    UpdateAdjustLabels();
+                    if (btnTrailNow != null) btnTrailNow.IsEnabled = (mp != MarketPosition.Flat) && trailEnabled;
+                }
+                catch { }
+            });
+        }
+
+        private void UpdateModeButtons()
+        {
+            if (btnModeManual == null || btnModeAuto == null) return;
+            btnModeManual.Background = !autoMode ? new SolidColorBrush(Color.FromRgb(30, 90, 160)) : new SolidColorBrush(Color.FromRgb(50, 55, 65));
+            btnModeAuto.Background   =  autoMode ? new SolidColorBrush(Color.FromRgb(30, 90, 160)) : new SolidColorBrush(Color.FromRgb(50, 55, 65));
+        }
+        private void UpdateStratLabel()
+        {
+            if (lblStratName != null) lblStratName.Text = StrategyDisplay(autoStrategy);
+        }
+        private void UpdateAdjustLabels()
+        {
+            if (lblQtyVal != null) lblQtyVal.Text = contracts.ToString();
+            if (lblSlVal  != null) lblSlVal.Text  = slPoints + "pt | $" + (slPoints * 20);
+            if (lblTpVal  != null) lblTpVal.Text  = tpPoints + "pt | $" + (tpPoints * 20);
+            if (lblTrailDistVal != null)
+            {
+                if (trailActive && trailPrice > 0 && averageEntryPrice > 0 && openTradeDirection != 0)
+                {
+                    double price = Close[0];
+                    double tickPt = TickSize * NQ_TICKS_PER_POINT;
+                    double distPt = openTradeDirection == 1
+                        ? (price - trailPrice) / tickPt
+                        : (trailPrice - price) / tickPt;
+                    int distTk = (int)Math.Round(distPt * NQ_TICKS_PER_POINT);
+                    string flag = manualTrailEarlyStart ? " *" : "";
+                    string offTxt = Math.Abs(manualTrailOffsetPoints) > 0.01
+                        ? "  off=" + (manualTrailOffsetPoints > 0 ? "+" : "") + manualTrailOffsetPoints.ToString("F0") + "pt"
+                        : "";
+                    lblTrailDistVal.Text = distPt.ToString("F1") + "pt | " + distTk + "tk" + flag + offTxt;
+                }
+                else lblTrailDistVal.Text = trailEnabled ? "— (waiting)" : "OFF";
+            }
+        }
+        private void UpdateJumpLabel()
+        {
+            if (lblJumpPct != null) lblJumpPct.Text = jumpSlPercent + "%";
+        }
+
+        private void UpdateDashboardStatus(string text, Brush color)
+        {
+            if (lblStatus == null || ChartControl == null) return;
+            ChartControl.Dispatcher.InvokeAsync(() =>
+            {
+                if (lblStatus != null) { lblStatus.Text = text; lblStatus.Foreground = color; }
+            });
+        }
+
+        private void RemoveDashboard()
+        {
+            var panel = dashboardPanel;
+            var host  = dashboardHostPanel;
+            var chart = ChartControl;
+            dashboardPanel = null; dashboardHostPanel = null; dashboardAttached = false;
+            if (panel == null) return;
+            if (chart == null) { try { if (host != null) host.Children.Remove(panel); } catch { } return; }
+            try
+            {
+                chart.Dispatcher.InvokeAsync(() =>
+                {
+                    try
+                    {
+                        if (host != null) host.Children.Remove(panel);
+                        else if (chart.Parent is Grid g) g.Children.Remove(panel);
+                    }
+                    catch { }
+                });
+            }
+            catch { }
+        }
+
+        // ---------- WPF helpers ----------
+        private TextBlock MakeLabel(string text, Brush fg, double fontSize, FontWeight weight, HorizontalAlignment ha)
+        {
+            return new TextBlock
+            {
+                Text = text, Foreground = fg, FontSize = fontSize, FontWeight = weight,
+                HorizontalAlignment = ha, Margin = new Thickness(2, 1, 2, 1)
+            };
+        }
+        private Border MakeSep()
+        {
+            return new Border
+            {
+                Background = new SolidColorBrush(Color.FromRgb(45, 50, 60)),
+                Height = 1, Margin = new Thickness(0, 4, 0, 4)
+            };
+        }
+        private Button MakeBtn(string text, Brush bg, RoutedEventHandler click)
+        {
+            var b = new Button
+            {
+                Content = text, Width = 78, Height = 26,
+                Margin = new Thickness(2, 2, 2, 2),
+                Background = bg, Foreground = Brushes.White, FontSize = 10, FontWeight = FontWeights.SemiBold,
+                BorderThickness = new Thickness(0)
+            };
+            if (click != null) b.Click += click;
+            return b;
+        }
+        private Button MakeSmallBtn(string text, RoutedEventHandler click)
+        {
+            var b = new Button
+            {
+                Content = text, Width = 28, Height = 24,
+                Margin = new Thickness(2, 0, 2, 0),
+                Background = new SolidColorBrush(Color.FromRgb(50, 55, 65)),
+                Foreground = Brushes.White, FontSize = 11, BorderThickness = new Thickness(0)
+            };
+            if (click != null) b.Click += click;
+            return b;
+        }
+        private Button MakeToggle(string text, bool active, RoutedEventHandler click)
+        {
+            var b = new Button
+            {
+                Content = text, Width = 78, Height = 24,
+                Margin = new Thickness(2, 2, 2, 2),
+                Background = active ? new SolidColorBrush(Color.FromRgb(30, 90, 160)) : new SolidColorBrush(Color.FromRgb(50, 55, 65)),
+                Foreground = Brushes.White, FontSize = 10, FontWeight = FontWeights.SemiBold,
+                BorderThickness = new Thickness(0)
+            };
+            if (click != null) b.Click += click;
+            return b;
+        }
+        private StackPanel MakeAdjustRow(string label, string value, RoutedEventHandler dec, RoutedEventHandler inc, out TextBlock valLbl)
+        {
+            // Fixed widths so −/+ buttons line up across all adjust rows.
+            // Total width ≈ 60 + 44 + 150 + 44 = 298 px, fits inside 340-px dashboard with margin.
+            var row = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Stretch, Margin = new Thickness(0, 2, 0, 2) };
+            var lbl = MakeLabel(label, Brushes.Gray, 11, FontWeights.Normal, HorizontalAlignment.Left);
+            lbl.Width = 60;
+            lbl.VerticalAlignment = VerticalAlignment.Center;
+            row.Children.Add(lbl);
+            row.Children.Add(MakeAdjustBtn("−", dec));
+            valLbl = MakeLabel(value, Brushes.White, 11, FontWeights.SemiBold, HorizontalAlignment.Center);
+            valLbl.Width = 150;
+            valLbl.TextAlignment = TextAlignment.Center;
+            valLbl.VerticalAlignment = VerticalAlignment.Center;
+            row.Children.Add(valLbl);
+            row.Children.Add(MakeAdjustBtn("+", inc));
+            return row;
+        }
+
+        // Larger / clearer adjust button (different visual from MakeSmallBtn used by strategy nav)
+        private Button MakeAdjustBtn(string text, RoutedEventHandler click)
+        {
+            var b = new Button
+            {
+                Content = text, Width = 36, Height = 28,
+                Margin = new Thickness(4, 0, 4, 0),
+                Background = new SolidColorBrush(Color.FromRgb(60, 70, 90)),
+                Foreground = Brushes.White, FontSize = 16, FontWeight = FontWeights.Bold,
+                BorderThickness = new Thickness(1),
+                BorderBrush = new SolidColorBrush(Color.FromRgb(90, 105, 130)),
+                Cursor = Cursors.Hand
+            };
+            b.MouseEnter += (s, e) => b.Background = new SolidColorBrush(Color.FromRgb(80, 110, 160));
+            b.MouseLeave += (s, e) => b.Background = new SolidColorBrush(Color.FromRgb(60, 70, 90));
+            if (click != null) b.Click += click;
+            return b;
+        }
+        #endregion
+
+        // ===========================================================
+        //  DIAGNOSTIC LOG
+        // ===========================================================
+        #region Diagnostics
+        private void OpenDiagLog()
+        {
+            try
+            {
+                string docPath = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+                string dirPath = System.IO.Path.Combine(docPath, "NinjaTrader 8");
+                if (!System.IO.Directory.Exists(dirPath)) System.IO.Directory.CreateDirectory(dirPath);
+                string fileName = "MmATM_v5_DiagLog_" + (Time.Count > 0 ? Time[0].ToString("yyyyMMdd") : DateTime.Now.ToString("yyyyMMdd")) + ".csv";
+                string fullPath = System.IO.Path.Combine(dirPath, fileName);
+                diagWriter = new System.IO.StreamWriter(fullPath, false, System.Text.Encoding.UTF8);
+                diagWriter.AutoFlush = true;
+                diagHeaderWritten = false;
+                Print(TAG + "DiagLog open: " + fullPath);
+            }
+            catch (Exception ex) { Print(TAG + "DiagLog open EX: " + ex.Message); }
+        }
+        private void CloseDiagLog()
+        {
+            if (diagWriter != null)
+            {
+                try { diagWriter.Flush(); diagWriter.Close(); } catch { }
+                diagWriter = null;
+            }
+        }
+        private void WriteDiagHeader()
+        {
+            if (diagWriter == null || diagHeaderWritten) return;
+            diagWriter.WriteLine("DateTime,Bar,Close,VWAP,EmaF,EmaS,RSI,ATR,RawBull,RawBear,Bull,Bear,Tape,htfBias,trapScore,Action,Detail");
+            diagHeaderWritten = true;
+        }
+        private void WriteDiagRow(string action, string detail = "")
+        {
+            if (!enableDiagLog || diagWriter == null) return;
+            if (!diagHeaderWritten) WriteDiagHeader();
+            try
+            {
+                double ef = indEmaFast != null ? indEmaFast[0] : 0;
+                double es = indEmaSlow != null ? indEmaSlow[0] : 0;
+                double rs = indRsi != null ? indRsi[0] : 0;
+                double at = indAtr != null ? indAtr[0] : 0;
+                diagWriter.WriteLine(string.Format(
+                    "{0},{1},{2:F2},{3:F2},{4:F2},{5:F2},{6:F2},{7:F2},{8:F1},{9:F1},{10:F1},{11:F1},{12:F2},{13},{14:F1},{15},{16}",
+                    Time[0].ToString("yyyy-MM-dd HH:mm:ss"), CurrentBar, Close[0], vwapValue,
+                    ef, es, rs, at, rawBullConfidence, rawBearConfidence,
+                    lastBullConfidence, lastBearConfidence, cachedTapeDelta, htfBias, trapScore, action, detail));
+            }
+            catch (Exception ex) { Print(TAG + "DiagLog write EX: " + ex.Message); }
+        }
+        #endregion
+
+        // ===========================================================
+        //  PROPERTIES (NinjaTrader UI)
+        // ===========================================================
+        #region Properties
+        // Group 1 — Risk
+        [NinjaScriptProperty][Range(1, 500)]
+        [Display(Name = "Stop Loss (NQ pts)", Order = 1, GroupName = "1 - Risk")]
+        public int SlPoints { get { return slPoints; } set { slPoints = value; } }
+
+        [NinjaScriptProperty][Range(1, 500)]
+        [Display(Name = "Take Profit (NQ pts)", Order = 2, GroupName = "1 - Risk")]
+        public int TpPoints { get { return tpPoints; } set { tpPoints = value; } }
+
+        [NinjaScriptProperty][Range(500, 20000)]
+        [Display(Name = "Max Daily Loss ($)", Order = 3, GroupName = "1 - Risk")]
+        public int MaxDailyLossDollars { get { return maxDailyLossDollars; } set { maxDailyLossDollars = value; } }
+
+        [NinjaScriptProperty][Range(500, 50000)]
+        [Display(Name = "Daily Profit Target ($)", Order = 4, GroupName = "1 - Risk")]
+        public int MaxDailyProfitDollars { get { return maxDailyProfitDollars; } set { maxDailyProfitDollars = value; } }
+
+        [NinjaScriptProperty][Range(0, 999)]
+        [Display(Name = "Max Trades Per Day (0=∞)", Order = 5, GroupName = "1 - Risk")]
+        public int MaxTradesPerDay { get { return maxTradesPerDay; } set { maxTradesPerDay = value; } }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Allow Multiple Entries Per Bar", Order = 8, GroupName = "1 - Risk",
+            Description = "When ON (default), a new entry can be taken on the same bar after a previous fill/exit. When OFF, only one entry per bar is allowed.")]
+        public bool AllowMultiEntryPerBar { get { return allowMultiEntryPerBar; } set { allowMultiEntryPerBar = value; } }
+
+        [NinjaScriptProperty][Range(1, 10)]
+        [Display(Name = "Contracts Per Entry", Order = 6, GroupName = "1 - Risk")]
+        public int Contracts { get { return contracts; } set { contracts = value; } }
+
+        [NinjaScriptProperty][Range(1, 20)]
+        [Display(Name = "Max Contracts Total", Order = 7, GroupName = "1 - Risk")]
+        public int MaxContracts { get { return maxContracts; } set { maxContracts = value; } }
+
+        // Group 2 — Mode
+        [NinjaScriptProperty]
+        [Display(Name = "Auto Mode", Order = 1, GroupName = "2 - Mode")]
+        public bool AutoMode { get { return autoMode; } set { autoMode = value; } }
+
+        [NinjaScriptProperty][Range(0, 2)]
+        [Display(Name = "Strategy (0=M+V 1=KLB 2=Auto)", Order = 2, GroupName = "2 - Mode")]
+        public int AutoStrategy { get { return autoStrategy; } set { autoStrategy = value; } }
+
+        [NinjaScriptProperty][Range(20, 100)]
+        [Display(Name = "Min Signal Confidence (%)", Order = 3, GroupName = "2 - Mode")]
+        public double MinSignalConfidence { get { return minSignalConfidence; } set { minSignalConfidence = value; } }
+
+        [NinjaScriptProperty][Range(0, 60)]
+        [Display(Name = "Entry Delay (sec)", Order = 4, GroupName = "2 - Mode")]
+        public int EntryDelaySeconds { get { return entryDelaySeconds; } set { entryDelaySeconds = value; } }
+
+        // Group 3 — Trail / SL
+        [NinjaScriptProperty]
+        [Display(Name = "Adaptive Trail Enabled", Order = 1, GroupName = "3 - Trail / SL")]
+        public bool TrailEnabled { get { return trailEnabled; } set { trailEnabled = value; } }
+
+        [NinjaScriptProperty][Range(1, 100)]
+        [Display(Name = "Trail Activation (pts)", Order = 2, GroupName = "3 - Trail / SL")]
+        public int TrailActivationPoints { get { return trailActivationPoints; } set { trailActivationPoints = value; } }
+
+        [NinjaScriptProperty][Range(0.5, 5.0)]
+        [Display(Name = "Trail ATR Multiplier", Order = 3, GroupName = "3 - Trail / SL")]
+        public double TrailAtrMultiplier { get { return trailAtrMultiplier; } set { trailAtrMultiplier = value; } }
+
+        [NinjaScriptProperty][Range(0, 12)]
+        [Display(Name = "Smart Trail Backtrack (ticks)", Order = 4, GroupName = "3 - Trail / SL",
+            Description = "When MM stop-hunt detected, allow trail to RELAX up to this many ticks (anti-MM avoidance). 0 = disabled. Default 4.")]
+        public int SmartTrailBacktrackTicks { get { return smartTrailBacktrackTicks; } set { smartTrailBacktrackTicks = value; } }
+
+        [NinjaScriptProperty][Range(0.1, 2.0)]
+        [Display(Name = "TRL NOW Aggr ATR Factor", Order = 41, GroupName = "3 - Trail / SL",
+            Description = "TRL NOW initial trail distance = max(2pt, factor × ATR). Lower = tighter / locks more profit faster but riskier on noise. Default 0.5.")]
+        public double AggressiveTrailMaxAtrFactor { get { return aggressiveTrailMaxAtrFactor; } set { aggressiveTrailMaxAtrFactor = value; } }
+
+        [NinjaScriptProperty][Range(2, 50)]
+        [Display(Name = "Breakeven At (pts)", Order = 5, GroupName = "3 - Trail / SL")]
+        public int BreakevenAtPoints { get { return breakevenAtPoints; } set { breakevenAtPoints = value; } }
+
+        [NinjaScriptProperty][Range(0.0, 1.5)]
+        [Display(Name = "BE Safe ATR Factor", Order = 51, GroupName = "3 - Trail / SL",
+            Description = "Smart BE safety: SL is forced to stay at least (factor×ATR) below current price so MM stop-hunts can't tag it. Default 0.35.")]
+        public double BeSafeAtrFactor { get { return beSafeAtrFactor; } set { beSafeAtrFactor = value; } }
+
+        [NinjaScriptProperty][Range(2, 40)]
+        [Display(Name = "BE Safe Min Ticks", Order = 52, GroupName = "3 - Trail / SL",
+            Description = "Hard floor for BE distance from current price (in ticks). Even if ATR is tiny, SL stays at least this far. Default 6 ticks (1.5pt).")]
+        public int BeSafeMinTicks { get { return beSafeMinTicks; } set { beSafeMinTicks = value; } }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Breakeven Lock Enabled", Order = 5, GroupName = "3 - Trail / SL",
+            Description = "Master ON/OFF for the auto break-even SL move. When OFF, SL stays at original until trail or hard SL hit. Dashboard BE button mirrors this.")]
+        public bool BreakevenEnabled { get { return breakevenEnabled; } set { breakevenEnabled = value; } }
+
+        [NinjaScriptProperty][Range(10, 95)]
+        [Display(Name = "Jump SL %", Order = 6, GroupName = "3 - Trail / SL")]
+        public int JumpSlPercent { get { return jumpSlPercent; } set { jumpSlPercent = value; } }
+
+        [NinjaScriptProperty][Range(1, 50)]
+        [Display(Name = "SL/TP Adjust Step (pts)", Order = 7, GroupName = "3 - Trail / SL")]
+        public int SlTpAdjustStep { get { return slTpAdjustStep; } set { slTpAdjustStep = value; } }
+
+        // Group 4 — Smart Logic
+        [NinjaScriptProperty]
+        [Display(Name = "Trap Detector Enabled", Order = 1, GroupName = "4 - Smart Logic")]
+        public bool EnableTrapDetector { get { return enableTrapDetector; } set { enableTrapDetector = value; } }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Order-Flow Tape Filter (live only)", Order = 2, GroupName = "4 - Smart Logic",
+            Description = "When ON, blocks entries against aggressive tape (live data only; no effect in backtest). Lightweight — recommended ON.")]
+        public bool OrderFlowFilterEnabled { get { return orderFlowFilterEnabled; } set { orderFlowFilterEnabled = value; } }
+
+        // Group 5 — Indicators
+        [NinjaScriptProperty][Range(3, 50)]
+        [Display(Name = "EMA Fast", Order = 1, GroupName = "5 - Indicators")]
+        public int EmaPeriodFast { get { return emaPeriodFast; } set { emaPeriodFast = value; } }
+
+        [NinjaScriptProperty][Range(10, 200)]
+        [Display(Name = "EMA Slow", Order = 2, GroupName = "5 - Indicators")]
+        public int EmaPeriodSlow { get { return emaPeriodSlow; } set { emaPeriodSlow = value; } }
+
+        [NinjaScriptProperty][Range(5, 30)]
+        [Display(Name = "RSI", Order = 3, GroupName = "5 - Indicators")]
+        public int RsiPeriod { get { return rsiPeriod; } set { rsiPeriod = value; } }
+
+        [NinjaScriptProperty][Range(5, 30)]
+        [Display(Name = "ATR", Order = 4, GroupName = "5 - Indicators")]
+        public int AtrPeriod { get { return atrPeriod; } set { atrPeriod = value; } }
+
+        [NinjaScriptProperty][Range(10, 200)]
+        [Display(Name = "HTF EMA", Order = 5, GroupName = "5 - Indicators")]
+        public int HtfEmaPeriod { get { return htfEmaPeriod; } set { htfEmaPeriod = value; } }
+
+        // Group 6 — Hours
+        [NinjaScriptProperty]
+        [Display(Name = "Trading Hours Filter", Order = 1, GroupName = "6 - Hours")]
+        public bool TradingHoursEnabled { get { return tradingHoursEnabled; } set { tradingHoursEnabled = value; } }
+
+        [NinjaScriptProperty][Range(0, 235959)]
+        [Display(Name = "Trading Start (HHMMSS)", Order = 2, GroupName = "6 - Hours")]
+        public int TradingStartTime { get { return tradingStartTime; } set { tradingStartTime = value; } }
+
+        [NinjaScriptProperty][Range(0, 235959)]
+        [Display(Name = "Auto-Flatten Time (HHMMSS)", Order = 3, GroupName = "6 - Hours")]
+        public int FlattenTime { get { return flattenTime; } set { flattenTime = value; } }
+
+        // Group 7 — Display
+        [NinjaScriptProperty]
+        [Display(Name = "Show EMA on chart", Order = 1, GroupName = "7 - Display")]
+        public bool ShowEma { get { return showEma; } set { showEma = value; } }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Show VWAP line", Order = 2, GroupName = "7 - Display")]
+        public bool ShowVwap { get { return showVwap; } set { showVwap = value; } }
+
+        // Group 8 — Diagnostics
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Diagnostic Log", Order = 1, GroupName = "8 - Diagnostics")]
+        public bool EnableDiagLog { get { return enableDiagLog; } set { enableDiagLog = value; } }
+        #endregion
+    }
+}

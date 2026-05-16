@@ -1,8 +1,37 @@
 // ============================================================
-//  Mm-ATM v6.0 Strategy for NinjaTrader 8
+//  Mm-ATM v7.0 Strategy for NinjaTrader 8
+//  v7 = forked from Mm_ATM_v6 4.2 stable on 2026-04-30. v6 history preserved below.
 //  Complete rewrite: simplified architecture, 12 filters, unified exits,
 //  smart-trail backtrack vs MM stop-hunts, optional order-flow tape filter,
 //  redesigned dashboard with explicit BUY/SELL trade-signal indicator.
+//
+//  ===== v7 changes =====
+//  v7 0.3 (2026-04-30): "Ride The Brick" -- stop the trail from bailing on alive same-direction streaks.
+//                       Validated against v7 0.2 playback ($1,275 / 9 trades). 4/30 09:35 SHORT was the smoking gun:
+//                         entered TREND_DN streak=13, peak=13.8pt at 09:35:49 (51s in market), exited 09:35:51 at +$190
+//                         on a 4.0pt retrace -- BUT the streak was STILL ALIVE (16 R bricks ahead, RUN_END len=17 maxFav=80pt).
+//                         Same trend was sliced into 5 trades (+$190+$75+$125+$45+$85 = +$520) when held should have been ~$1,600.
+//                       Root cause: pxStopAdxFallingMult (0.7x) TIGHTENED effRetracePts when adxSlope dipped briefly
+//                       negative (-0.57) -- exactly the wrong reaction during an alive 17-brick streak.
+//                       (A) RIDE_LOCK in PxStop: when alive same-direction streak >= rideStreakMin (5) AND slope > rideMinSlope (-2.0),
+//                            override falling-mult; apply rideStreakBonus (1.0 + 0.05*(streak-min), cap rideStreakMaxMult 1.5x);
+//                            final effRetracePts *= max(rideMult, prior mult). Emits RIDE_LOCK_PXSTOP diag.
+//                       (B) New diag tag RIDE_LOCK_PXSTOP (per fire) -- proves trail held vs old behavior.
+//  v7 0.2 (2026-04-30): "Premium Re-Arm" -- maxTradesPerDay no longer locks out CLEAN trends.
+//                       Validated against v7 0.1 playback ($975, cap hit 11:55 -> missed 13:00-14:00 streak-43 TREND_UP run worth ~$3k/contract).
+//                       (A) PREMIUM_BYPASS: when dailyTradeCount>=cap AND regime in {TREND_UP,TREND_DN} AND streak>=premiumStreak (12)
+//                            AND matching brick color AND conf>=premiumMinConf (85) AND dailyPnl>=premiumMinPnl ($0), bypass cap
+//                            up to premiumExtraTrades (5) per session.
+//                       (B) Cap refund on winners: when a closed trade nets >= cdScratchThreshold ($25), decrement dailyTradeCount
+//                            (floor 0). Death-by-tiny-wins is no longer a thing -- 20 winners no longer locks the budget.
+//                       (C) New diag tag PREMIUM_BYPASS (per fire) and CAP_REFUND (per winner). WOULD_TRADE audit kept active.
+//  v7 0.1 (2026-04-30): v4.3 ports -- pre-RTH bypass on strong-trend brick streak +
+//                       streak-hold loosen on streak>=8 (was always-on) + chop peak-lock mult 0.80->0.85 +
+//                       WOULD_TRADE instrumentation for blocked auto-entries (measure pre-RTH alpha).
+//                       Playback 4/30 RTH: +$975 (vs v6 4.2 +$445 / v6 4.0 +$530). Cap hit 11:55 -> 43 silent
+//                       blocks during 13:00-14:00 streak-43 TREND_UP run -> motivated v7 0.2.
+//
+//  ===== v6 history (preserved for forensics) =====
 //  v6 3.7 (2026-04-30): Pullback Re-Entry (post big-run continuation) + Extension Ratio Auto-Loosen on strong htf.
 //  v6 4.0 (2026-04-30): Peak-Lock Trail Floor (tiered max giveback) + Cooldown halved (8->4 bars) + HtfStaleness override at streak 5 (was 8).
 //                       Backtest 4/28-4/30: trail left $12,000 on table across 39 trades (avg capture 30%). Peak-Lock caps absolute giveback by peak magnitude:
@@ -50,7 +79,7 @@ using NinjaTrader.NinjaScript.Indicators;
 
 namespace NinjaTrader.NinjaScript.Strategies
 {
-    public class Mm_ATM_v6 : Strategy
+    public class Mm_ATM_v7 : Strategy
     {
         // ===========================================================
         //  CONSTANTS
@@ -62,7 +91,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private const int    AGGRESSIVE_LIMIT_TIMEOUT_SEC = 3;
         private const int    STALE_EXIT_TICKS     = 250;
         private const int    FLAT_SYNC_MAX_TICKS  = 200;
-        private const string TAG = "[Mm-ATM v6] ";
+        private const string TAG = "[Mm-ATM v7] ";
         #endregion
 
         // ===========================================================
@@ -491,7 +520,43 @@ namespace NinjaTrader.NinjaScript.Strategies
         // v6 4.2 Phase 7 - Per-Regime Peak-Lock multipliers.
         // Applied as: effGiveback = tierGiveback * regimeMult (TREND looser, CHOP tighter).
         private double   peakLockTrendMult          = 1.20;     // let runners breathe in confirmed trend
-        private double   peakLockChopMult           = 0.80;     // tighten in chop / unknown to lock fast
+        private double   peakLockChopMult           = 0.85;     // v7 0.1 - lifted 0.80->0.85 (UNKNOWN T#5 SL'd at +$10 on v4.2 playback was overtight)
+
+        // ===== v7 0.1 =====
+        // #1 pre-RTH bypass: allow AUTO entries before tradingStartTime when regime is TREND_* with strong brick streak.
+        private bool     preRthTrendBypassEnabled   = true;
+        private int      preRthTrendMinStreak       = 12;
+        // #2 streak-hold guard relaxes when streak is large (clean impulse, no chop): disable guard when streak >= this.
+        private int      streakHoldMaxStreak        = 8;
+        // #5 WOULD_TRADE audit: emit informational diag row when an entry was blocked but conditions look strong.
+        // Lets us quantify pre-RTH (and other) alpha BEFORE relaxing live gates.
+        private bool     enableWouldTradeAudit      = true;
+        private int      wouldTradeMinStreak        = 8;
+        private int      lastWouldTradeBar          = -1;
+        private string   lastWouldTradeKey          = "";
+
+        // ===== v7 0.2 "Premium Re-Arm" =====
+        // (A) PREMIUM_BYPASS of maxTradesPerDay when conditions are clean-trend premium.
+        // (B) Cap refund: winners >= cdScratchThreshold decrement dailyTradeCount (floor 0).
+        private bool     premiumBypassEnabled       = true;
+        private int      premiumStreak              = 12;     // min nrBrickStreakCount to qualify
+        private int      premiumMinConf             = 85;     // min bull/bearConfidence in matching dir
+        private double   premiumMinPnl              = 0.0;    // dailyRealizedPnL must be >= this ($)
+        private int      premiumExtraTrades         = 5;      // hard sub-cap on bypasses per session
+        private int      premiumExtraUsed           = 0;      // session counter (reset in roll + ResetSessionFlags)
+        private double   cdScratchThreshold         = 25.0;   // winners >= $25 refund a slot to dailyTradeCount
+
+        // ===== v7 0.3 "Ride The Brick" =====
+        // RIDE_LOCK in PxStop: when alive same-direction brick streak is running, override pxStopAdxFallingMult
+        // and apply a streak-scaled bonus to effRetracePts so the trail does not bail on small mid-streak retraces.
+        // Targets the over-trading pattern where one continuous trend got sliced into 4-6 trades on noise pullbacks.
+        private bool     rideLockEnabled            = true;
+        private int      rideStreakMin              = 5;      // min streak (same-dir alive) to enable RIDE_LOCK
+        private double   rideMinSlope               = -2.0;   // override fallingMult only when slope > this (not in true collapse)
+        private double   rideStreakPerBrickBonus    = 0.05;   // +5% per brick beyond rideStreakMin
+        private double   rideStreakMaxMult          = 1.5;    // cap streak-scaled mult
+        private int      rideRecentBrickSec         = 30;     // last same-color brick must be this fresh
+        private int      lastRideLockBar            = -1;     // throttle diag (per-bar)
         // True when ArmHiddenStops/ResizeHiddenStops had to pull the hidden TP in to a prevDay
         // level. Used to FORCE the TP check to honor the hidden target even in runner mode
         // (otherwise the visible green line is at e.g. entry+18pt while the runner-mode bypass
@@ -880,8 +945,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 if (State == State.SetDefaults)
                 {
-                    Description  = "Mm-ATM v6 — unified exits, 12 filters, MM-avoidance trail, optional order-flow tape, manual trade-signal indicator.";
-                    Name         = "Mm_ATM_v6";
+                    Description  = "Mm-ATM v7 — unified exits, 12 filters, MM-avoidance trail, optional order-flow tape, manual trade-signal indicator.";
+                    Name         = "Mm_ATM_v7";
                     Calculate    = Calculate.OnEachTick;
                     EntriesPerDirection = 40;
                     EntryHandling = EntryHandling.AllEntries;
@@ -1255,6 +1320,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             dailyProfitHit = false;
             peakDailyPnL = 0;            // v6 4.2 Phase 3
             softProfitCapActive = false; // v6 4.2 Phase 3
+            premiumExtraUsed = 0;        // v7 0.2 (A)
             flattenFired = false;
             emergencyKillActive = false;
             consecutiveLosses = 0;
@@ -2088,18 +2154,49 @@ namespace NinjaTrader.NinjaScript.Strategies
                         bool sameDirBrick = (openTradeDirection ==  1 && lastNrBrickColor == "G")
                                          || (openTradeDirection == -1 && lastNrBrickColor == "R");
                         bool strongTrend  = sameDirBrick && nrBrickStreakCount >= pxStopStrongStreakMin;
+                        double prevEff = effRetracePts;
                         if (strongTrend && lastAdxSlope > 0)         effRetracePts *= pxStopAdxRisingMult;
                         else if (lastAdxSlope < 0)                    effRetracePts *= pxStopAdxFallingMult;
+
+                        // v7 0.3 RIDE_LOCK -- when an alive same-direction brick streak is in flight,
+                        // never let the fallingMult tighten the retrace below baseline; ADD a streak-scaled
+                        // bonus so the trail breathes wider as the trend matures. The 09:35 4/30 SHORT
+                        // was killed by fallingMult * 0.7 inside an alive 17-R streak. This block prevents that.
+                        if (rideLockEnabled && sameDirBrick && nrBrickStreakCount >= rideStreakMin
+                            && lastSameColorBrickTime != DateTime.MinValue
+                            && (Time[0] - lastSameColorBrickTime).TotalSeconds <= rideRecentBrickSec
+                            && lastAdxSlope > rideMinSlope)
+                        {
+                            int extra = Math.Max(0, nrBrickStreakCount - rideStreakMin);
+                            double rideMult = Math.Min(rideStreakMaxMult, 1.0 + extra * rideStreakPerBrickBonus);
+                            double rideEff  = prevEff * rideMult;
+                            if (rideEff > effRetracePts)
+                            {
+                                if (enableDiagLog && lastRideLockBar != CurrentBar)
+                                {
+                                    lastRideLockBar = CurrentBar;
+                                    WriteDiagRow("RIDE_LOCK_PXSTOP",
+                                        "streak=" + nrBrickStreakCount
+                                        + " slope=" + lastAdxSlope.ToString("F2")
+                                        + " base=" + prevEff.ToString("F2")
+                                        + " prevMult_eff=" + effRetracePts.ToString("F2")
+                                        + " rideMult=" + rideMult.ToString("F2")
+                                        + " newEff=" + rideEff.ToString("F2")
+                                        + " peak=" + trailMaxProfitPts.ToString("F1")
+                                        + " cur=" + profitPts.ToString("F1"));
+                                }
+                                effRetracePts = rideEff;
+                            }
+                        }
                     }
                     // v6 4.1 - STREAK-HOLD: when last brick is in trade direction AND was printed
                     // recently (streak alive), require >= 1 full brick of retrace before PxStop fires.
-                    // Prevents the "trail exited next bar" scalp-out pattern (4/30 09:35-09:40 cluster
-                    // exited 4 trades each within 1 brick at peaks 9-13pt with 3-5pt body-anchor retrace).
-                    // Real continuations always retrace less than 1 brick body before resuming.
+                    // v7 0.1 - LOOSEN: disable guard when streak >= streakHoldMaxStreak (clean impulse,
+                    // no chop -- legacy retrace logic catches reversal in time anyway).
                     bool streakAliveDir = (openTradeDirection ==  1 && lastNrBrickColor == "G"
-                                         && nrBrickStreakCount >= 3)
+                                         && nrBrickStreakCount >= 3 && nrBrickStreakCount < streakHoldMaxStreak)
                                        || (openTradeDirection == -1 && lastNrBrickColor == "R"
-                                         && nrBrickStreakCount >= 3);
+                                         && nrBrickStreakCount >= 3 && nrBrickStreakCount < streakHoldMaxStreak);
                     bool sameColorRecent = lastSameColorBrickTime != DateTime.MinValue
                                          && (Time[0] - lastSameColorBrickTime).TotalSeconds <= 25;
                     if (streakAliveDir && sameColorRecent && renkoBrickSize > 0)
@@ -2564,6 +2661,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 emergencyKillActive = false;
                 flattenFired        = false;
                 rthStartedToday     = false;
+                premiumExtraUsed    = 0;     // v7 0.2 (A) reset bypass quota each session
                 if (baseAggressiveTrailFactor > 0) aggressiveTrailMaxAtrFactor = baseAggressiveTrailFactor;
                 if (SystemPerformance != null && SystemPerformance.AllTrades != null)
                     processedTradeCount = SystemPerformance.AllTrades.Count;
@@ -3082,7 +3180,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             if (enteredThisBar && !allowMultiEntryPerBar) { UpdateDashboardStatus(label + " blocked: already entered this bar", Brushes.Orange); return false; }
             if (maxTradesPerDay > 0 && !isManual && dailyTradeCount >= maxTradesPerDay
-                && Position.MarketPosition == MarketPosition.Flat)
+                && Position.MarketPosition == MarketPosition.Flat
+                && !IsPremiumBypassEligible(direction))   // v7 0.2 (A) -- premium TREND can punch through cap
             { UpdateDashboardStatus(label + " blocked: max trades/day", Brushes.Orange); return false; }
             int ct = ToTime(Time[0]);
             if (ct >= 165500 && ct < 180000) { UpdateDashboardStatus(label + " blocked: CME maint", Brushes.OrangeRed); return false; }
@@ -3111,11 +3210,47 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             int ct = ToTime(Time[0]);
             bool insideHours = !tradingHoursEnabled || (ct >= tradingStartTime && ct < flattenTime);
+            // v7 0.1 - PRE-RTH BYPASS: allow auto entries before RTH when regime confirms trend
+            // AND brick streak >= preRthTrendMinStreak (proves real impulse, not overnight chop).
+            // Targets the 8 outsideHours blocks observed on 4/30 v4.2 playback (~$150-300 missed).
+            bool preRthOk = false;
+            if (!insideHours && preRthTrendBypassEnabled)
+            {
+                bool trendDir = (currentRegime == "TREND_UP" && lastNrBrickColor == "G")
+                              || (currentRegime == "TREND_DN" && lastNrBrickColor == "R");
+                if (trendDir && nrBrickStreakCount >= preRthTrendMinStreak)
+                {
+                    preRthOk = true;
+                    if (enableDiagLog) WriteDiagRow("PRE_RTH_BYPASS",
+                        "regime=" + currentRegime + " streak=" + nrBrickStreakCount + " color=" + lastNrBrickColor);
+                }
+            }
             // v6 4.2 Phase 4 - emit BLOCK_AUTO with reason on every silent return (throttled per state-change).
-            if (!insideHours)               { LogSilentBlock("outsideHours"); return; }
+            if (!insideHours && !preRthOk) { LogSilentBlock("outsideHours"); return; }
             if (dailyLimitHit)              { LogSilentBlock("dailyLimitHit"); return; }
             if (emergencyKillActive)        { LogSilentBlock("emergencyKill"); return; }
-            if (maxTradesPerDay > 0 && dailyTradeCount >= maxTradesPerDay) { LogSilentBlock("maxTrades"); return; }
+            // v7 0.2 (A) -- maxTrades cap with PREMIUM_BYPASS escape for clean-trend setups.
+            if (maxTradesPerDay > 0 && dailyTradeCount >= maxTradesPerDay)
+            {
+                int intendedDir = (lastNrBrickColor == "G") ? 1 : (lastNrBrickColor == "R" ? -1 : 0);
+                if (intendedDir != 0 && IsPremiumBypassEligible(intendedDir))
+                {
+                    premiumExtraUsed++;
+                    if (enableDiagLog) WriteDiagRow("PREMIUM_BYPASS",
+                        "dir=" + (intendedDir == 1 ? "LONG" : "SHORT")
+                        + " regime=" + currentRegime
+                        + " streak=" + nrBrickStreakCount
+                        + " conf=" + (intendedDir == 1 ? lastBullConfidence : lastBearConfidence).ToString("F0")
+                        + " dailyPnl=" + dailyRealizedPnL.ToString("F2")
+                        + " extraUsed=" + premiumExtraUsed + "/" + premiumExtraTrades
+                        + " tradesToday=" + dailyTradeCount + "/" + maxTradesPerDay);
+                    // fall through -- entry pipeline continues
+                }
+                else
+                {
+                    LogSilentBlock("maxTrades"); return;
+                }
+            }
             // v6 4.2 Phase 3 - Soft profit cap: only TrendChase / PullbackReentry allowed (decided below).
 
             // v6 3.2 - TrendChase override (computed FIRST so cooldowns can be bypassed in strong trends).
@@ -3365,7 +3500,28 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
+        // v7 0.2 (A) - Premium-trend bypass eligibility check.
+        // ALL must hold: feature on, regime is TREND_*, brick color matches dir, streak >= premiumStreak,
+        //                matching confidence >= premiumMinConf, dailyPnl >= premiumMinPnl, sub-cap not exhausted.
+        // No diag side-effect here -- caller emits PREMIUM_BYPASS only on actual fire.
+        private bool IsPremiumBypassEligible(int direction)
+        {
+            if (!premiumBypassEnabled) return false;
+            if (direction != 1 && direction != -1) return false;
+            if (premiumExtraUsed >= premiumExtraTrades) return false;
+            bool trendDir = (direction == 1 && currentRegime == "TREND_UP" && lastNrBrickColor == "G")
+                         || (direction == -1 && currentRegime == "TREND_DN" && lastNrBrickColor == "R");
+            if (!trendDir) return false;
+            if (nrBrickStreakCount < premiumStreak) return false;
+            double conf = (direction == 1) ? lastBullConfidence : lastBearConfidence;
+            if (conf < premiumMinConf) return false;
+            if (dailyRealizedPnL < premiumMinPnl) return false;
+            return true;
+        }
+
         // v6 4.2 Phase 4 - Silent-Block diag throttle: only emit when (reason, bar) changes.
+        // v7 0.1 - Also emit WOULD_TRADE row when blocked-but-strong (lets us measure missed alpha
+        //          per gate before relaxing it live; pure observation, no trading effect).
         private void LogSilentBlock(string reason)
         {
             if (!enableDiagLog) return;
@@ -3373,6 +3529,23 @@ namespace NinjaTrader.NinjaScript.Strategies
             lastSilentBlockBar    = CurrentBar;
             lastSilentBlockReason = reason;
             WriteDiagRow("BLOCK_AUTO", "reason=" + reason);
+
+            if (!enableWouldTradeAudit) return;
+            // Strong-signal heuristic: brick streak >= N AND brick color matches a TREND regime.
+            bool strongLong  = lastNrBrickColor == "G" && nrBrickStreakCount >= wouldTradeMinStreak
+                            && (currentRegime == "TREND_UP" || currentRegime == "UNKNOWN");
+            bool strongShort = lastNrBrickColor == "R" && nrBrickStreakCount >= wouldTradeMinStreak
+                            && (currentRegime == "TREND_DN" || currentRegime == "UNKNOWN");
+            if (!strongLong && !strongShort) return;
+            string key = reason + (strongLong ? "L" : "S");
+            if (lastWouldTradeBar == CurrentBar && lastWouldTradeKey == key) return;
+            lastWouldTradeBar = CurrentBar;
+            lastWouldTradeKey = key;
+            string dir = strongLong ? "LONG" : "SHORT";
+            WriteDiagRow("WOULD_TRADE", "blockedBy=" + reason + " dir=" + dir
+                + " regime=" + currentRegime + " streak=" + nrBrickStreakCount
+                + " bullConf=" + lastBullConfidence.ToString("F0")
+                + " bearConf=" + lastBearConfidence.ToString("F0"));
         }
 
         // v6 4.2 Phase 5 - Record capture-ratio sample per regime; trigger nightly auto-tune.
@@ -4328,6 +4501,16 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 consecutiveWins++;
                                 lastLossDirection = 0;
                                 RecordTradeOutcome(true);
+                                // v7 0.2 (B) - Cap refund: a real winner returns one slot to the daily budget.
+                                // Prevents "death by tiny wins" -- 20 small wins should not lock out the afternoon mega-trend.
+                                if (last.ProfitCurrency >= cdScratchThreshold && dailyTradeCount > 0)
+                                {
+                                    dailyTradeCount--;
+                                    if (enableDiagLog) WriteDiagRow("CAP_REFUND",
+                                        "pnl=" + last.ProfitCurrency.ToString("F2")
+                                        + " thr=" + cdScratchThreshold.ToString("F2")
+                                        + " tradesToday=" + dailyTradeCount + "/" + maxTradesPerDay);
+                                }
                                 // Track for post-win same-direction cooldown
                                 lastWinExitTime = Time[0];
                                 lastWinExitDirection = last.Entry.MarketPosition == MarketPosition.Long ? 1 : -1;
@@ -5360,7 +5543,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     };
                     dashTitleBar.Child = new TextBlock
                     {
-                        Text = "≡  NQ  Mm-ATM v6",
+                        Text = "≡  NQ  Mm-ATM v7",
                         Foreground = Brushes.White, FontSize = 13, FontWeight = FontWeights.Bold,
                         HorizontalAlignment = HorizontalAlignment.Center
                     };
@@ -6163,7 +6346,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 string docPath = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
                 string dirPath = System.IO.Path.Combine(docPath, "NinjaTrader 8");
                 if (!System.IO.Directory.Exists(dirPath)) System.IO.Directory.CreateDirectory(dirPath);
-                string fileName = "MmATM_v6_DiagLog_" + (Time.Count > 0 ? Time[0].ToString("yyyyMMdd") : DateTime.Now.ToString("yyyyMMdd")) + ".csv";
+                string fileName = "MmATM_v7_DiagLog_" + (Time.Count > 0 ? Time[0].ToString("yyyyMMdd") : DateTime.Now.ToString("yyyyMMdd")) + ".csv";
                 string fullPath = System.IO.Path.Combine(dirPath, fileName);
                 diagWriter = new System.IO.StreamWriter(fullPath, false, System.Text.Encoding.UTF8);
                 diagWriter.AutoFlush = true;
