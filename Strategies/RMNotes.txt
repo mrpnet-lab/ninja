@@ -3,4 +3,4 @@
 RM_Pro_1.5 - stable
 RM_Pro_1_9 - Stable with good feature like EMA trend, mas trade allow and also high volatily (similar to 1_5).
 RM_Pro_2_3 - includes smart reverse detection plus daily loss and bomb limit loss (3 mins).
-RM_Pro_2_5 - includes smart reverse detection plus daily loss and bomb limit loss (3 mins). Plus, it now displays the pts/ticks/$ and Time bombin SL/tp
+RM_Pro_2_5 - includes smart reverse detection plus daily loss and bomb limit loss (3 mins). Plus, it now displays the pts/ticks/$ and Time bombin SL/tp. the polling engine upgrade
